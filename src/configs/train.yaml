@@ -1,0 +1,14 @@
+# Entrypoint config for src/train.py  →  @hydra.main(config_name="train")
+# Compose: `uv run python src/train.py`
+# Override:  `uv run python src/train.py model=llama3_3b seed=0`
+
+defaults:
+  - model: llama3_3b
+  - _self_          # keep last so values below override the groups above
+
+seed: 42
+output_dir: checkpoints     # artifacts live at project root, gitignored
+
+# --- training (fill in as the method lands) ---
+# block_size / jump_count are method knobs (ablated per the slides)
+# lr, epochs, dual-distillation weights, etc. — TODO

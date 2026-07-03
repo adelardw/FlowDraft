@@ -1,0 +1,30 @@
+# Frozen AR backbone (Orthrus host) — HF loading kwargs.
+# Selected via `defaults: [model: llama3_3b]`; override with `model=<name>`.
+
+name: meta-llama/Llama-3.2-3B-Instruct
+
+# AutoModelForCausalLM.from_pretrained(**backbone)
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16              # transformers>=5 renamed `torch_dtype` -> `dtype`
+  device_map: auto
+  attn_implementation: eager    # sdpa | eager | flash_attention_2
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false              # KV cache is managed by the decode loop, not HF
+
+# AutoTokenizer.from_pretrained(**tokenizer)
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right           # use `left` for batched generation
+  trust_remote_code: false
+  add_bos_token: true
+  add_eos_token: false
+
+# OrthrusAttentionAdapter — projection attribute names that get a trainable DF twin.
+# Model-agnostic (matched by name); add o_proj here to regulate the output projection too.
+adapter:
+  w_names: [q_proj, k_proj, v_proj]

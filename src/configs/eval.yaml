@@ -1,0 +1,13 @@
+# Entrypoint config for src/eval.py  →  @hydra.main(config_name="eval")
+# Compose: `uv run python src/eval.py`
+
+defaults:
+  - model: llama3_3b
+  - _self_
+
+seed: 42
+checkpoint: null            # path to trained drafter weights
+
+# --- evaluation (fill in) ---
+# metrics: acceptance length / TPF / throughput — all verified lossless
+# block_size / jump_count ablation grid — TODO
