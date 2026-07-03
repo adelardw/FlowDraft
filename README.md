@@ -25,6 +25,7 @@
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
 - [Key idea: a Categorical Flow Map drafter](#key-idea-a-categorical-flow-map-drafter)
+- [Dual distillation, in brief](#dual-distillation-in-brief)
 - [Goals](#goals)
 - [Expected deliverables](#expected-deliverables)
 - [Method](#method) 🚧
@@ -41,9 +42,11 @@
 
 ### Overview
 
-Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens costs *L* forward passes, which is memory-bandwidth bound. Diffusion LMs can draft whole blocks in parallel, but they drift from the AR distribution and lose quality. Speculative-style verification restores quality: draft in parallel, then verify against the AR model and keep only the tokens the AR model would have produced — this is **lossless**.
+Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens costs *L* forward passes, which is memory-bandwidth bound. Diffusion LMs can draft whole blocks in parallel, but they drift from the AR distribution and lose quality. Speculative-style verification restores quality: draft a block in parallel, then verify it against the AR model in a single pass and keep only the tokens the AR model would have produced — this is **lossless**.
 
 **FlowDraft** upgrades the *drafter* inside a lossless parallel-decoding loop. The throughput of any verify-based system is governed by its **acceptance length** — the number of drafted tokens accepted per cycle. We replace the single-step masked-diffusion drafter with a **Categorical Flow Map** drafter that produces a higher-fidelity *joint* proposal over the block at the **same** number of forward passes. Verification is left untouched, so the output stays strictly lossless — the drafter affects only **speed**, never **quality**.
+
+Crucially, the AR model is what does the verifying, so it is kept **frozen throughout**. Keeping it untouched is exactly what makes the output provably identical to the base model; it is what the word *lossless* rests on.
 
 ### Background: the decoding bottleneck
 
@@ -55,8 +58,8 @@ Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens cos
 
 FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 
-- Frozen AR backbone + lightweight trainable diffusion drafter, sharing one KV cache.
-- The drafter proposes *K* tokens in parallel; the frozen AR head verifies → output **provably identical** to the base model.
+- One transformer, two attention paths: a **frozen AR path** and a **lightweight, trainable diffusion path** (~16% of parameters), sharing the same norm / MLP / embeddings and a single KV cache.
+- The diffusion path proposes *K* tokens in parallel; the frozen AR head verifies them in one pass → output **provably identical** to the base model. Accepted tokens are committed to the shared KV cache, and the loop continues with the next block.
 - Reported by Orthrus: up to **7.8×** faster, training only **~16%** of parameters on **<1B** tokens.
 
 > *These figures describe the Orthrus host framework (prior work), not FlowDraft's own results.*
@@ -81,6 +84,17 @@ FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 2. **Fidelity** — speedup with **zero** quality loss (verification guarantees it).
 3. **Foundations** — connects flow-map distillation to fast, faithful LLM inference.
 
+### Dual distillation, in brief
+
+The drafter is trained with **two teachers** — hence *dual* — because a single teacher cannot supply both skills it needs:
+
+- **From the AR model — *what* to propose.** The drafter learns to match the distribution the frozen AR verifier would accept, rather than to reproduce the training corpus. The target is to be *accepted by the verifier*, not to match corpus text.
+- **From itself — *how* to jump.** The drafter's reliable "local" behaviour teaches its harder "long-jump" behaviour, so it can emit the whole block in one or a few jumps. This is the flow-map (self-)consistency.
+
+Both teachers are used as fixed targets (stop-gradient) — the model is not trained *through* them. The balance between the two terms is the main design knob.
+
+The frozen AR model is used **only as a teacher** during training: it provides the target distribution, and its weights are never updated. It stays frozen at inference too, where it is the verifier — the same fact that guarantees losslessness.
+
 ### Goals
 
 1. **Reproduce Orthrus** (frozen AR + masked-diffusion drafter, shared KV cache, lossless loop) at a tractable scale.
@@ -96,18 +110,21 @@ FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 
 ### Method
 
-> 🚧 **TODO.** Detailed method write-up goes here: flow-map drafter architecture, the simplex endpoint head, the dual-distillation objective (AR-teacher distribution loss + flow-map consistency loss), the sampling / jump schedule, and integration with the Orthrus verification loop.
+> 🚧 **TODO.** Detailed method write-up goes here (kept high-level for now).
 
-<!--
-Suggested subsections to fill in:
-- Notation & problem setup
-- Flow-map drafter (simplex endpoint head)
-- Dual distillation objective
-    - AR-teacher distribution term
-    - Flow-map consistency term
-- Lossless verification loop (unchanged from Orthrus)
-- Complexity / passes-per-block analysis
--->
+Planned subsections:
+
+- Notation & problem setup.
+- Flow-map drafter (simplex endpoint head, one shared network for both the "local" and "long-jump" modes).
+- Dual-distillation objective:
+  - **AR-teacher term** — match the frozen verifier's distribution (what to propose).
+  - **Flow-map (self-)consistency term** — few-step jumping (how to propose it).
+- Open design choices (this is the core of Goal 3, "design the objective"):
+  - Anchor target: match the AR distribution (soft) vs. corpus tokens (hard) vs. a mix.
+  - Source of block content used to build trajectories: training corpus vs. AR-generated continuations (**on-policy** — matches the inference-time distribution).
+  - Balance weight between the two terms, and its schedule.
+- Lossless verification loop (unchanged from Orthrus).
+- Passes-per-block / cost analysis (why one or a few jumps, not many steps).
 
 ### Repository structure
 
@@ -128,6 +145,8 @@ FlowDraft/
 ├── notebooks/                # analysis & ablations
 └── results/                  # logs, tables, figures
 ```
+
+> `src/orthrus/` follows the Orthrus reference implementation; `src/flowmap/` builds on the Categorical Flow Map reference implementation (see [References](#references)).
 
 ### Installation
 
@@ -183,8 +202,8 @@ FlowDraft/
 
 ### References
 
-- **Categorical Flow Maps** — Roos et al., 2026. <!-- TODO: full citation, venue, arXiv id, link -->
-- **Orthrus** — lossless parallel decoding via a frozen AR backbone + trainable diffusion drafter. <!-- TODO: full citation, authors, venue, link -->
+- **Categorical Flow Maps** — Roos et al., ICML 2026. arXiv:2602.12233. Reference implementation: `olsdavis/semicat`. <!-- TODO: confirm final citation & links -->
+- **Orthrus** — lossless parallel decoding via a frozen AR backbone + trainable diffusion drafter. arXiv:2605.12825. Reference implementation: `chiennv2000/orthrus`. <!-- TODO: confirm final citation & links -->
 
 <!-- TODO: complete once metadata is available -->
 ```bibtex
@@ -220,6 +239,7 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 - [Host-фреймворк: Orthrus](#host-фреймворк-orthrus)
 - [Проблема](#проблема)
 - [Идея: драфтер на Categorical Flow Map](#идея-драфтер-на-categorical-flow-map)
+- [Коротко про dual distillation](#коротко-про-dual-distillation)
 - [Цели](#цели)
 - [Ожидаемые результаты](#ожидаемые-результаты)
 - [Метод](#метод) 🚧
@@ -236,9 +256,11 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 
 ### Обзор
 
-Авторегрессионные (AR) LLM декодируют строго последовательно: чтобы сгенерировать *L* токенов, нужно *L* прямых проходов — а это упирается в пропускную способность памяти. Диффузионные LM умеют драфтить целые блоки параллельно, но уходят от AR-распределения и теряют качество. Верификация в стиле спекулятивного декодирования возвращает качество: драфтим параллельно, затем сверяемся с AR-моделью и оставляем только те токены, которые выдала бы сама AR-модель — это **без потерь (lossless)**.
+Авторегрессионные (AR) LLM декодируют строго последовательно: чтобы сгенерировать *L* токенов, нужно *L* прямых проходов — а это упирается в пропускную способность памяти. Диффузионные LM умеют драфтить целые блоки параллельно, но уходят от AR-распределения и теряют качество. Верификация в стиле спекулятивного декодирования возвращает качество: драфтим блок параллельно, затем сверяем его с AR-моделью за один проход и оставляем только те токены, которые выдала бы сама AR-модель — это **без потерь (lossless)**.
 
 **FlowDraft** улучшает *драфтер* внутри lossless-петли параллельного декодирования. Пропускную способность любой системы с верификацией определяет **длина приёма (acceptance length)** — сколько сдрафченных токенов принимается за цикл. Мы заменяем одношаговый masked-diffusion драфтер на драфтер на основе **Categorical Flow Map**, который выдаёт более качественное *совместное* предложение по блоку при **том же** числе прямых проходов. Верификация не меняется, поэтому вывод остаётся строго lossless — драфтер влияет только на **скорость**, но не на **качество**.
+
+Важно: верифицирует именно AR-модель, поэтому она остаётся **замороженной на всех этапах**. Именно то, что её не трогают, и делает вывод доказуемо идентичным базовой модели — на этом держится слово *lossless*.
 
 ### Контекст: узкое место декодирования
 
@@ -250,8 +272,8 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 
 FlowDraft строится внутри **Orthrus** — каркаса lossless-параллельного декодирования:
 
-- Замороженный AR-бэкбон + лёгкий обучаемый диффузионный драфтер, использующие общий KV-кэш.
-- Драфтер предлагает *K* токенов параллельно; замороженная AR-голова верифицирует → вывод **доказуемо идентичен** базовой модели.
+- Один трансформер, две attention-ветки: **замороженная AR-ветка** и **лёгкая обучаемая диффузионная ветка** (~16% параметров), использующие общие norm / MLP / эмбеддинги и единый KV-кэш.
+- Диффузионная ветка предлагает *K* токенов параллельно; замороженная AR-голова верифицирует их за один проход → вывод **доказуемо идентичен** базовой модели. Принятые токены коммитятся в общий KV-кэш, и цикл продолжается со следующего блока.
 - По данным Orthrus: ускорение до **7.8×**, обучается лишь **~16%** параметров на **<1B** токенов.
 
 > *Эти цифры относятся к host-фреймворку Orthrus (предыдущая работа), а не к результатам самого FlowDraft.*
@@ -268,13 +290,24 @@ FlowDraft строится внутри **Orthrus** — каркаса lossless-
 - **Categorical Flow Maps** [Roos et al., 2026] выучивают *интегрированное, скоррелированное* распределение конечной точки на симплексе и генерируют за **один или несколько скачков (jumps)**.
 - Используем это как драфтер: **более качественное совместное предложение** по блоку — при **том же числе проходов**.
 - Верификация не меняется → вывод остаётся **строго lossless**; драфтер влияет только на *скорость*, но не на *качество*.
-- **Новизна:** flow-map драфтер + **двойная дистилляция**, подгоняющая одновременно распределение AR-учителя **и** консистентность flow-map.
+- **Новизна:** flow-map драфтер + **двойная дистилляция (dual distillation)**, подгоняющая одновременно распределение AR-учителя **и** консистентность flow-map.
 
 **Почему это важно**
 
 1. **Эффективность** — больше длина приёма = выше пропускная способность, бесплатно.
 2. **Точность (fidelity)** — ускорение при **нулевой** потере качества (это гарантирует верификация).
 3. **Фундамент** — связывает дистилляцию flow-map с быстрым и точным инференсом LLM.
+
+### Коротко про dual distillation
+
+Драфтер обучается с **двумя учителями** — отсюда *dual* — потому что один учитель не может дать оба нужных навыка:
+
+- **От AR-модели — *что* предлагать.** Драфтер учится воспроизводить распределение, которое принял бы замороженный AR-верификатор, а не текст обучающего корпуса. Цель — быть *принятым верификатором*, а не совпасть с корпусом.
+- **От самого себя — *как* прыгать.** Надёжный «локальный» режим драфтера учит его же более сложный «дальний прыжок», чтобы выдавать весь блок за один или несколько прыжков. Это и есть консистентность flow-map (self-consistency).
+
+Оба учителя используются как фиксированные цели (stop-gradient) — градиент в них не течёт. Баланс между двумя членами — главный настроечный параметр.
+
+Замороженная AR-модель на обучении используется **только как учитель**: она даёт целевое распределение, её веса не обновляются. На инференсе она тоже заморожена и работает как верификатор — тот же факт, что и гарантирует lossless.
 
 ### Цели
 
@@ -291,18 +324,21 @@ FlowDraft строится внутри **Orthrus** — каркаса lossless-
 
 ### Метод
 
-> 🚧 **TODO.** Здесь будет подробное описание метода: архитектура flow-map драфтера, симплексная голова конечной точки, объектив двойной дистилляции (loss по распределению AR-учителя + loss консистентности flow-map), расписание сэмплирования / скачков и интеграция с петлёй верификации Orthrus.
+> 🚧 **TODO.** Здесь будет подробное описание метода (пока высокоуровнево).
 
-<!--
-Предлагаемые подразделы для заполнения:
-- Обозначения и постановка задачи
-- Flow-map драфтер (симплексная голова конечной точки)
-- Объектив двойной дистилляции
-    - Член по распределению AR-учителя
-    - Член консистентности flow-map
-- Lossless-петля верификации (без изменений относительно Orthrus)
-- Анализ сложности / числа проходов на блок
--->
+Планируемые подразделы:
+
+- Обозначения и постановка задачи.
+- Flow-map драфтер (симплексная голова конечной точки, одна общая сеть для «локального» режима и «дальнего прыжка»).
+- Объектив двойной дистилляции:
+  - **Член AR-учителя** — подгонка под распределение замороженного верификатора (что предлагать).
+  - **Член консистентности flow-map (self-consistency)** — прыжок за один/несколько шагов (как предлагать).
+- Открытые развилки дизайна (это и есть суть Goal 3, «design the objective»):
+  - Таргет якоря: подгонка под AR-распределение (soft) vs. токены корпуса (hard) vs. микс.
+  - Источник содержимого блока для построения траекторий: обучающий корпус vs. AR-сгенерированные продолжения (**on-policy** — совпадает с инференсным распределением).
+  - Вес баланса между двумя членами и его расписание.
+- Lossless-петля верификации (без изменений относительно Orthrus).
+- Анализ числа проходов на блок / стоимости (почему один-два прыжка, а не много шагов).
 
 ### Структура репозитория
 
@@ -323,6 +359,8 @@ FlowDraft/
 ├── notebooks/                # анализ и абляции
 └── results/                  # логи, таблицы, графики
 ```
+
+> `src/orthrus/` следует референсной имплементации Orthrus; `src/flowmap/` строится на референсной имплементации Categorical Flow Map (см. [Ссылки](#ссылки)).
 
 ### Установка
 
@@ -378,8 +416,8 @@ FlowDraft/
 
 ### Ссылки
 
-- **Categorical Flow Maps** — Roos et al., 2026. <!-- TODO: полная ссылка, площадка, arXiv id, линк -->
-- **Orthrus** — lossless-параллельное декодирование через замороженный AR-бэкбон + обучаемый диффузионный драфтер. <!-- TODO: полная ссылка, авторы, площадка, линк -->
+- **Categorical Flow Maps** — Roos et al., ICML 2026. arXiv:2602.12233. Референсная имплементация: `olsdavis/semicat`. <!-- TODO: сверить финальную ссылку и линки -->
+- **Orthrus** — lossless-параллельное декодирование через замороженный AR-бэкбон + обучаемый диффузионный драфтер. arXiv:2605.12825. Референсная имплементация: `chiennv2000/orthrus`. <!-- TODO: сверить финальную ссылку и линки -->
 
 <!-- TODO: дополнить, когда появятся метаданные -->
 ```bibtex
