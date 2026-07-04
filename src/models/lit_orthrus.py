@@ -73,6 +73,17 @@ class FlowMapOrthrus(L.LightningModule):
         u = torch.rand(batch, 2, device=device)
         return u.min(dim=-1).values, u.max(dim=-1).values
 
+    def sample_times_paper(self, batch, device):
+        """``t ~ U[0, 1]``, then ``s ~ U[0, t]``.
+
+        Pair density on the triangle is ∝ 1/t: short EARLY jumps are
+        overweighted, and the anchor's diagonal times are uniform
+        (E[t] = 1/2 vs 2/3 for triangle, 3/4 for sequential).
+        """
+        t = torch.rand(batch, device=device)
+        s = t * torch.rand(batch, device=device)
+        return s, t
+
     def sample_trajectory(self, simplex, attention_mask=None):
         """Draw one training point of the linear simplex path per sample.
 
