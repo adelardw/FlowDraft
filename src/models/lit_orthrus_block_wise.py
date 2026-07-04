@@ -44,6 +44,15 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         ids, mask = batch["input_ids"], batch["attention_mask"]
         block = self.cfg.train.get("block_size", 64)
         p = self._split_point(mask, block)
+        # With dynamic padding the tensor can be NARROWER than min_prefix + K.
+        # Shrink the window to what actually exists — otherwise the teacher
+        # slice [p-1 : p+K-1] and the block [p : p+K] get clipped by the
+        # tensor edge to DIFFERENT lengths (off by one -> shape mismatch).
+        width = ids.size(1)
+        if width < 2:
+            raise ValueError("cannot train on width-1 batches: no AR context for the block")
+        p = min(p, width - 1)
+        block = min(block, width - p)
         ctx_mask = mask[:, : p + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
