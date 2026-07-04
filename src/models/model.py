@@ -29,7 +29,7 @@ def build_model(cfg: DictConfig):
     backbone.requires_grad_(False)
     backbone.eval()
 
-    processor = DiffusionProcessor.from_model(tokenizer, backbone)
+    df_processor = DiffusionProcessor.from_model(tokenizer, backbone)
     model = OrthrusAttentionAdapter(backbone, w_names=list(cfg.adapter.w_names))
 
     n_total = sum(p.numel() for p in model.parameters())
@@ -38,7 +38,7 @@ def build_model(cfg: DictConfig):
         f"Orthrus '{cfg.name}': {n_total / 1e9:.2f}B total, "
         f"{n_train / 1e6:.1f}M trainable (df head over {model.n_dual} projections)"
     )
-    return model, tokenizer, processor
+    return model, tokenizer, df_processor
 
 
 if __name__ == "__main__":

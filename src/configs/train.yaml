@@ -9,6 +9,32 @@ defaults:
 seed: 42
 output_dir: checkpoints     # artifacts live at project root, gitignored
 
-# --- training (fill in as the method lands) ---
+# --- training (OrthrusLitModule.configure_optimizers) ---
+train:
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  time_sampling: triangle   # triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1])
+  lambda: 1.0               # weight of the ECLD part: loss = anchor + lambda * (4*EC + 2*TD)
+  anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
+                            #   trajectory | landing (X_{s,t}(x_s))
+  checkpoint_every_n_steps: 1000
+
+# Lightning Trainer kwargs, passed through verbatim (см. src/train.py)
+trainer:
+  accelerator: auto
+  devices: auto
+  precision: bf16-mixed
+  max_steps: 10000
+  val_check_interval: 500
+  log_every_n_steps: 10
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+
+# data section is YOURS — consumed only by build_dataloaders in src/train.py
+data:
+  batch_size: 4
+  max_length: 512
+  num_workers: 4
+
 # block_size / jump_count are method knobs (ablated per the slides)
-# lr, epochs, dual-distillation weights, etc. — TODO
