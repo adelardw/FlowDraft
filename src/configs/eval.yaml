@@ -6,8 +6,15 @@ defaults:
   - _self_
 
 seed: 42
-checkpoint: null            # path to trained drafter weights
+checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
 
-# --- evaluation (fill in) ---
-# metrics: acceptance length / TPF / throughput — all verified lossless
-# block_size / jump_count ablation grid — TODO
+# metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
+# ablation grid: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
+decode:
+  block_size: 8
+  jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
+  max_new_tokens: 64
+  prompts:
+    - "The capital of France is"
+    - "Once upon a time, in a small village,"
+    - "def fibonacci(n):"
