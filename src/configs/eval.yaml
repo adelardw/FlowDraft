@@ -7,6 +7,8 @@ defaults:
 
 seed: 42
 checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
+variant: fixed              # which drafter the checkpoint was trained as:
+                            #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
 # ablation grid: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`

@@ -42,10 +42,14 @@ def aggregate(per_prompt):
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="eval")
 def main(cfg: DictConfig) -> None:
-    from src.models.lit_orthrus import FlowMapOrthrus
-
     torch.manual_seed(cfg.seed)
-    model = FlowMapOrthrus(cfg)
+    variant = cfg.get("variant", "fixed")
+    if variant == "baseline":
+        from src.models.lit_orthrus_baseline import FlowMapOrthrusBaseline as Module
+    else:
+        # fixed and block_wise share the flow-map draft step at inference
+        from src.models.lit_orthrus import FlowMapOrthrus as Module
+    model = Module(cfg)
     if cfg.checkpoint:
         state = torch.load(cfg.checkpoint, map_location="cpu", weights_only=False)["state_dict"]
         model.load_state_dict(state, strict=False)  # ckpt holds the DF head only

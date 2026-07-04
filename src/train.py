@@ -11,7 +11,19 @@ from src.models.lit_orthrus import FlowMapOrthrus
 def main(cfg: DictConfig) -> None:
     L.seed_everything(cfg.seed, workers=True)
 
-    model = FlowMapOrthrus(cfg)
+    variant = cfg.train.get("variant", "fixed")
+    if variant == "block_wise":
+        from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
+
+        model = FlowMapOrthrusBlockWise(cfg)
+    elif variant == "baseline":
+        from src.models.lit_orthrus_baseline import FlowMapOrthrusBaseline
+
+        model = FlowMapOrthrusBaseline(cfg)
+    elif variant == "fixed":
+        model = FlowMapOrthrus(cfg)
+    else:
+        raise ValueError(f"unknown train.variant='{variant}' (fixed | block_wise | baseline)")
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
     callbacks = [
