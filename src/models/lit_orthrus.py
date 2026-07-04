@@ -120,7 +120,13 @@ class FlowMapOrthrus(L.LightningModule):
 
     @staticmethod
     def _masked_kl(log_p, log_q, live):
-        """``KL(p || q)`` per position, averaged over live (non-pad) tokens."""
+        """``KL(p || q)`` per position, averaged over live (non-pad) tokens.
+
+        An empty ``live`` mask yields a graph-connected zero, not NaN
+        (``mean()`` over an empty tensor silently poisons the weights).
+        """
+        if not live.any():
+            return log_q.sum() * 0.0
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
         return kl[live].mean()
 
@@ -414,6 +420,8 @@ class FlowMapOrthrus(L.LightningModule):
     def training_step(self, batch, batch_idx):
         teacher_logits, draft_logits, x_s, x_t, s, t = self._shared_step(batch)
         loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, s, t)
+        if not torch.isfinite(loss):
+            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True)
         return loss
 

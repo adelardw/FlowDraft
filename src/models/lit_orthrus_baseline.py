@@ -52,6 +52,8 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
 
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._masked_step(batch)
+        if not torch.isfinite(loss):
+            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
