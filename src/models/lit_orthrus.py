@@ -1,3 +1,5 @@
+import time
+
 import lightning as L
 import torch
 import torch.nn.functional as F
@@ -190,49 +192,183 @@ class FlowMapOrthrus(L.LightningModule):
         self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td})
         return loss
 
-    # --- lightning hooks -------------------------------------------------------
+    # --- generation: the model generates, start to finish ----------------------
+    # src/eval.py drives these: it compares generate() vs ar_generate() and
+    # asserts losslessness.
 
-    @torch.no_grad()
-    def generate(self, text, block_size: int = 8, jumps=1, **tokenizer_kwargs):
-        """Draft ``block_size`` NEW tokens after the prompt with the flow map.
-
-        The prompt is prefilled through the frozen AR path into a shared KV
-        cache (committing its K/V); the drafter then denoises a noise block
-        ``x0 [B, K, V]`` — K fresh positions after the prefix — in one or
-        several jumps. ``jumps`` is either an int (``n`` equal jumps over a
-        ``linspace(0, 1)`` schedule) or an explicit time grid like
-        ``[0, 0.5, 1]``.
-
-        Returns ``{"draft_ids": [B, K], "draft_simplex": [B, K, V]}`` — the
-        drafter's proposal only. Lossless verification of the block against
-        the AR path is the decode loop's job (``src/generate``); the cache is
-        left AR-only (prefix length), ready for that verify pass.
-        """
-        enc = self.df_processor(text, return_simplex=False, **tokenizer_kwargs)
-        ids = enc["input_ids"].to(self.device)
-        prompt_mask = enc["attention_mask"].to(self.device)
-        batch = ids.size(0)
-
-
-        cache = DynamicCache(config=self.orthrus.model.config)
-        self.orthrus(ids, prompt_mask, past_key_values=cache)  # AR prefill: commit the prompt
-
+    @staticmethod
+    def _jump_schedule(jumps):
+        """int n -> n equal jumps over linspace(0, 1); list -> validated as-is."""
         times = torch.linspace(0, 1, jumps + 1).tolist() if isinstance(jumps, int) else list(jumps)
         if times[0] != 0 or times[-1] != 1 or any(a >= b for a, b in zip(times, times[1:])):
             raise ValueError(f"jump schedule must increase from 0 to 1, got {times}")
+        return times
 
-        vocab = self.df_processor.vocab_size
-        x = torch.distributions.Dirichlet(
-            torch.ones(vocab, device=self.device)
-        ).sample((batch, block_size))
-        # prompt padding stays masked; the K drafted positions are all live
-        block_mask = torch.cat(
-            [prompt_mask, torch.ones(batch, block_size, dtype=prompt_mask.dtype, device=self.device)],
+    @staticmethod
+    def verify_greedy(draft_ids, last_logits, verify_logits):
+        """Greedy lossless verification of one drafted block (batch size 1).
+
+        The drafted token at position j is accepted iff it equals the token
+        greedy AR would have produced there itself; the AR expectation for j
+        is conditioned on the drafted tokens before j, so one mismatch
+        invalidates everything after it — hence the longest-prefix rule.
+
+        Args:
+            draft_ids:     ``[1, K]`` — drafter proposal.
+            last_logits:   ``[1, V]`` — AR distribution of the FIRST drafted
+                position (from the previous cycle / prefill).
+            verify_logits: ``[1, K, V]`` — AR forward over ``draft_ids``;
+                position ``j`` holds the AR distribution of position ``j+1``.
+
+        Returns ``(n_accepted, next_token)``: the accepted-prefix length and
+        the token AR emits after it — its own correction at the first
+        mismatch, or the bonus continuation when the whole block matched.
+        Emitting it makes every cycle produce >= 1 token and keeps the
+        output bit-identical to greedy AR.
+        """
+        expected = torch.cat(
+            [last_logits.argmax(-1, keepdim=True), verify_logits[:, :-1].argmax(-1)],
             dim=1,
         )
+        n_accepted = int((draft_ids == expected).cumprod(dim=1).sum())
+        if n_accepted == draft_ids.size(1):
+            next_token = verify_logits[:, -1].argmax(-1)  # bonus: AR's continuation
+        else:
+            next_token = expected[:, n_accepted]  # correction: what AR wanted instead
+        return n_accepted, next_token
+
+    def _encode(self, text, input_ids, **tokenizer_kwargs):
+        if (text is None) == (input_ids is None):
+            raise ValueError("pass exactly one of text / input_ids")
+        if text is not None:
+            enc = self.df_processor(text, return_simplex=False, **tokenizer_kwargs)
+            input_ids = enc["input_ids"]
+        input_ids = input_ids.to(self.device)
+        assert input_ids.dim() == 2 and input_ids.size(0) == 1, "generation is batch-size-1"
+        return input_ids
+
+    def _draft_block(self, cache, block_size, times):
+        """Dirichlet noise -> jump schedule via :meth:`predict` -> draft ids.
+
+        The shared cache stays AR-only: the adapter crops the draft's K/V
+        right after each forward.
+        """
+        x = torch.distributions.Dirichlet(
+            torch.ones(self.df_processor.vocab_size, device=self.device)
+        ).sample((1, block_size))
+        mask = torch.ones(1, cache.get_seq_length() + block_size, dtype=torch.long, device=self.device)
         for s_i, t_i in zip(times[:-1], times[1:]):
-            x = self.predict(x, block_mask, s_i, t_i, past_key_values=cache)
-        return {"draft_ids": x.argmax(-1), "draft_simplex": x}
+            x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
+        return x.argmax(-1)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        text=None,
+        *,
+        input_ids=None,
+        block_size: int = 8,
+        jumps=1,
+        max_new_tokens: int = 128,
+        eos_token_id=None,
+        **tokenizer_kwargs,
+    ):
+        """FULL lossless generation: draft -> verify -> commit, until done.
+
+        Every cycle the flow map drafts ``block_size`` tokens in
+        ``len(jumps)`` forwards, one AR forward verifies the block
+        (longest accepted prefix + AR's own correction/bonus token), the
+        cache is cropped to the accepted text and one 1-token AR forward
+        commits the extra token. The output ids are bit-identical to
+        :meth:`ar_generate` — the drafter affects speed, never content.
+
+        Returns a dict: ``sequences [1, T+N]``, ``new_tokens`` (list),
+        ``text`` (when a tokenizer is attached), ``acceptance`` (per cycle),
+        ``n_forwards``, ``seconds``.
+        """
+        input_ids = self._encode(text, input_ids, **tokenizer_kwargs)
+        times = self._jump_schedule(jumps)
+        if eos_token_id is None and self.tokenizer is not None:
+            eos_token_id = self.tokenizer.eos_token_id
+
+        start = time.perf_counter()
+        cache = DynamicCache(config=self.orthrus.model.config)
+        out = self.orthrus(input_ids, torch.ones_like(input_ids), past_key_values=cache)
+        last_logits = out.logits[:, -1]
+        n_forwards = 1
+        emitted, acceptance = [], []
+
+        while len(emitted) < max_new_tokens:
+            draft_ids = self._draft_block(cache, block_size, times)
+            n_forwards += len(times) - 1
+
+            committed = cache.get_seq_length()
+            mask = torch.ones(1, committed + block_size, dtype=torch.long, device=self.device)
+            verify_logits = self.orthrus(draft_ids, mask, past_key_values=cache).logits
+            n_forwards += 1
+
+            n_accepted, next_token = self.verify_greedy(draft_ids, last_logits, verify_logits)
+            cache.crop(committed + n_accepted)  # rejected draft K/V never pollute the cache
+            acceptance.append(n_accepted)
+            new = draft_ids[0, :n_accepted].tolist() + [int(next_token)]
+            emitted.extend(new)
+            if eos_token_id is not None and eos_token_id in new:
+                break
+
+            # commit next_token's K/V; its logits are the next cycle's last_logits
+            mask = torch.ones(1, cache.get_seq_length() + 1, dtype=torch.long, device=self.device)
+            out = self.orthrus(next_token.view(1, 1), mask, past_key_values=cache)
+            last_logits = out.logits[:, -1]
+            n_forwards += 1
+
+        return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
+                              acceptance=acceptance)
+
+    @torch.no_grad()
+    def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,
+                    eos_token_id=None, **tokenizer_kwargs):
+        """Plain greedy AR generation through the frozen path — the
+        correctness reference (generate() must match it token-for-token)
+        and the throughput baseline (1 token per forward)."""
+        input_ids = self._encode(text, input_ids, **tokenizer_kwargs)
+        if eos_token_id is None and self.tokenizer is not None:
+            eos_token_id = self.tokenizer.eos_token_id
+
+        start = time.perf_counter()
+        cache = DynamicCache(config=self.orthrus.model.config)
+        out = self.orthrus(input_ids, torch.ones_like(input_ids), past_key_values=cache)
+        n_forwards = 1
+        emitted = []
+
+        while len(emitted) < max_new_tokens:
+            token = out.logits[:, -1].argmax(-1)
+            emitted.append(int(token))
+            if eos_token_id is not None and int(token) == eos_token_id:
+                break
+            mask = torch.ones(1, cache.get_seq_length() + 1, dtype=torch.long, device=self.device)
+            out = self.orthrus(token.view(1, 1), mask, past_key_values=cache)
+            n_forwards += 1
+
+        return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards)
+
+    def _finalize(self, input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
+                  acceptance=None):
+        emitted = emitted[:max_new_tokens]
+        if eos_token_id is not None and eos_token_id in emitted:
+            emitted = emitted[: emitted.index(eos_token_id) + 1]
+        result = {
+            "sequences": torch.cat(
+                [input_ids, torch.tensor([emitted], device=input_ids.device)], dim=1
+            ),
+            "new_tokens": emitted,
+            "n_forwards": n_forwards,
+            "seconds": time.perf_counter() - start,
+        }
+        if acceptance is not None:
+            result["acceptance"] = acceptance
+        if self.tokenizer is not None:
+            result["text"] = self.tokenizer.decode(emitted, skip_special_tokens=True)
+        return result
 
     def predict(self, x_s, mask, s, t, past_key_values=None):
         """One flow-map jump: the point ``X_{s,t}(x_s)`` on the simplex.
