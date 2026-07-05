@@ -122,8 +122,9 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
         # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
-        # ||∂_t π^θ_{s,t}||², finite difference in the time INPUT.
-        dt = torch.where(t + 1e-3 <= 1.0, 1e-3, -1e-3)
+        # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
+        # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
+        dt = torch.where(t + 1e-2 <= 1.0, 1e-2, -1e-2)
         pi_dt = self.orthrus(
             x_s, ctx_mask, use_df=True, s=s, t=t + dt, past_key_values=cache
         ).logits.float().softmax(-1)

@@ -24,6 +24,11 @@ def build_model(cfg: DictConfig):
 
     backbone = AutoModelForCausalLM.from_pretrained(**backbone_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(**tokenizer_kwargs)
+    if tokenizer.pad_token is None:
+        # Llama-family tokenizers ship without a pad token, while
+        # DiffusionProcessor pads by default — the first real batched
+        # tokenization would crash otherwise.
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Frozen AR backbone — this is what makes the output provably lossless.
     backbone.requires_grad_(False)
