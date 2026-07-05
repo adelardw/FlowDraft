@@ -120,7 +120,13 @@ class FlowMapOrthrus(L.LightningModule):
 
     @staticmethod
     def _masked_kl(log_p, log_q, live):
-        """``KL(p || q)`` per position, averaged over live (non-pad) tokens."""
+        """``KL(p || q)`` per position, averaged over live (non-pad) tokens.
+
+        An empty ``live`` mask yields a graph-connected zero, not NaN
+        (``mean()`` over an empty tensor silently poisons the weights).
+        """
+        if not live.any():
+            return log_q.sum() * 0.0
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
         return kl[live].mean()
 
@@ -194,7 +200,8 @@ class FlowMapOrthrus(L.LightningModule):
         # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
         # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
         # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
-        dt = torch.where(t + 1e-3 <= 1.0, 1e-3, -1e-3)
+        dt_val = 0.05
+        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
         pi_dt = self.orthrus(x_s, mask, use_df=True, s=s, t=t + dt).logits.float().softmax(-1)
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)  # [B, T]
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
@@ -414,6 +421,8 @@ class FlowMapOrthrus(L.LightningModule):
     def training_step(self, batch, batch_idx):
         teacher_logits, draft_logits, x_s, x_t, s, t = self._shared_step(batch)
         loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, s, t)
+        if not torch.isfinite(loss):
+            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True)
         return loss
 

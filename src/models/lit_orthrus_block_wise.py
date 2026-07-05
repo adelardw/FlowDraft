@@ -26,18 +26,33 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
     ``train.block_size`` (K) and ``train.min_prefix``.
     """
 
-    def _split_point(self, seq_len: int, block: int) -> int:
+    def _split_point(self, attention_mask, block: int) -> int:
+        """Sample the split from the TRUE lengths, not the padded width.
+
+        With right-padding, sampling from ``ids.size(1)`` can drop the whole
+        block window into pads (empty live mask -> NaN loss). The upper
+        bound is the shortest live length in the batch; when even that is
+        too short the split clamps to ``min_prefix`` and the per-position
+        live mask (plus the empty-block guard in the loss) absorbs the rest.
+        """
         min_prefix = self.cfg.train.get("min_prefix", 1)
-        if seq_len < min_prefix + block:
-            raise ValueError(
-                f"sequence length {seq_len} < min_prefix {min_prefix} + block_size {block}"
-            )
-        return int(torch.randint(min_prefix, seq_len - block + 1, (1,)))
+        true_min = int(attention_mask.sum(dim=1).min())
+        high = max(min_prefix + 1, true_min - block + 1)
+        return int(torch.randint(min_prefix, high, (1,)))
 
     def _shared_step(self, batch):
         ids, mask = batch["input_ids"], batch["attention_mask"]
         block = self.cfg.train.get("block_size", 64)
-        p = self._split_point(ids.size(1), block)
+        p = self._split_point(mask, block)
+        # With dynamic padding the tensor can be NARROWER than min_prefix + K.
+        # Shrink the window to what actually exists — otherwise the teacher
+        # slice [p-1 : p+K-1] and the block [p : p+K] get clipped by the
+        # tensor edge to DIFFERENT lengths (off by one -> shape mismatch).
+        width = ids.size(1)
+        if width < 2:
+            raise ValueError("cannot train on width-1 batches: no AR context for the block")
+        p = min(p, width - 1)
+        block = min(block, width - p)
         ctx_mask = mask[:, : p + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
@@ -65,6 +80,10 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         """
         eps = 1e-4
         live = block_mask.bool()
+        if not live.any():
+            # the whole block landed in padding: a zero step wired into the
+            # graph instead of NaN from a mean over an empty tensor
+            return draft_logits.sum() * 0.0
         log_draft = F.log_softmax(draft_logits.float(), -1)
 
         # Landing point of the jump — the EC-target input. Detached: the
@@ -103,8 +122,10 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
         # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
-        # ||∂_t π^θ_{s,t}||², finite difference in the time INPUT.
-        dt = torch.where(t + 1e-3 <= 1.0, 1e-3, -1e-3)
+        # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
+        # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
+        dt_val = 0.05
+        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
         pi_dt = self.orthrus(
             x_s, ctx_mask, use_df=True, s=s, t=t + dt, past_key_values=cache
         ).logits.float().softmax(-1)
@@ -117,6 +138,8 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
 
     def training_step(self, batch, batch_idx):
         loss = self.compute_loss(*self._shared_step(batch))
+        if not torch.isfinite(loss):
+            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
