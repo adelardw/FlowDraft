@@ -1,5 +1,3 @@
-# Entrypoint config for src/eval.py  →  @hydra.main(config_name="eval")
-# Compose: `uv run python src/eval.py`
 
 defaults:
   - model: llama3_3b
@@ -11,12 +9,13 @@ variant: fixed              # which drafter the checkpoint was trained as:
                             #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
-# ablation grid: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
+# ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
 decode:
   block_size: 8
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
-  prompts:
-    - "The capital of France is"
-    - "Once upon a time, in a small village,"
-    - "def fibonacci(n):"
+  n_prompts: 8              # validation samples to evaluate on
+  prompt_len: 32            # prefix length (tokens) taken from each sample
+  temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = speculative sampling (lossless in distribution)
+  top_k: null               # sampling only
+  top_p: null               # sampling only

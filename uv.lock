@@ -628,6 +628,7 @@ dependencies = [
     { name = "tensorboard" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "typer" },
 ]
 
 [package.metadata]
@@ -641,6 +642,7 @@ requires-dist = [
     { name = "tensorboard", specifier = ">=2.21.0" },
     { name = "torch", specifier = ">=2.12.1" },
     { name = "transformers", specifier = ">=5.12.1" },
+    { name = "typer", specifier = ">=0.26.8" },
 ]
 
 [[package]]
