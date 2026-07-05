@@ -265,11 +265,66 @@ class FlowMapOrthrus(L.LightningModule):
         assert input_ids.dim() == 2 and input_ids.size(0) == 1, "generation is batch-size-1"
         return input_ids
 
-    def _draft_block(self, cache, block_size, times):
-        """Dirichlet noise -> jump schedule via :meth:`predict` -> draft ids.
+    @staticmethod
+    def _target_probs(logits, temperature: float, top_k=None, top_p=None):
+        """The AR target distribution ``p`` under the sampling params.
 
-        The shared cache stays AR-only: the adapter crops the draft's K/V
-        right after each forward.
+        ``temperature=0`` -> a delta at the argmax (greedy). ``top_k``/
+        ``top_p`` filter BEFORE the softmax; the same ``p`` is used both to
+        sample in :meth:`ar_generate` and to accept/reject drafted tokens,
+        which is exactly what makes speculative sampling lossless in
+        distribution for ANY proposal q.
+        """
+        logits = logits.float()
+        if temperature <= 0:
+            return F.one_hot(logits.argmax(-1), logits.size(-1)).float()
+        logits = logits / temperature
+        if top_k:
+            kth = logits.topk(min(top_k, logits.size(-1)), dim=-1).values[..., -1:]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
+        if top_p:
+            sorted_logits, idx = logits.sort(dim=-1, descending=True)
+            cum = sorted_logits.softmax(-1).cumsum(-1)
+            drop_sorted = cum - sorted_logits.softmax(-1) > top_p  # keep first token past p
+            drop = torch.zeros_like(drop_sorted).scatter(-1, idx, drop_sorted)
+            logits = logits.masked_fill(drop, float("-inf"))
+        return logits.softmax(-1)
+
+    def _verify_speculative(self, draft_ids, q, last_logits, verify_logits,
+                            temperature, top_k, top_p):
+        """Leviathan-style accept/reject — lossless IN DISTRIBUTION.
+
+        Token ``x_j ~ q_j`` is accepted with probability ``min(1, p_j(x_j) /
+        q_j(x_j))``; at the first rejection the replacement is drawn from the
+        residual ``norm(max(0, p_j − q_j))``; a fully accepted block earns a
+        bonus token from ``p_K``. The drafter's quality only moves the
+        acceptance rate, never the output distribution.
+        """
+        p = self._target_probs(
+            torch.cat([last_logits[:, None], verify_logits[:, :-1]], dim=1),
+            temperature, top_k, top_p,
+        )  # [1, K, V]: the target distribution of every drafted position
+        q = q.float()
+        for j in range(draft_ids.size(1)):
+            token = draft_ids[0, j]
+            ratio = p[0, j, token] / q[0, j, token].clamp_min(1e-12)
+            if torch.rand((), device=draft_ids.device) < ratio:
+                continue
+            residual = (p[0, j] - q[0, j]).clamp_min(0)
+            residual = residual / residual.sum().clamp_min(1e-12)
+            return j, torch.multinomial(residual, 1)
+        bonus = self._target_probs(verify_logits[:, -1], temperature, top_k, top_p)
+        return draft_ids.size(1), torch.multinomial(bonus[0], 1)
+
+    def _draft_block(self, cache, block_size, times, sample: bool = False):
+        """Dirichlet noise -> jump schedule via :meth:`predict`.
+
+        The final simplex point IS the proposal distribution ``q`` (a convex
+        mix of distributions stays on the simplex): greedy takes its argmax,
+        sampling draws from it. The shared cache stays AR-only: the adapter
+        crops the draft's K/V right after each forward.
+
+        Returns ``(draft_ids [1, K], q [1, K, V])``.
         """
         x = torch.distributions.Dirichlet(
             torch.ones(self.df_processor.vocab_size, device=self.device)
@@ -277,7 +332,10 @@ class FlowMapOrthrus(L.LightningModule):
         mask = torch.ones(1, cache.get_seq_length() + block_size, dtype=torch.long, device=self.device)
         for s_i, t_i in zip(times[:-1], times[1:]):
             x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
-        return x.argmax(-1)
+        q = x.clamp_min(0)
+        q = q / q.sum(-1, keepdim=True).clamp_min(1e-12)  # float-noise safety
+        ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
+        return ids, q
 
     @torch.no_grad()
     def generate(
@@ -289,16 +347,24 @@ class FlowMapOrthrus(L.LightningModule):
         jumps=1,
         max_new_tokens: int = 128,
         eos_token_id=None,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
         **tokenizer_kwargs,
     ):
         """FULL lossless generation: draft -> verify -> commit, until done.
 
         Every cycle the flow map drafts ``block_size`` tokens in
         ``len(jumps)`` forwards, one AR forward verifies the block
-        (longest accepted prefix + AR's own correction/bonus token), the
-        cache is cropped to the accepted text and one 1-token AR forward
-        commits the extra token. The output ids are bit-identical to
-        :meth:`ar_generate` — the drafter affects speed, never content.
+        (accepted prefix + AR's own correction/bonus token), the cache is
+        cropped to the accepted text and one 1-token AR forward commits the
+        extra token. The drafter affects speed, never content:
+
+        * ``temperature=0`` (default) — greedy verification; the output ids
+          are BIT-identical to greedy :meth:`ar_generate`.
+        * ``temperature>0`` (optionally ``top_k``/``top_p``) — speculative
+          sampling: the output is lossless IN DISTRIBUTION, i.e. exactly the
+          law of :meth:`ar_generate` with the same sampling params.
 
         Returns a dict: ``sequences [1, T+N]``, ``new_tokens`` (list),
         ``text`` (when a tokenizer is attached), ``acceptance`` (per cycle),
@@ -317,7 +383,7 @@ class FlowMapOrthrus(L.LightningModule):
         emitted, acceptance = [], []
 
         while len(emitted) < max_new_tokens:
-            draft_ids = self._draft_block(cache, block_size, times)
+            draft_ids, q = self._draft_block(cache, block_size, times, sample=temperature > 0)
             n_forwards += len(times) - 1
 
             committed = cache.get_seq_length()
@@ -325,7 +391,12 @@ class FlowMapOrthrus(L.LightningModule):
             verify_logits = self.orthrus(draft_ids, mask, past_key_values=cache).logits
             n_forwards += 1
 
-            n_accepted, next_token = self.verify_greedy(draft_ids, last_logits, verify_logits)
+            if temperature > 0:
+                n_accepted, next_token = self._verify_speculative(
+                    draft_ids, q, last_logits, verify_logits, temperature, top_k, top_p
+                )
+            else:
+                n_accepted, next_token = self.verify_greedy(draft_ids, last_logits, verify_logits)
             cache.crop(committed + n_accepted)  # rejected draft K/V never pollute the cache
             acceptance.append(n_accepted)
             new = draft_ids[0, :n_accepted].tolist() + [int(next_token)]
@@ -344,10 +415,13 @@ class FlowMapOrthrus(L.LightningModule):
 
     @torch.no_grad()
     def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,
-                    eos_token_id=None, **tokenizer_kwargs):
-        """Plain greedy AR generation through the frozen path — the
-        correctness reference (generate() must match it token-for-token)
-        and the throughput baseline (1 token per forward)."""
+                    eos_token_id=None, temperature: float = 0.0,
+                    top_k: int | None = None, top_p: float | None = None,
+                    **tokenizer_kwargs):
+        """Plain AR generation through the frozen path — the correctness
+        reference (greedy generate() must match it token-for-token; sampled
+        generate() matches it in distribution) and the throughput baseline
+        (1 token per forward). ``temperature=0`` = greedy."""
         input_ids = self._encode(text, input_ids, **tokenizer_kwargs)
         if eos_token_id is None and self.tokenizer is not None:
             eos_token_id = self.tokenizer.eos_token_id
@@ -359,7 +433,8 @@ class FlowMapOrthrus(L.LightningModule):
         emitted = []
 
         while len(emitted) < max_new_tokens:
-            token = out.logits[:, -1].argmax(-1)
+            probs = self._target_probs(out.logits[:, -1], temperature, top_k, top_p)
+            token = torch.multinomial(probs[0], 1) if temperature > 0 else probs.argmax(-1)
             emitted.append(int(token))
             if eos_token_id is not None and int(token) == eos_token_id:
                 break

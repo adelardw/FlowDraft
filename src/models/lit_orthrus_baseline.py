@@ -67,16 +67,19 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
 
     # --- generation: one forward per draft --------------------------------------
 
-    def _draft_block(self, cache, block_size, times):
-        """Barycenter block -> ONE DF forward -> argmax.
+    def _draft_block(self, cache, block_size, times, sample: bool = False):
+        """Barycenter block -> ONE DF forward; ``q`` = its softmax.
 
         Only ``jumps=1`` is meaningful: a single-step drafter has no jump
         schedule (that limitation is the baseline's whole point).
+
+        Returns ``(draft_ids [1, K], q [1, K, V])``.
         """
         if len(times) != 2:
             raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
         vocab = self.df_processor.vocab_size
         x_in = torch.full((1, block_size, vocab), 1.0 / vocab, device=self.device)
         mask = torch.ones(1, cache.get_seq_length() + block_size, dtype=torch.long, device=self.device)
-        logits = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits
-        return logits.argmax(-1)
+        q = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits.float().softmax(-1)
+        ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
+        return ids, q

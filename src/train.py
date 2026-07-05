@@ -4,26 +4,14 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
 
 from src.data import build_dataloaders
-from src.models.lit_orthrus import FlowMapOrthrus
+from src.models.factory import build_lit
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     L.seed_everything(cfg.seed, workers=True)
 
-    variant = cfg.train.get("variant", "fixed")
-    if variant == "block_wise":
-        from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
-
-        model = FlowMapOrthrusBlockWise(cfg)
-    elif variant == "baseline":
-        from src.models.lit_orthrus_baseline import FlowMapOrthrusBaseline
-
-        model = FlowMapOrthrusBaseline(cfg)
-    elif variant == "fixed":
-        model = FlowMapOrthrus(cfg)
-    else:
-        raise ValueError(f"unknown train.variant='{variant}' (fixed | block_wise | baseline)")
+    model = build_lit(cfg, variant=cfg.train.get("variant", "fixed"))
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
     callbacks = [
