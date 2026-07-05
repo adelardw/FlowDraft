@@ -10,7 +10,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: work in progress.** Method, code, and experimental results are still being added. Sections marked **TODO** are placeholders / templates.
+> 🚧 **Status: core implementation landed** — adapter, three training variants (fixed / block-wise / baseline), lossless decoding (greedy bitwise + speculative sampling), evaluation harness. Data pipeline and GPU experiments pending; **Results** are TBD.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -110,81 +110,93 @@ The frozen AR model is used **only as a teacher** during training: it provides t
 
 ### Method
 
-> 🚧 **TODO.** Detailed method write-up goes here (kept high-level for now).
+One frozen backbone, two attention paths (the Orthrus host), a Categorical Flow Map drafter on the diffusion path, and a dual-distillation objective. Implemented; large-scale validation pending.
 
-Planned subsections:
-
-- Notation & problem setup.
-- Flow-map drafter (simplex endpoint head, one shared network for both the "local" and "long-jump" modes).
-- Dual-distillation objective:
-  - **AR-teacher term** — match the frozen verifier's distribution (what to propose).
-  - **Flow-map (self-)consistency term** — few-step jumping (how to propose it).
-- Open design choices (this is the core of Goal 3, "design the objective"):
-  - Anchor target: match the AR distribution (soft) vs. corpus tokens (hard) vs. a mix.
-  - Source of block content used to build trajectories: training corpus vs. AR-generated continuations (**on-policy** — matches the inference-time distribution).
-  - Balance weight between the two terms, and its schedule.
-- Lossless verification loop (unchanged from Orthrus).
-- Passes-per-block / cost analysis (why one or a few jumps, not many steps).
+- **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
+- **Objective** (`FlowMapOrthrus.compute_loss`): `loss = anchor + λ · (4·EC + 2·TD)`
+  - **anchor** — `KL(sg(p_AR) ‖ π_{t,t}(·))`: the AR verifier anchors only the diagonal (soft target). The evaluation point is a knob (`train.anchor_point`): trajectory `x_t` (default) | landing `X_{s,t}(x_s)`. Jumps get no direct AR loss — such a target is constant in the noise seed and collapses the transport.
+  - **EC** — eq. (18) of *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — jumps learn from the diagonal at their own landing point; truth flows `p_AR → π_{t,t} → π_{s,t}`.
+  - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
+  - Time pairs `(s, t)` per sample (`train.time_sampling`): `triangle` (uniform on {s≤t}) | `sequential` | `paper` (t~U, s~U[0,t]).
+- **Training geometries** (`train.variant`): `fixed` — noise the whole sequence; `block_wise` — the inference geometry (clean AR prefix in the KV cache + noisy K-token block; also shrinks every `[B,T,V]` loss tensor to `[B,K,V]`); `baseline` — Orthrus' own single-step masked-diffusion drafter (no time conditioning, barycenter as the simplex-native `[MASK]`).
+- **Decoding** (`FlowMapOrthrus.generate`): draft K tokens in 1–few jumps → one AR forward verifies the block → crop the cache to the accepted prefix → commit the correction/bonus token. `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` (+`top_k`/`top_p`): speculative sampling (accept `min(1, p/q)`, residual resampling) — lossless **in distribution** for any drafter quality.
 
 ### Repository structure
 
-> 🚧 **Suggested layout (TODO: adjust as the code lands).**
-
 ```text
 FlowDraft/
-├── README.md
-├── requirements.txt          # or environment.yml / pyproject.toml
-├── configs/                  # training & experiment configs
-├── src/
-│   ├── orthrus/              # Orthrus reproduction (frozen AR + masked-diffusion drafter)
-│   ├── flowmap/              # Categorical Flow Map drafter (simplex endpoint head)
-│   ├── distillation/         # dual distillation: AR-teacher + flow-map consistency
-│   ├── decoding/             # lossless parallel decoding loop + verification
-│   └── eval/                 # acceptance length / TPF / throughput metrics
-├── scripts/                  # train / evaluate entry points
-├── notebooks/                # analysis & ablations
-└── results/                  # logs, tables, figures
+├── main.py                        # playground CLI (typer): generate from your prompts
+├── hf-auth.sh                     # HF_TOKEN from .env -> env (gated Llama)
+├── pyproject.toml                 # uv project; installed as an editable `src` package
+└── src/
+    ├── models/
+    │   ├── base/df_adapter.py     # OrthrusAttentionAdapter: frozen AR + trainable DF twins
+    │   ├── base/fte.py            # FlowTimeEmbedding (s, t)
+    │   ├── model.py               # build_model: backbone + tokenizer + processor
+    │   ├── factory.py             # build_lit: variant selection + checkpoint loading
+    │   ├── lit_orthrus.py         # FlowMapOrthrus: loss, training, lossless generate
+    │   ├── lit_orthrus_block_wise.py  # training in the inference geometry
+    │   └── lit_orthrus_baseline.py    # Orthrus masked-diffusion baseline
+    ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
+    ├── data/                      # YOUR Dataset / collate / DataLoader (build_dataloaders seam)
+    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*
+    ├── train.py                   # training entrypoint
+    └── eval.py                    # dataset evaluation: acceptance / TPF / speedup / NLL
 ```
-
-> `src/orthrus/` follows the Orthrus reference implementation; `src/flowmap/` builds on the Categorical Flow Map reference implementation (see [References](#references)).
 
 ### Installation
 
-> 🚧 **TODO.**
-
 ```bash
-# git clone https://github.com/<org>/FlowDraft.git
-# cd FlowDraft
-# python -m venv .venv && source .venv/bin/activate
-# pip install -r requirements.txt
+git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+uv sync
+echo "HF_TOKEN=hf_..." > .env     # gated meta-llama access
+./hf-auth.sh                      # verify the token authenticates
 ```
 
 ### Usage
 
-> 🚧 **TODO.** Minimal end-to-end example (load model → run lossless decoding with the flow-map drafter).
-
 ```bash
-# Example (placeholder):
-# python scripts/generate.py --model <path> --drafter flowmap --block-size K --jumps N
+# generate from your prompts (greedy: bitwise-lossless check included)
+./hf-auth.sh uv run python main.py -p "Once upon a time" -p "def main():"
+# sampling (lossless in distribution) + a trained drafter
+./hf-auth.sh uv run python main.py -p "..." --temperature 0.8 --top-k 50 \
+    --jumps 2 --variant block_wise --checkpoint checkpoints/last.ckpt
 ```
 
 ### Training
 
-> 🚧 **TODO.** Dual-distillation training recipe: data, teacher, losses, schedule, hardware.
+Data: [nvidia/Nemotron-Post-Training-Dataset-v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2),
+streamed (no full download), category splits interleaved, `messages` rendered
+with the tokenizer's chat template (`src/data/dataloaders.py`). Batch contract:
+`input_ids [B,T]` + `attention_mask [B,T]`; the `[B,T,V]` simplex is built
+on-device, never in the batch.
 
 ```bash
-# Example (placeholder):
-# python scripts/train.py --config configs/flowmap_distill.yaml
+./hf-auth.sh uv run python src/train.py                            # fixed variant
+./hf-auth.sh uv run python src/train.py train.variant=block_wise   # inference geometry
+./hf-auth.sh uv run python src/train.py train.variant=baseline     # Orthrus baseline
 ```
+
+Knobs live in `configs/train.yaml`: `lambda` (dual-distillation balance),
+`anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), optimizer,
+Lightning `trainer.*`. Checkpoints store only the DF head (~1.7 GB for 3B).
 
 ### Evaluation
 
-> 🚧 **TODO.** How to reproduce the comparison and the ablations (block size, jump count), plus how losslessness is verified.
+Prefixes of validation samples are decoded twice — flow-draft vs plain AR — and
+compared. Greedy losslessness is asserted **bitwise**, not assumed.
 
 ```bash
-# Example (placeholder):
-# python scripts/evaluate.py --config configs/eval.yaml --verify-lossless
+./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt variant=block_wise
+# block-size / jump-count ablation grid (hydra multirun):
+./hf-auth.sh uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4
 ```
+
+Metrics per run: mean **acceptance** per cycle, **TPF** (tokens per forward, both
+paths), **tokens/s** + speedup vs AR, **continuation NLL** under the frozen
+teacher (generation quality), `lossless` flag. Sampling evaluation:
+`decode.temperature>0` (+`top_k`/`top_p`) — outputs are then lossless in
+distribution and the bitwise flag is reported as N/A.
 
 ### Results
 
@@ -324,81 +336,93 @@ FlowDraft строится внутри **Orthrus** — каркаса lossless-
 
 ### Метод
 
-> 🚧 **TODO.** Здесь будет подробное описание метода (пока высокоуровнево).
+Один замороженный бэкбон, два attention-пути (каркас Orthrus), CFM-драфтер на диффузионном пути и объектив двойной дистилляции. Реализовано; масштабная валидация впереди.
 
-Планируемые подразделы:
-
-- Обозначения и постановка задачи.
-- Flow-map драфтер (симплексная голова конечной точки, одна общая сеть для «локального» режима и «дальнего прыжка»).
-- Объектив двойной дистилляции:
-  - **Член AR-учителя** — подгонка под распределение замороженного верификатора (что предлагать).
-  - **Член консистентности flow-map (self-consistency)** — прыжок за один/несколько шагов (как предлагать).
-- Открытые развилки дизайна (это и есть суть Goal 3, «design the objective»):
-  - Таргет якоря: подгонка под AR-распределение (soft) vs. токены корпуса (hard) vs. микс.
-  - Источник содержимого блока для построения траекторий: обучающий корпус vs. AR-сгенерированные продолжения (**on-policy** — совпадает с инференсным распределением).
-  - Вес баланса между двумя членами и его расписание.
-- Lossless-петля верификации (без изменений относительно Orthrus).
-- Анализ числа проходов на блок / стоимости (почему один-два прыжка, а не много шагов).
+- **Адаптер** (`src/models/base/df_adapter.py`): каждый `q/k/v_proj` получает обучаемого двойника-копию замороженного AR-веса (~14% параметров 3B). Роутинг stateless (`torch.func.functional_call`, дерево модулей бэкбона не модифицируется); norm / MLP / `o_proj` / эмбеддинги / LM-head и единый KV-кэш — общие. Кэш AR-only по контракту: драфтер читает закоммиченный префикс, его собственные K/V срезаются сразу после каждого прохода. DF-путь работает **без маски** (двунаправленно; CFM не требует маски, кроме паддинга) и кондиционируется временами прыжка `(s, t)` через синусоидальный time-эмбеддинг с нулевой инициализацией (`fte.py`).
+- **Объектив** (`FlowMapOrthrus.compute_loss`): `loss = anchor + λ · (4·EC + 2·TD)`
+  - **anchor** — `KL(sg(p_AR) ‖ π_{t,t}(·))`: AR-верификатор заякоривает только диагональ (soft-таргет). Точка оценки — ручка `train.anchor_point`: trajectory `x_t` (дефолт) | landing `X_{s,t}(x_s)`. Прыжки прямого AR-лосса не получают — такой таргет константен по шумовому зерну и схлопывает транспорт.
+  - **EC** — ур. (18) из *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — прыжки учатся у диагонали в точке собственного приземления; знание течёт `p_AR → π_{t,t} → π_{s,t}`.
+  - **TD** — ур. (16): временной дрейф `‖∂_t π_{s,t}‖²`.
+  - Пары `(s, t)` на сэмпл (`train.time_sampling`): `triangle` (равномерно на {s≤t}) | `sequential` | `paper` (t~U, s~U[0,t]).
+- **Геометрии обучения** (`train.variant`): `fixed` — шумится вся последовательность; `block_wise` — инференсная геометрия (чистый AR-префикс в KV-кэше + шумный K-блок; заодно сжимает тензоры лосса `[B,T,V]` → `[B,K,V]`); `baseline` — одношаговый masked-diffusion драфтер самого Orthrus (без времени, барицентр как симплекс-нативный `[MASK]`).
+- **Декодирование** (`FlowMapOrthrus.generate`): драфт K токенов за 1–несколько прыжков → один AR-forward верифицирует блок → кэш срезается до принятого префикса → коммит коррекции/бонуса. `temperature=0`: жадная верификация, выход **побитово** равен `ar_generate`. `temperature>0` (+`top_k`/`top_p`): спекулятивное сэмплирование (приём `min(1, p/q)`, ресэмпл из остатка) — lossless **по распределению** при любом качестве драфтера.
 
 ### Структура репозитория
 
-> 🚧 **Предлагаемая структура (TODO: скорректировать по мере появления кода).**
-
 ```text
 FlowDraft/
-├── README.md
-├── requirements.txt          # или environment.yml / pyproject.toml
-├── configs/                  # конфиги обучения и экспериментов
-├── src/
-│   ├── orthrus/              # воспроизведение Orthrus (замороженный AR + masked-diffusion драфтер)
-│   ├── flowmap/              # драфтер Categorical Flow Map (симплексная голова)
-│   ├── distillation/         # двойная дистилляция: AR-учитель + консистентность flow-map
-│   ├── decoding/             # lossless-петля параллельного декодирования + верификация
-│   └── eval/                 # метрики: длина приёма / TPF / пропускная способность
-├── scripts/                  # точки входа train / evaluate
-├── notebooks/                # анализ и абляции
-└── results/                  # логи, таблицы, графики
+├── main.py                        # playground-CLI (typer): генерация из ваших промптов
+├── hf-auth.sh                     # HF_TOKEN из .env -> окружение (gated Llama)
+├── pyproject.toml                 # uv-проект; ставится editable-пакетом `src`
+└── src/
+    ├── models/
+    │   ├── base/df_adapter.py     # OrthrusAttentionAdapter: замороженный AR + DF-двойники
+    │   ├── base/fte.py            # FlowTimeEmbedding (s, t)
+    │   ├── model.py               # build_model: бэкбон + токенизатор + процессор
+    │   ├── factory.py             # build_lit: выбор варианта + загрузка чекпоинта
+    │   ├── lit_orthrus.py         # FlowMapOrthrus: лосс, обучение, lossless generate
+    │   ├── lit_orthrus_block_wise.py  # обучение в инференсной геометрии
+    │   └── lit_orthrus_baseline.py    # masked-diffusion бейзлайн Orthrus
+    ├── preprocessor/df_processor.py   # токенизация + one-hot вершины симплекса
+    ├── data/                      # Dataset / collate / DataLoader (шов build_dataloaders)
+    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*
+    ├── train.py                   # точка входа обучения
+    └── eval.py                    # оценка на датасете: acceptance / TPF / speedup / NLL
 ```
-
-> `src/orthrus/` следует референсной имплементации Orthrus; `src/flowmap/` строится на референсной имплементации Categorical Flow Map (см. [Ссылки](#ссылки)).
 
 ### Установка
 
-> 🚧 **TODO.**
-
 ```bash
-# git clone https://github.com/<org>/FlowDraft.git
-# cd FlowDraft
-# python -m venv .venv && source .venv/bin/activate
-# pip install -r requirements.txt
+git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+uv sync
+echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
+./hf-auth.sh                      # проверить аутентификацию
 ```
 
 ### Использование
 
-> 🚧 **TODO.** Минимальный сквозной пример (загрузить модель → запустить lossless-декодирование с flow-map драфтером).
-
 ```bash
-# Пример (заглушка):
-# python scripts/generate.py --model <path> --drafter flowmap --block-size K --jumps N
+# генерация из ваших промптов (greedy: с побитовой lossless-проверкой)
+./hf-auth.sh uv run python main.py -p "Once upon a time" -p "def main():"
+# сэмплирование (lossless по распределению) + обученный драфтер
+./hf-auth.sh uv run python main.py -p "..." --temperature 0.8 --top-k 50 \
+    --jumps 2 --variant block_wise --checkpoint checkpoints/last.ckpt
 ```
 
 ### Обучение
 
-> 🚧 **TODO.** Рецепт обучения с двойной дистилляцией: данные, учитель, лоссы, расписание, железо.
+Данные: [nvidia/Nemotron-Post-Training-Dataset-v2](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2) —
+стриминг (без полной закачки), интерливинг категорийных сплитов, `messages`
+рендерятся chat-template'ом токенизатора (`src/data/dataloaders.py`). Контракт
+батча: `input_ids [B,T]` + `attention_mask [B,T]`; симплекс `[B,T,V]` строится
+на девайсе и в батч не кладётся.
 
 ```bash
-# Пример (заглушка):
-# python scripts/train.py --config configs/flowmap_distill.yaml
+./hf-auth.sh uv run python src/train.py                            # fixed
+./hf-auth.sh uv run python src/train.py train.variant=block_wise   # инференсная геометрия
+./hf-auth.sh uv run python src/train.py train.variant=baseline     # бейзлайн Orthrus
 ```
+
+Ручки — в `configs/train.yaml`: `lambda` (баланс двойной дистилляции),
+`anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), оптимизатор,
+Lightning `trainer.*`. Чекпоинты хранят только DF-голову (~1.7 ГБ для 3B).
 
 ### Оценка
 
-> 🚧 **TODO.** Как воспроизвести сравнение и абляции (размер блока, число скачков) и как проверяется lossless.
+Префиксы валидационных сэмплов декодируются дважды — flow-draft и чистый AR — и
+сравниваются. Жадный lossless утверждается **побитово**, а не предполагается.
 
 ```bash
-# Пример (заглушка):
-# python scripts/evaluate.py --config configs/eval.yaml --verify-lossless
+./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt variant=block_wise
+# сетка абляций размер-блока / число-прыжков (hydra multirun):
+./hf-auth.sh uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4
 ```
+
+Метрики: средний **acceptance** за цикл, **TPF** (токенов на forward, обе ветки),
+**tokens/s** + speedup против AR, **NLL продолжения** под замороженным учителем
+(качество генерации), флаг `lossless`. Сэмплирующая оценка:
+`decode.temperature>0` (+`top_k`/`top_p`) — выходы lossless по распределению,
+побитовый флаг помечается как N/A.
 
 ### Результаты
 

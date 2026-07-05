@@ -36,10 +36,15 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
-# data section is YOURS — consumed only by build_dataloaders in src/train.py
+# consumed by src/data/dataloaders.py::build_dataloaders (streaming, no full download)
 data:
+  dataset: nvidia/Nemotron-Post-Training-Dataset-v2
+  splits: [chat, code, math, stem]   # interleaved; multilingual_{ja,de,it,es,fr} also available
+  streaming: true
+  shuffle_buffer: 1000
+  val_size: 256               # first N samples of the stream -> validation
   batch_size: 4
   max_length: 512
-  num_workers: 4
+  num_workers: 0              # streaming dataset: keep 0 unless sharding is configured
 
 # block_size / jump_count are method knobs (ablated per the slides)
