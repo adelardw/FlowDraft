@@ -200,7 +200,8 @@ class FlowMapOrthrus(L.LightningModule):
         # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
         # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
         # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
-        dt = torch.where(t + 1e-2 <= 1.0, 1e-2, -1e-2)
+        dt_val = 0.05
+        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
         pi_dt = self.orthrus(x_s, mask, use_df=True, s=s, t=t + dt).logits.float().softmax(-1)
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)  # [B, T]
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
