@@ -316,7 +316,7 @@ class FlowMapOrthrus(L.LightningModule):
         bonus = self._target_probs(verify_logits[:, -1], temperature, top_k, top_p)
         return draft_ids.size(1), torch.multinomial(bonus[0], 1)
 
-    def _draft_block(self, cache, block_size, times, sample: bool = False):
+    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Dirichlet noise -> jump schedule via :meth:`predict`.
 
         The final simplex point IS the proposal distribution ``q`` (a convex
@@ -324,15 +324,31 @@ class FlowMapOrthrus(L.LightningModule):
         sampling draws from it. The shared cache stays AR-only: the adapter
         crops the draft's K/V right after each forward.
 
-        Returns ``(draft_ids [1, K], q [1, K, V])``.
+        ``anchor_token`` — the previous cycle's correction/bonus token whose
+        K/V are NOT yet in the cache. It rides as a CLEAN in-block position 0
+        (the drafter sees it bidirectionally) and is re-clamped to its
+        one-hot after every jump: the position is already at t=1 while the
+        time labels cover the whole block (diffusion-inpainting clamp). Its
+        K/V get committed by the NEXT verify forward, not by a standalone
+        1-token pass — that keeps the cycle at ``jumps + 1`` forwards.
+
+        Returns ``(draft_ids [1, K], q [1, K, V])`` for the K FRESH positions.
         """
+        vocab = self.df_processor.vocab_size
         x = torch.distributions.Dirichlet(
-            torch.ones(self.df_processor.vocab_size, device=self.device)
+            torch.ones(vocab, device=self.device)
         ).sample((1, block_size))
-        mask = torch.ones(1, cache.get_seq_length() + block_size, dtype=torch.long, device=self.device)
+        anchor = None
+        if anchor_token is not None:
+            anchor = F.one_hot(anchor_token.view(1, 1), vocab).to(x.dtype)
+            x = torch.cat([anchor, x], dim=1)
+        mask = torch.ones(1, cache.get_seq_length() + x.size(1), dtype=torch.long, device=self.device)
         for s_i, t_i in zip(times[:-1], times[1:]):
             x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
-        q = x.clamp_min(0)
+            if anchor is not None:
+                x = torch.cat([anchor, x[:, 1:]], dim=1)  # keep the clean position clean
+        fresh = x[:, 1:] if anchor is not None else x
+        q = fresh.clamp_min(0)
         q = q / q.sum(-1, keepdim=True).clamp_min(1e-12)  # float-noise safety
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q
@@ -354,11 +370,12 @@ class FlowMapOrthrus(L.LightningModule):
     ):
         """FULL lossless generation: draft -> verify -> commit, until done.
 
-        Every cycle the flow map drafts ``block_size`` tokens in
-        ``len(jumps)`` forwards, one AR forward verifies the block
-        (accepted prefix + AR's own correction/bonus token), the cache is
-        cropped to the accepted text and one 1-token AR forward commits the
-        extra token. The drafter affects speed, never content:
+        Every cycle: the flow map drafts ``block_size`` fresh tokens in
+        ``jumps`` forwards (the previous cycle's correction/bonus token rides
+        along as a clean in-block anchor), then ONE AR forward verifies the
+        block — committing the anchor's K/V and scoring every draft position
+        in the same pass. Cycle cost = ``jumps + 1`` forwards, nothing else.
+        The drafter affects speed, never content:
 
         * ``temperature=0`` (default) — greedy verification; the output ids
           are BIT-identical to greedy :meth:`ar_generate`.
@@ -381,15 +398,30 @@ class FlowMapOrthrus(L.LightningModule):
         last_logits = out.logits[:, -1]
         n_forwards = 1
         emitted, acceptance = [], []
+        # The correction/bonus token is NOT committed by its own 1-token pass
+        # (that would make the cycle jumps+2 forwards and depress TPF).
+        # Instead it stays "pending": the drafter sees it as a clean in-block
+        # anchor, and the next verify forward commits its K/V and yields the
+        # first fresh position's target in one go — the cycle is jumps+1.
+        pending = None
 
         while len(emitted) < max_new_tokens:
-            draft_ids, q = self._draft_block(cache, block_size, times, sample=temperature > 0)
+            draft_ids, q = self._draft_block(
+                cache, block_size, times, sample=temperature > 0, anchor_token=pending
+            )
             n_forwards += len(times) - 1
 
             committed = cache.get_seq_length()
-            mask = torch.ones(1, committed + block_size, dtype=torch.long, device=self.device)
-            verify_logits = self.orthrus(draft_ids, mask, past_key_values=cache).logits
+            verify_in = draft_ids if pending is None else torch.cat(
+                [pending.view(1, 1), draft_ids], dim=1
+            )
+            mask = torch.ones(1, committed + verify_in.size(1), dtype=torch.long, device=self.device)
+            logits = self.orthrus(verify_in, mask, past_key_values=cache).logits
             n_forwards += 1
+            if pending is not None:
+                last_logits, verify_logits = logits[:, 0], logits[:, 1:]
+            else:
+                verify_logits = logits  # last_logits carried from the prefill
 
             if temperature > 0:
                 n_accepted, next_token = self._verify_speculative(
@@ -397,18 +429,15 @@ class FlowMapOrthrus(L.LightningModule):
                 )
             else:
                 n_accepted, next_token = self.verify_greedy(draft_ids, last_logits, verify_logits)
-            cache.crop(committed + n_accepted)  # rejected draft K/V never pollute the cache
+            # keep the (now committed) pending token + the accepted prefix;
+            # rejected draft K/V never pollute the cache
+            cache.crop(committed + (0 if pending is None else 1) + n_accepted)
             acceptance.append(n_accepted)
             new = draft_ids[0, :n_accepted].tolist() + [int(next_token)]
             emitted.extend(new)
+            pending = next_token
             if eos_token_id is not None and eos_token_id in new:
                 break
-
-            # commit next_token's K/V; its logits are the next cycle's last_logits
-            mask = torch.ones(1, cache.get_seq_length() + 1, dtype=torch.long, device=self.device)
-            out = self.orthrus(next_token.view(1, 1), mask, past_key_values=cache)
-            last_logits = out.logits[:, -1]
-            n_forwards += 1
 
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
                               acceptance=acceptance)

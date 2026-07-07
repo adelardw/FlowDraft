@@ -39,27 +39,45 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
         eos_token_id=eos_token_id, **sampling,
     )
     n_tokens = len(fd["new_tokens"])
+    assert fd["acceptance"], "generation ran zero cycles — check max_new_tokens"
     return {
         "lossless": fd["new_tokens"] == ar["new_tokens"] if temperature == 0 else None,
-        # drafted tokens accepted per cycle — the number the whole project optimizes
-        "acceptance": sum(fd["acceptance"]) / max(len(fd["acceptance"]), 1),
-        # tokens per forward pass (the PDF's TPF; AR is ~1 by construction)
+        # HEADLINE metrics — hardware/kernel independent:
+        # drafted tokens accepted per cycle (what the whole project optimizes)
+        "acceptance": sum(fd["acceptance"]) / len(fd["acceptance"]),
+        # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
+        # wall-clock DIAGNOSTICS, not headline: under eager attention both
+        # paths are throttled by the same slow kernel and the ratio drifts;
+        # for reportable wall-clock rerun with model.backbone.attn_implementation=sdpa
         "tokens_per_s": n_tokens / fd["seconds"],
         "tokens_per_s_ar": len(ar["new_tokens"]) / ar["seconds"],
         "speedup": (n_tokens / fd["seconds"]) / (len(ar["new_tokens"]) / ar["seconds"]),
-        # generation quality: teacher NLL of the continuation
-        "nll": continuation_nll(model, prompt_ids, fd["new_tokens"]),
+        # teacher NLL of the continuation: meaningful under sampling only —
+        # at temperature=0 the output is bitwise equal to AR (asserted above),
+        # so the greedy NLL would measure nothing but the lossless property
+        "nll": continuation_nll(model, prompt_ids, fd["new_tokens"]) if temperature > 0 else None,
         "n_tokens": n_tokens,
     }
 
 
 def aggregate(per_prompt):
-    """Mean of every numeric metric; lossless must hold on EVERY prompt
+    """Mean ± std of every numeric metric (acceptance varies a lot across
+    prompts — a mean without spread is not a reportable number); ``None``
+    values are skipped per-key. ``lossless`` must hold on EVERY prompt
     (None = sampling mode, bitwise equality not applicable)."""
-    keys = [k for k in per_prompt[0] if k != "lossless"]
-    out = {k: sum(r[k] for r in per_prompt) / len(per_prompt) for k in keys}
+    out = {}
+    for key in per_prompt[0]:
+        if key == "lossless":
+            continue
+        vals = [r[key] for r in per_prompt if r[key] is not None]
+        if not vals:
+            continue
+        mean = sum(vals) / len(vals)
+        out[key] = mean
+        if len(vals) > 1:
+            out[f"{key}_std"] = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
     flags = [r["lossless"] for r in per_prompt]
     out["lossless"] = None if all(f is None for f in flags) else all(f for f in flags if f is not None)
     return out

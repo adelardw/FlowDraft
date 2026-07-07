@@ -13,14 +13,17 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
     decode time. Here every step looks exactly like one decode cycle:
 
       1. the batch is split at a random point ``p``; ONE no-grad AR forward
-         over ``[:, :p+K]`` yields both the KV cache (cropped to ``p`` — the
-         clean prefix, AR weights only) and the teacher distributions for
-         the K block tokens (no extra shift needed afterwards: the slice
-         ``[p-1 : p+K-1]`` is already token-aligned);
-      2. only the K-token tail block is noised — every ``[B, T, V]`` tensor
-         of the fixed variant shrinks to ``[B, K, V]`` (~T/K times smaller);
-      3. all DF forwards (draft, anchor, EC expert, TD) run WITH the cache,
-         attending to the clean prefix like at decode time.
+         over ``[:, :p+1+K]`` yields both the KV cache (cropped to ``p`` —
+         the clean prefix, AR weights only) and the teacher distributions
+         ``[p : p+K]`` for the K fresh tokens;
+      2. the block mirrors the decode cycle exactly: position ``p`` is the
+         CLEAN in-block anchor (the decode loop's pending correction/bonus
+         token, whose K/V are not in the cache while drafting), positions
+         ``p+1 .. p+K`` are noised and drafted;
+      3. every DF forward of the loss (draft, anchor, EC expert, TD) runs
+         WITH the cache AND the clean anchor at in-block position 0 — the
+         drafter trains in the exact configuration it decodes in. All
+         ``[B, T, V]`` tensors of the fixed variant shrink to ``[B, K, V]``.
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
     ``train.block_size`` (K) and ``train.min_prefix``.
@@ -37,46 +40,56 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         """
         min_prefix = self.cfg.train.get("min_prefix", 1)
         true_min = int(attention_mask.sum(dim=1).min())
-        high = max(min_prefix + 1, true_min - block + 1)
+        # the window is anchor + K fresh tokens: p + 1 + K must fit
+        high = max(min_prefix + 1, true_min - block)
         return int(torch.randint(min_prefix, high, (1,)))
+
+    def _df_forward(self, x_block, anchor, ctx_mask, cache, s, t):
+        """One DF forward in the decode configuration: the clean anchor rides
+        at in-block position 0, its output row is discarded — returned logits
+        cover the K fresh positions only."""
+        x_in = torch.cat([anchor, x_block], dim=1)
+        logits = self.orthrus(x_in, ctx_mask, use_df=True, s=s, t=t, past_key_values=cache).logits
+        return logits[:, 1:]
 
     def _shared_step(self, batch):
         ids, mask = batch["input_ids"], batch["attention_mask"]
         block = self.cfg.train.get("block_size", 64)
         p = self._split_point(mask, block)
-        # With dynamic padding the tensor can be NARROWER than min_prefix + K.
-        # Shrink the window to what actually exists — otherwise the teacher
-        # slice [p-1 : p+K-1] and the block [p : p+K] get clipped by the
-        # tensor edge to DIFFERENT lengths (off by one -> shape mismatch).
+        # With dynamic padding the tensor can be NARROWER than the window.
+        # Shrink to what exists — otherwise the teacher and block slices get
+        # clipped by the tensor edge to DIFFERENT lengths (shape mismatch).
         width = ids.size(1)
-        if width < 2:
-            raise ValueError("cannot train on width-1 batches: no AR context for the block")
-        p = min(p, width - 1)
-        block = min(block, width - p)
-        ctx_mask = mask[:, : p + block]
+        if width < 3:
+            raise ValueError("cannot train on width<3 batches: prefix + anchor + block needed")
+        p = min(p, width - 2)
+        block = min(block, width - p - 1)
+        ctx_mask = mask[:, : p + 1 + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad():
-            teacher_full = self.orthrus(ids[:, : p + block], ctx_mask, past_key_values=cache).logits
-        # Keep ONLY the clean-prefix K/V — the decode-loop invariant. The AR
-        # logits at [p-1 : p+K-1] are the distributions of tokens p..p+K-1.
+            teacher_full = self.orthrus(ids[:, : p + 1 + block], ctx_mask, past_key_values=cache).logits
+        # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
+        # K/V are NOT in the cache while drafting. The AR logits at
+        # [p : p+K] are the distributions of the fresh tokens p+1..p+K.
         cache.crop(p)
-        teacher_logits = teacher_full[:, p - 1 : p + block - 1]
+        teacher_logits = teacher_full[:, p : p + block]
 
-        block_mask = mask[:, p : p + block]
-        x1 = self.df_processor.to_simplex(ids[:, p : p + block], attention_mask=block_mask)
+        # position p — the clean in-block anchor; p+1..p+K — the noised block
+        anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])
+        block_mask = mask[:, p + 1 : p + 1 + block]
+        x1 = self.df_processor.to_simplex(ids[:, p + 1 : p + 1 + block], attention_mask=block_mask)
         x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
-        draft_logits = self.orthrus(
-            x_s, ctx_mask, use_df=True, s=s, t=t, past_key_values=cache
-        ).logits
-        return teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache
+        draft_logits = self._df_forward(x_s, anchor, ctx_mask, cache, s, t)
+        return teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor
 
-    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache):
+    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor):
         """The parent's three terms in block geometry.
 
         Differences from the fixed variant: no one-position shift (teacher
         is pre-aligned in ``_shared_step``), the live mask is the block's
-        own, and every DF forward carries the clean-prefix cache.
+        own, and every DF forward carries the clean-prefix cache AND the
+        clean in-block anchor (via :meth:`_df_forward`).
         """
         eps = 1e-4
         live = block_mask.bool()
@@ -101,10 +114,8 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
         if anchor_input is None:
             raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
-        diag_logits = self.orthrus(
-            anchor_input, ctx_mask, use_df=True, s=t, t=t, past_key_values=cache
-        ).logits
-        anchor = self._masked_kl(
+        diag_logits = self._df_forward(anchor_input, anchor, ctx_mask, cache, s=t, t=t)
+        anchor_loss = self._masked_kl(
             F.log_softmax(teacher_logits.float(), -1),
             F.log_softmax(diag_logits.float(), -1),
             live,
@@ -116,9 +127,9 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
             tgt = diag_logits.detach().float().softmax(-1)
         else:
             with torch.no_grad():
-                tgt = self.orthrus(
-                    x_jump, ctx_mask, use_df=True, s=t, t=t, past_key_values=cache
-                ).logits.float().softmax(-1)
+                tgt = self._df_forward(
+                    x_jump, anchor, ctx_mask, cache, s=t, t=t
+                ).float().softmax(-1)
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
         # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
@@ -126,14 +137,12 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
         dt_val = 0.05
         dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
-        pi_dt = self.orthrus(
-            x_s, ctx_mask, use_df=True, s=s, t=t + dt, past_key_values=cache
-        ).logits.float().softmax(-1)
+        pi_dt = self._df_forward(x_s, anchor, ctx_mask, cache, s=s, t=t + dt).float().softmax(-1)
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
 
-        loss = anchor + self.cfg.train.get("lambda", 1.0) * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td})
+        loss = anchor_loss + self.cfg.train.get("lambda", 1.0) * (4.0 * ec + 2.0 * td)
+        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td})
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -146,7 +155,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
     def validation_step(self, batch, batch_idx):
         teacher_logits, draft_logits, *rest = self._shared_step(batch)
         loss = self.compute_loss(teacher_logits, draft_logits, *rest)
-        block_mask = rest[-2]
+        block_mask = rest[-3]
         # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
         agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[block_mask.bool()]
         self.log("val/loss", loss, prog_bar=True)

@@ -14,8 +14,22 @@ decode:
   block_size: 8
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
-  n_prompts: 8              # validation samples to evaluate on
+  n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
   prompt_len: 32            # prefix length (tokens) taken from each sample
   temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = speculative sampling (lossless in distribution)
   top_k: null               # sampling only
   top_p: null               # sampling only
+
+# Prompt source for dataset mode. The val slice IS held out from training
+# samples (train skips the first val_size of the same seeded stream), but it
+# is the SAME distribution — for a distribution-level held-out bench
+# (MATH-500 / HumanEval / MT-Bench style) point dataset/splits elsewhere.
+data:
+  dataset: nvidia/Nemotron-Post-Training-Dataset-v2
+  splits: [chat, code, math, stem]
+  streaming: true
+  shuffle_buffer: 1000
+  val_size: 256
+  batch_size: 4
+  max_length: 512
+  num_workers: 0
