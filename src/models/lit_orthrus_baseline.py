@@ -67,19 +67,25 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
 
     # --- generation: one forward per draft --------------------------------------
 
-    def _draft_block(self, cache, block_size, times, sample: bool = False):
+    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Barycenter block -> ONE DF forward; ``q`` = its softmax.
 
         Only ``jumps=1`` is meaningful: a single-step drafter has no jump
-        schedule (that limitation is the baseline's whole point).
+        schedule (that limitation is the baseline's whole point). The
+        pending correction/bonus token, when given, rides as a clean one-hot
+        position 0 (see the parent) and is sliced off the returned proposal.
 
-        Returns ``(draft_ids [1, K], q [1, K, V])``.
+        Returns ``(draft_ids [1, K], q [1, K, V])`` for the K fresh positions.
         """
         if len(times) != 2:
             raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
         vocab = self.df_processor.vocab_size
         x_in = torch.full((1, block_size, vocab), 1.0 / vocab, device=self.device)
-        mask = torch.ones(1, cache.get_seq_length() + block_size, dtype=torch.long, device=self.device)
-        q = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits.float().softmax(-1)
+        if anchor_token is not None:
+            anchor = F.one_hot(anchor_token.view(1, 1), vocab).to(x_in.dtype)
+            x_in = torch.cat([anchor, x_in], dim=1)
+        mask = torch.ones(1, cache.get_seq_length() + x_in.size(1), dtype=torch.long, device=self.device)
+        logits = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits
+        q = (logits[:, 1:] if anchor_token is not None else logits).float().softmax(-1)
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q
