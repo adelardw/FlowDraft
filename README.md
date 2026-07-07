@@ -21,6 +21,7 @@
 ### Table of contents
 
 - [Overview](#overview)
+- [Quickstart](#quickstart)
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
@@ -47,6 +48,38 @@ Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens cos
 **FlowDraft** upgrades the *drafter* inside a lossless parallel-decoding loop. The throughput of any verify-based system is governed by its **acceptance length** — the number of drafted tokens accepted per cycle. We replace the single-step masked-diffusion drafter with a **Categorical Flow Map** drafter that produces a higher-fidelity *joint* proposal over the block at the **same** number of forward passes. Verification is left untouched, so the output stays strictly lossless — the drafter affects only **speed**, never **quality**.
 
 Crucially, the AR model is what does the verifying, so it is kept **frozen throughout**. Keeping it untouched is exactly what makes the output provably identical to the base model; it is what the word *lossless* rests on.
+
+### Quickstart
+
+```bash
+# 1. Setup (once)
+git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+uv sync
+echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
+./hf-auth.sh                         # verify: prints your HF username
+
+# 2. Inference sanity — the UNTRAINED drafter is already lossless (just slow)
+./hf-auth.sh uv run python main.py -p "Once upon a time"
+#    -> generation + [lossless vs greedy AR: PASS]
+
+# 3. Train the drafter (block_wise = the inference geometry; GPU recommended)
+./hf-auth.sh uv run python src/train.py train.variant=block_wise \
+    trainer.max_steps=10000 data.batch_size=8
+#    watch: loss/anchor ↓, loss/ec ↓, loss/td sane, val/teacher_agreement ↑
+#    checkpoints (DF head only, ~1.7 GB for 3B) land in checkpoints/
+
+# 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
+./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt variant=block_wise
+
+# 5. Generate with the trained drafter (greedy; add --temperature for sampling)
+./hf-auth.sh uv run python main.py -p "..." --variant block_wise \
+    --checkpoint checkpoints/last.ckpt --jumps 2
+```
+
+Laptop debugging: `src/train.py` and `src/eval.py` also run on a small ungated
+backbone — append the hydra overrides
+`model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
+model.backbone.device_map=null`.
 
 ### Background: the decoding bottleneck
 
@@ -251,6 +284,7 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 ### Содержание
 
 - [Обзор](#обзор)
+- [Быстрый старт](#быстрый-старт)
 - [Контекст: узкое место декодирования](#контекст-узкое-место-декодирования)
 - [Host-фреймворк: Orthrus](#host-фреймворк-orthrus)
 - [Проблема](#проблема)
@@ -277,6 +311,38 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 **FlowDraft** улучшает *драфтер* внутри lossless-петли параллельного декодирования. Пропускную способность любой системы с верификацией определяет **длина приёма (acceptance length)** — сколько сдрафченных токенов принимается за цикл. Мы заменяем одношаговый masked-diffusion драфтер на драфтер на основе **Categorical Flow Map**, который выдаёт более качественное *совместное* предложение по блоку при **том же** числе прямых проходов. Верификация не меняется, поэтому вывод остаётся строго lossless — драфтер влияет только на **скорость**, но не на **качество**.
 
 Важно: верифицирует именно AR-модель, поэтому она остаётся **замороженной на всех этапах**. Именно то, что её не трогают, и делает вывод доказуемо идентичным базовой модели — на этом держится слово *lossless*.
+
+### Быстрый старт
+
+```bash
+# 1. Установка (один раз)
+git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+uv sync
+echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
+./hf-auth.sh                         # проверка: печатает ваш HF-логин
+
+# 2. Санити инференса — НЕОБУЧЕННЫЙ драфтер уже lossless (просто медленный)
+./hf-auth.sh uv run python main.py -p "Once upon a time"
+#    -> генерация + [lossless vs greedy AR: PASS]
+
+# 3. Обучение драфтера (block_wise = инференсная геометрия; нужен GPU)
+./hf-auth.sh uv run python src/train.py train.variant=block_wise \
+    trainer.max_steps=10000 data.batch_size=8
+#    смотреть: loss/anchor ↓, loss/ec ↓, loss/td без пиков, val/teacher_agreement ↑
+#    чекпоинты (только DF-голова, ~1.7 ГБ для 3B) падают в checkpoints/
+
+# 4. Замер acceptance / TPF против AR-бейзлайна (lossless утверждается побитово)
+./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt variant=block_wise
+
+# 5. Генерация обученным драфтером (greedy; --temperature для сэмплирования)
+./hf-auth.sh uv run python main.py -p "..." --variant block_wise \
+    --checkpoint checkpoints/last.ckpt --jumps 2
+```
+
+Отладка на ноутбуке: `src/train.py` и `src/eval.py` работают и на маленьком
+негейтированном бэкбоне — добавьте hydra-оверрайды
+`model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
+model.backbone.device_map=null`.
 
 ### Контекст: узкое место декодирования
 
