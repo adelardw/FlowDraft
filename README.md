@@ -227,9 +227,10 @@ compared. Greedy losslessness is asserted **bitwise**, not assumed.
 
 Headline metrics (mean ± std over `n_prompts`): **acceptance** per cycle and
 **TPF** (tokens per forward; cycle = `jumps+1`). Wall-clock tokens/s and
-speedup vs AR are reported as diagnostics only — under eager attention both
-paths share the same slow kernel and the ratio is not publishable (rerun with
-`model.backbone.attn_implementation=sdpa` for wall-clock numbers).
+speedup vs AR are reported as diagnostics (hardware/kernel dependent). The
+attention kernel is a config switch (`model.backbone.attn_implementation`):
+`sdpa` (default; fused, supports the DF mask — verified against eager) |
+`flex_attention` (compiled block masks, GPU only) | `eager` (reference).
 **Continuation NLL** under the frozen teacher is computed in sampling mode
 only (at greedy the output is bitwise equal to AR, so it measures nothing).
 The val slice is held out from training samples; for a distribution-level
@@ -490,9 +491,10 @@ Lightning `trainer.*`. Чекпоинты хранят только DF-голо�
 
 Головные метрики (mean ± std по `n_prompts`): **acceptance** за цикл и **TPF**
 (токенов на forward; цикл = `jumps+1`). Wall-clock tokens/s и speedup против
-AR — только диагностика: под eager-вниманием обе ветки задушены одним
-медленным ядром и отношение непубликуемо (для wall-clock цифр перезапустить с
-`model.backbone.attn_implementation=sdpa`). **NLL продолжения** под
+AR — диагностика (зависит от железа/ядра). Ядро внимания — переключатель
+конфига (`model.backbone.attn_implementation`): `sdpa` (дефолт; fused,
+поддерживает DF-маску — сверено с eager) | `flex_attention` (компилируемые
+блок-маски, только GPU) | `eager` (референс). **NLL продолжения** под
 замороженным учителем считается только в сэмплирующем режиме (при greedy
 выход побитово равен AR и NLL не измеряет ничего). Val-срез held-out по
 сэмплам обучения; для held-out по распределению направьте

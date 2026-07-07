@@ -9,7 +9,12 @@ backbone:
   revision: main
   dtype: bfloat16              # transformers>=5 renamed `torch_dtype` -> `dtype`
   device_map: auto
-  attn_implementation: eager    # sdpa | eager | flash_attention_2
+  # Attention kernel — the adapter is kernel-agnostic (it feeds masks to the
+  # HF interface), so this is the ONLY switch:
+  #   sdpa           — fused kernels, supports our 4D DF mask (verified == eager to 2e-7)
+  #   flex_attention — compiled block masks, GPU only (kernel compile fails on CPU)
+  #   eager          — reference path; required only if the jvp-based TD returns
+  attn_implementation: sdpa
   low_cpu_mem_usage: true
   trust_remote_code: false
   use_cache: false              # KV cache is managed by the decode loop, not HF

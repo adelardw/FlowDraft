@@ -48,9 +48,8 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
         # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
-        # wall-clock DIAGNOSTICS, not headline: under eager attention both
-        # paths are throttled by the same slow kernel and the ratio drifts;
-        # for reportable wall-clock rerun with model.backbone.attn_implementation=sdpa
+        # wall-clock DIAGNOSTICS, not headline: hardware/kernel dependent
+        # (default kernel is sdpa; try model.backbone.attn_implementation=flex_attention on GPU)
         "tokens_per_s": n_tokens / fd["seconds"],
         "tokens_per_s_ar": len(ar["new_tokens"]) / ar["seconds"],
         "speedup": (n_tokens / fd["seconds"]) / (len(ar["new_tokens"]) / ar["seconds"]),
