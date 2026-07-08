@@ -1,0 +1,10 @@
+# @package _global_
+# Brief step 1: reproduce the Orthrus baseline at tractable scale.
+# 0.5B backbone, block-causal geometry (causal to context, bidirectional
+# within block), single-step masked drafting, drafter-only training.
+#   uv run python src/train.py +experiment=baseline
+defaults:
+  - override /model: qwen2_0.5b
+
+train:
+  variant: baseline_block_wise

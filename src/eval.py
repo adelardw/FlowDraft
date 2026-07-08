@@ -22,14 +22,17 @@ def continuation_nll(model, prompt_ids, new_tokens):
 
 @torch.no_grad()
 def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
-                    temperature=0.0, top_k=None, top_p=None, eos_token_id=None):
+                    temperature=0.0, top_k=None, top_p=None, coupled=True,
+                    eos_token_id=None):
     """model.generate vs model.ar_generate on one prompt -> metrics.
 
-    At ``temperature=0`` ``lossless`` is checked bitwise, not assumed. With
-    sampling the outputs are equal in distribution, not token-for-token, so
-    ``lossless`` is reported as None there.
+    ``lossless`` is checked bitwise at ``temperature=0`` AND at
+    ``temperature>0`` with Gumbel-coupled sampling (the default). Only the
+    uncoupled (Leviathan) mode is equal in distribution rather than
+    token-for-token — there ``lossless`` is None and the TV equivalence
+    check applies instead.
     """
-    sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p)
+    sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p, coupled=coupled)
     fd = model.generate(
         input_ids=prompt_ids, block_size=block_size, jumps=jumps,
         max_new_tokens=max_new_tokens, eos_token_id=eos_token_id, **sampling,
@@ -40,8 +43,9 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
     )
     n_tokens = len(fd["new_tokens"])
     assert fd["acceptance"], "generation ran zero cycles — check max_new_tokens"
+    bitwise_applicable = temperature == 0 or coupled
     return {
-        "lossless": fd["new_tokens"] == ar["new_tokens"] if temperature == 0 else None,
+        "lossless": fd["new_tokens"] == ar["new_tokens"] if bitwise_applicable else None,
         # HEADLINE metrics — hardware/kernel independent:
         # drafted tokens accepted per cycle (what the whole project optimizes)
         "acceptance": sum(fd["acceptance"]) / len(fd["acceptance"]),
@@ -80,6 +84,37 @@ def aggregate(per_prompt):
     flags = [r["lossless"] for r in per_prompt]
     out["lossless"] = None if all(f is None for f in flags) else all(f for f in flags if f is not None)
     return out
+
+
+@torch.no_grad()
+def sampling_equivalence(model, prompt_ids, *, n_samples, block_size, jumps,
+                         temperature, top_k=None, top_p=None):
+    """Distributional lossless check for ``temperature > 0``.
+
+    Bitwise comparison is impossible without coupling the RNG streams of the
+    speculative and AR paths, so equality of LAWS is tested instead:
+    null-calibrated total variation on first-token counts. ``tv_null`` —
+    the TV between two independent AR runs (pure sampling noise); the
+    speculative path passes if ``tv_fd_ar`` does not exceed it materially.
+    """
+    from collections import Counter
+
+    c_fd, c_ar1, c_ar2 = Counter(), Counter(), Counter()
+    for _ in range(n_samples):
+        c_fd[model.generate(
+            input_ids=prompt_ids, block_size=block_size, jumps=jumps, max_new_tokens=1,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+        )["new_tokens"][0]] += 1
+        for c in (c_ar1, c_ar2):
+            c[model.ar_generate(
+                input_ids=prompt_ids, max_new_tokens=1,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+            )["new_tokens"][0]] += 1
+
+    def tv(a, b):
+        return sum(abs(a[k] - b[k]) for k in set(a) | set(b)) / (2 * n_samples)
+
+    return {"tv_fd_ar": tv(c_fd, c_ar1), "tv_null": tv(c_ar1, c_ar2)}
 
 
 def dataset_prompts(model, cfg):
@@ -121,7 +156,10 @@ def main(cfg: DictConfig) -> None:
 
     dec = cfg.decode
     results = []
+    first_prompt = None
     for label, ids in dataset_prompts(model, cfg):
+        if first_prompt is None:
+            first_prompt = ids
         metrics = evaluate_prompt(
             model, ids,
             block_size=dec.block_size,
@@ -130,6 +168,7 @@ def main(cfg: DictConfig) -> None:
             temperature=dec.get("temperature", 0.0),
             top_k=dec.get("top_k", None),
             top_p=dec.get("top_p", None),
+            coupled=dec.get("coupled", True),
         )
         logger.info(f"{label!r}: {metrics}")
         results.append(metrics)
@@ -140,8 +179,46 @@ def main(cfg: DictConfig) -> None:
         f"temperature={dec.get('temperature', 0.0)} ==="
     )
     logger.info(OmegaConf.to_yaml(summary))
+
+    # machine-readable row for the analysis plots (src/plots.py)
+    results_file = cfg.get("results_file", None)
+    if results_file:
+        import json
+        from pathlib import Path
+
+        from hydra.utils import to_absolute_path
+
+        row = {
+            "variant": cfg.get("variant", "fixed"),
+            "model": cfg.model.name,
+            "checkpoint": cfg.checkpoint,
+            "block_size": dec.block_size,
+            "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),
+            "temperature": dec.get("temperature", 0.0),
+            "coupled": dec.get("coupled", True),
+            "n_prompts": len(results),
+            **summary,
+        }
+        path = Path(to_absolute_path(str(results_file)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        logger.info(f"row appended -> {path}")
     if summary["lossless"] is False:
         raise RuntimeError("LOSSLESS CHECK FAILED — flow-draft output diverged from greedy AR")
+
+    # UNCOUPLED sampling: bitwise equality is N/A, equality of LAWS is asserted
+    temperature = dec.get("temperature", 0.0)
+    equiv_samples = dec.get("equiv_samples", 0)
+    if temperature > 0 and not dec.get("coupled", True) and equiv_samples > 0 and first_prompt is not None:
+        eq = sampling_equivalence(
+            model, first_prompt, n_samples=equiv_samples,
+            block_size=dec.block_size, jumps=dec.jumps,
+            temperature=temperature, top_k=dec.get("top_k"), top_p=dec.get("top_p"),
+        )
+        logger.info(f"sampling equivalence: TV(fd,ar)={eq['tv_fd_ar']:.3f} vs noise TV(ar,ar')={eq['tv_null']:.3f}")
+        if eq["tv_fd_ar"] > eq["tv_null"] + 0.05:
+            raise RuntimeError("SAMPLING LOSSLESS CHECK FAILED — speculative law diverged from AR")
 
 
 if __name__ == "__main__":

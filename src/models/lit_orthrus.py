@@ -118,6 +118,19 @@ class FlowMapOrthrus(L.LightningModule):
 
     # --- the loss is yours ----------------------------------------------------
 
+    def _lambda(self):
+        """ECLD weight with optional staging: teacher-matching FIRST, then
+        consistency. With ``train.lambda_ramp_steps = N > 0`` the weight ramps
+        linearly ``0 -> train.lambda`` over the first N optimizer steps, so
+        early training is anchor-only (the diagonal must be trustworthy
+        before it can teach the jumps); ``0`` = static from step one.
+        """
+        lam = self.cfg.train.get("lambda", 1.0)
+        ramp = int(self.cfg.train.get("lambda_ramp_steps", 0))
+        if ramp > 0:
+            lam = lam * min(1.0, self.global_step / ramp)
+        return lam
+
     @staticmethod
     def _masked_kl(log_p, log_q, live):
         """``KL(p || q)`` per position, averaged over live (non-pad) tokens.
@@ -206,8 +219,10 @@ class FlowMapOrthrus(L.LightningModule):
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)  # [B, T]
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
 
-        loss = anchor + self.cfg.train.get("lambda", 1.0) * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td})
+        lam = self._lambda()
+        aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
+        loss = aw * anchor + lam * (4.0 * ec + 2.0 * td)
+        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td, "loss/lambda": lam})
         return loss
 
     # --- generation: the model generates, start to finish ----------------------
@@ -290,6 +305,21 @@ class FlowMapOrthrus(L.LightningModule):
             logits = logits.masked_fill(drop, float("-inf"))
         return logits.softmax(-1)
 
+    @staticmethod
+    def _gumbel(seed: int, position: int, vocab: int, device):
+        """Position-keyed Gumbel noise — the coupling that makes T>0 BIT-exact.
+
+        Gumbel-max: ``argmax(log p + g)`` is an exact sample from ``p``. With
+        ``g`` a deterministic function of ``(seed, generated-token index)``,
+        sampling becomes a deterministic map — the AR path and the
+        speculative path perturb the SAME target distributions with the SAME
+        noise, so greedy-consensus verification reproduces AR sampling
+        token-for-token.
+        """
+        gen = torch.Generator().manual_seed(seed * 1_000_003 + position)
+        u = torch.rand(vocab, generator=gen).clamp(1e-9, 1 - 1e-9)
+        return (-torch.log(-torch.log(u))).to(device)
+
     def _verify_speculative(self, draft_ids, q, last_logits, verify_logits,
                             temperature, top_k, top_p):
         """Leviathan-style accept/reject — lossless IN DISTRIBUTION.
@@ -366,6 +396,8 @@ class FlowMapOrthrus(L.LightningModule):
         temperature: float = 0.0,
         top_k: int | None = None,
         top_p: float | None = None,
+        coupled: bool = True,
+        sampling_seed: int = 0,
         **tokenizer_kwargs,
     ):
         """FULL lossless generation: draft -> verify -> commit, until done.
@@ -379,9 +411,13 @@ class FlowMapOrthrus(L.LightningModule):
 
         * ``temperature=0`` (default) — greedy verification; the output ids
           are BIT-identical to greedy :meth:`ar_generate`.
-        * ``temperature>0`` (optionally ``top_k``/``top_p``) — speculative
-          sampling: the output is lossless IN DISTRIBUTION, i.e. exactly the
-          law of :meth:`ar_generate` with the same sampling params.
+        * ``temperature>0, coupled=True`` (default) — Gumbel-coupled
+          sampling: position-keyed Gumbel noise (``sampling_seed``) makes
+          sampling a deterministic argmax, so the output is BIT-identical to
+          :meth:`ar_generate` with the same temperature/seed. Different
+          seeds -> different (correctly distributed) samples.
+        * ``temperature>0, coupled=False`` — Leviathan speculative sampling:
+          lossless IN DISTRIBUTION (equality of laws, not of tokens).
 
         Returns a dict: ``sequences [1, T+N]``, ``new_tokens`` (list),
         ``text`` (when a tokenizer is attached), ``acceptance`` (per cycle),
@@ -407,9 +443,21 @@ class FlowMapOrthrus(L.LightningModule):
 
         while len(emitted) < max_new_tokens:
             draft_ids, q = self._draft_block(
-                cache, block_size, times, sample=temperature > 0, anchor_token=pending
+                cache, block_size, times,
+                sample=temperature > 0 and not coupled, anchor_token=pending,
             )
             n_forwards += len(times) - 1
+            if temperature > 0 and coupled:
+                # keys = indices of the tokens these positions would emit;
+                # g_all[j] targets generated token (len(emitted) + j)
+                base = len(emitted)
+                g_all = torch.stack([
+                    self._gumbel(sampling_seed, base + j, q.size(-1), q.device)
+                    for j in range(draft_ids.size(1) + 1)
+                ])
+                # best draft = argmax of the PERTURBED proposal (same noise
+                # the verifier will apply to the target distribution)
+                draft_ids = (q[0].clamp_min(1e-30).log() + g_all[:-1]).argmax(-1)[None]
 
             committed = cache.get_seq_length()
             verify_in = draft_ids if pending is None else torch.cat(
@@ -423,7 +471,21 @@ class FlowMapOrthrus(L.LightningModule):
             else:
                 verify_logits = logits  # last_logits carried from the prefill
 
-            if temperature > 0:
+            if temperature > 0 and coupled:
+                # Gumbel-max turns sampling into a deterministic argmax over
+                # perturbed logits — the greedy-consensus machinery then
+                # verifies it BIT-exactly. Perturb each target distribution
+                # with the gumbel of the token index it decides.
+                last_pert = (
+                    self._target_probs(last_logits, temperature, top_k, top_p)
+                    .clamp_min(1e-30).log() + g_all[0]
+                )
+                vl_pert = (
+                    self._target_probs(verify_logits, temperature, top_k, top_p)
+                    .clamp_min(1e-30).log() + g_all[1:][None]
+                )
+                n_accepted, next_token = self.verify_greedy(draft_ids, last_pert, vl_pert)
+            elif temperature > 0:
                 n_accepted, next_token = self._verify_speculative(
                     draft_ids, q, last_logits, verify_logits, temperature, top_k, top_p
                 )
@@ -446,11 +508,14 @@ class FlowMapOrthrus(L.LightningModule):
     def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,
                     eos_token_id=None, temperature: float = 0.0,
                     top_k: int | None = None, top_p: float | None = None,
+                    coupled: bool = True, sampling_seed: int = 0,
                     **tokenizer_kwargs):
         """Plain AR generation through the frozen path — the correctness
-        reference (greedy generate() must match it token-for-token; sampled
-        generate() matches it in distribution) and the throughput baseline
-        (1 token per forward). ``temperature=0`` = greedy."""
+        reference and the throughput baseline (1 token per forward).
+        ``temperature=0`` = greedy (bitwise reference). ``temperature>0,
+        coupled=True`` = Gumbel-max sampling with position-keyed noise —
+        the bitwise reference for coupled generate(); ``coupled=False`` =
+        plain multinomial sampling (reference in distribution)."""
         input_ids = self._encode(text, input_ids, **tokenizer_kwargs)
         if eos_token_id is None and self.tokenizer is not None:
             eos_token_id = self.tokenizer.eos_token_id
@@ -463,7 +528,13 @@ class FlowMapOrthrus(L.LightningModule):
 
         while len(emitted) < max_new_tokens:
             probs = self._target_probs(out.logits[:, -1], temperature, top_k, top_p)
-            token = torch.multinomial(probs[0], 1) if temperature > 0 else probs.argmax(-1)
+            if temperature > 0 and coupled:
+                g = self._gumbel(sampling_seed, len(emitted), probs.size(-1), probs.device)
+                token = (probs[0].clamp_min(1e-30).log() + g).argmax().view(1)
+            elif temperature > 0:
+                token = torch.multinomial(probs[0], 1)
+            else:
+                token = probs.argmax(-1)
             emitted.append(int(token))
             if eos_token_id is not None and int(token) == eos_token_id:
                 break
@@ -539,7 +610,37 @@ class FlowMapOrthrus(L.LightningModule):
         agree = (draft_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[mask]
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/teacher_agreement", agree.float().mean())
+        self._maybe_decode_val(batch, batch_idx)
         return loss
+
+    @torch.no_grad()
+    def _maybe_decode_val(self, batch, batch_idx):
+        """The REAL target metrics as validation curves: run the lossless
+        decode loop (single-jump — the headline configuration) on a few val
+        prompts and log ``val/acceptance_decode`` and ``val/tpf``. This is
+        what training should improve to beat the baseline, and what the
+        checkpoint monitor tracks; ``train.val_decode_prompts=0`` disables.
+        """
+        n = self.cfg.train.get("val_decode_prompts", 0)
+        if n <= 0 or batch_idx != 0:
+            return
+        max_new = self.cfg.train.get("val_decode_max_new", 32)
+        block = self.cfg.train.get("block_size", 8)
+        accs, tpfs = [], []
+        for i in range(min(n, batch["input_ids"].size(0))):
+            live = int(batch["attention_mask"][i].sum())
+            plen = min(max(live // 2, 2), 32)
+            if live < plen + 2:
+                continue
+            out = self.generate(
+                input_ids=batch["input_ids"][i : i + 1, :plen],
+                block_size=block, jumps=1, max_new_tokens=max_new,
+            )
+            accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
+            tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
+        if tpfs:
+            self.log("val/acceptance_decode", sum(accs) / len(accs))
+            self.log("val/tpf", sum(tpfs) / len(tpfs))
 
     def configure_optimizers(self):
         opt = self.cfg.train

@@ -17,12 +17,16 @@ def build_lit(cfg: DictConfig, variant: str | None = None):
     variant = variant or cfg.get("variant", "fixed")
     if variant == "baseline":
         from src.models.lit_orthrus_baseline import FlowMapOrthrusBaseline as Module
+    elif variant == "baseline_block_wise":
+        from src.models.lit_orthrus_baseline_block_wise import FlowMapOrthrusBaselineBlockWise as Module
     elif variant == "block_wise":
         from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise as Module
     elif variant == "fixed":
         from src.models.lit_orthrus import FlowMapOrthrus as Module
     else:
-        raise ValueError(f"unknown variant='{variant}' (fixed | block_wise | baseline)")
+        raise ValueError(
+            f"unknown variant='{variant}' (fixed | block_wise | baseline | baseline_block_wise)"
+        )
     model = Module(cfg)
     if cfg.get("checkpoint"):
         state = torch.load(cfg.checkpoint, map_location="cpu", weights_only=False)["state_dict"]
