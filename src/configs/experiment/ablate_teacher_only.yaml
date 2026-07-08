@@ -5,6 +5,9 @@
 defaults:
   - override /model: qwen2_0.5b
 
+output_dir: checkpoints/ablate-teacher
+
 train:
   variant: block_wise
   lambda: 0.0
+  checkpoint_name: ablate-teacher-{step:07d}

@@ -6,6 +6,9 @@
 defaults:
   - override /model: qwen2_0.5b
 
+output_dir: checkpoints/ablate-consistency
+
 train:
   variant: block_wise
   anchor_weight: 0.0
+  checkpoint_name: ablate-consistency-{step:07d}

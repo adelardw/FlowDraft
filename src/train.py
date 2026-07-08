@@ -24,8 +24,8 @@ def main(cfg: DictConfig) -> None:
     else:
         monitor, mode = "val/loss", "min"
     callbacks = [
-        # The DF head is ~1.7 GB (on_save_checkpoint strips the frozen
-        # backbone); keep the best and the last.
+        # on_save_checkpoint strips the frozen backbone; the file still
+        # carries the DF head + its Adam moments. Keep the best and the last.
         ModelCheckpoint(
             dirpath=cfg.output_dir,
             filename=cfg.train.get("checkpoint_name", "flowdraft-{step:07d}"),
