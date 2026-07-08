@@ -1,0 +1,11 @@
+# @package _global_
+# Brief steps 2-3: the Categorical Flow Map drafter with STAGED dual
+# distillation — teacher-matching first (lambda ramps from 0), consistency
+# second. Same 0.5B backbone and block-causal geometry as the baseline.
+#   uv run python src/train.py +experiment=flowmap_staged
+defaults:
+  - override /model: qwen2_0.5b
+
+train:
+  variant: block_wise
+  lambda_ramp_steps: 2000

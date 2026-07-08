@@ -52,13 +52,18 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         logits = self.orthrus(x_in, ctx_mask, use_df=True, s=s, t=t, past_key_values=cache).logits
         return logits[:, 1:]
 
-    def _shared_step(self, batch):
+    def _prepare_block(self, batch):
+        """The window math shared by the flow and baseline block variants:
+        split at ``p``, ONE no-grad AR forward, clean-prefix cache, clean
+        anchor, teacher for the K fresh tokens.
+
+        With dynamic padding the tensor can be NARROWER than the window —
+        the window shrinks to what exists, otherwise the teacher and block
+        slices get clipped by the tensor edge to DIFFERENT lengths.
+        """
         ids, mask = batch["input_ids"], batch["attention_mask"]
         block = self.cfg.train.get("block_size", 64)
         p = self._split_point(mask, block)
-        # With dynamic padding the tensor can be NARROWER than the window.
-        # Shrink to what exists — otherwise the teacher and block slices get
-        # clipped by the tensor edge to DIFFERENT lengths (shape mismatch).
         width = ids.size(1)
         if width < 3:
             raise ValueError("cannot train on width<3 batches: prefix + anchor + block needed")
@@ -75,10 +80,15 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         cache.crop(p)
         teacher_logits = teacher_full[:, p : p + block]
 
-        # position p — the clean in-block anchor; p+1..p+K — the noised block
+        # position p — the clean in-block anchor; p+1..p+K — the drafted block
         anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])
         block_mask = mask[:, p + 1 : p + 1 + block]
-        x1 = self.df_processor.to_simplex(ids[:, p + 1 : p + 1 + block], attention_mask=block_mask)
+        block_ids = ids[:, p + 1 : p + 1 + block]
+        return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
+
+    def _shared_step(self, batch):
+        teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor = self._prepare_block(batch)
+        x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
         x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
         draft_logits = self._df_forward(x_s, anchor, ctx_mask, cache, s, t)
         return teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor
@@ -141,8 +151,10 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
 
-        loss = anchor_loss + self.cfg.train.get("lambda", 1.0) * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td})
+        lam = self._lambda()
+        aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
+        loss = aw * anchor_loss + lam * (4.0 * ec + 2.0 * td)
+        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td, "loss/lambda": lam})
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -160,4 +172,5 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[block_mask.bool()]
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/teacher_agreement", agree.float().mean())
+        self._maybe_decode_val(batch, batch_idx)
         return loss

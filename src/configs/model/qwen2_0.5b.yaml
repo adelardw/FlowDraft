@@ -1,0 +1,25 @@
+# The brief's tractable scale: a 0.5B AR backbone (drafter-only training).
+# Select with `model=qwen2_0.5b`. Qwen2 attention carries QKV biases — the
+# adapter clones them into the DF twins automatically.
+
+name: Qwen/Qwen2.5-0.5B-Instruct
+
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: sdpa     # sdpa (default) | flex_attention (GPU) | eager (reference)
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false              # KV cache is managed by the decode loop, not HF
+
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right
+  trust_remote_code: false
+
+adapter:
+  w_names: [q_proj, k_proj, v_proj]

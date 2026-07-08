@@ -21,10 +21,12 @@ def generate(
     max_new_tokens: int = typer.Option(64),
     variant: str = typer.Option("fixed", help="fixed | block_wise | baseline"),
     checkpoint: str = typer.Option(None, help="Trained DF-head .ckpt; omit for the raw drafter."),
-    temperature: float = typer.Option(0.0, help="0 = greedy (bitwise lossless); >0 = speculative sampling."),
+    temperature: float = typer.Option(0.0, help="0 = greedy; >0 = sampling (coupled: bitwise lossless)."),
     top_k: int = typer.Option(None, help="Sampling only."),
     top_p: float = typer.Option(None, help="Sampling only."),
-    lossless_check: bool = typer.Option(True, help="Greedy only: run greedy AR and compare bitwise."),
+    coupled: bool = typer.Option(True, help="T>0: Gumbel-coupled sampling (bit-exact vs AR)."),
+    sampling_seed: int = typer.Option(0, help="Coupled sampling seed."),
+    lossless_check: bool = typer.Option(True, help="Compare bitwise vs AR (greedy or coupled sampling)."),
 ):
     import torch
 
@@ -38,10 +40,11 @@ def generate(
     torch.manual_seed(cfg.seed)
     model = build_lit(cfg)
 
+    sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p,
+                    coupled=coupled, sampling_seed=sampling_seed)
     for text in prompt:
         out = model.generate(
-            text, block_size=block_size, jumps=jumps, max_new_tokens=max_new_tokens,
-            temperature=temperature, top_k=top_k, top_p=top_p,
+            text, block_size=block_size, jumps=jumps, max_new_tokens=max_new_tokens, **sampling
         )
         mean_acc = sum(out["acceptance"]) / max(len(out["acceptance"]), 1)
         typer.echo(f"\n>>> {text}")
@@ -49,12 +52,12 @@ def generate(
         typer.echo(
             f"[acceptance={mean_acc:.2f}, forwards={out['n_forwards']}, {out['seconds']:.2f}s]"
         )
-        if lossless_check and temperature == 0:
-            ar = model.ar_generate(text, max_new_tokens=max_new_tokens)
+        if lossless_check and (temperature == 0 or coupled):
+            ar = model.ar_generate(text, max_new_tokens=max_new_tokens, **sampling)
             ok = out["new_tokens"] == ar["new_tokens"]
-            typer.echo(f"[lossless vs greedy AR: {'PASS' if ok else 'FAIL'}]")
+            typer.echo(f"[lossless vs AR (bitwise): {'PASS' if ok else 'FAIL'}]")
             if not ok:
-                logger.error("flow-draft output diverged from greedy AR!")
+                logger.error("flow-draft output diverged from AR!")
                 raise typer.Exit(code=1)
 
 

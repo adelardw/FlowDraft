@@ -5,6 +5,7 @@ defaults:
 
 seed: 42
 checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
+results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
 variant: fixed              # which drafter the checkpoint was trained as:
                             #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
 
@@ -16,9 +17,13 @@ decode:
   max_new_tokens: 64
   n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
   prompt_len: 32            # prefix length (tokens) taken from each sample
-  temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = speculative sampling (lossless in distribution)
+  temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = sampling
   top_k: null               # sampling only
   top_p: null               # sampling only
+  coupled: true             # temperature>0: true = Gumbel-coupled sampling — BIT-exact vs AR
+                            #   (per the brief); false = Leviathan — lossless in distribution
+  equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
+                            #   on the first prompt (e.g. 500 draws); 0 = off
 
 # Prompt source for dataset mode. The val slice IS held out from training
 # samples (train skips the first val_size of the same seeded stream), but it

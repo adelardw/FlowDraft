@@ -1,0 +1,11 @@
+# @package _global_
+# Brief step 5 ablation: the consistency term ALONE (teacher off).
+# Expectation: self-consistent but unanchored — the diagonal never learns
+# what the verifier accepts, acceptance should collapse.
+#   uv run python src/train.py +experiment=ablate_consistency_only
+defaults:
+  - override /model: qwen2_0.5b
+
+train:
+  variant: block_wise
+  anchor_weight: 0.0

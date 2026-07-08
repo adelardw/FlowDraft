@@ -13,17 +13,31 @@ output_dir: checkpoints     # artifacts live at project root, gitignored
 train:
   variant: fixed            # fixed (full-sequence, lit_orthrus)
                             # | block_wise (inference geometry: clean AR prefix in KV + noisy K-block)
-                            # | baseline (Orthrus masked-diffusion drafter, single-step, no time)
+                            # | baseline (Orthrus masked drafter, full-sequence)
+                            # | baseline_block_wise (Orthrus masked drafter, block-causal geometry)
+                            # Presets for the brief's stages: `+experiment=baseline|flowmap_staged|
+                            #   ablate_teacher_only|ablate_consistency_only` (see configs/experiment/)
   block_size: 64            # K — block-wise only
   min_prefix: 1             # block-wise only: shortest clean prefix
   lr: 1e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   time_sampling: triangle   # triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1]) | paper (t~U, s~U[0,t])
-  lambda: 1.0               # weight of the ECLD part: loss = anchor + lambda * (4*EC + 2*TD)
+  lambda: 1.0               # weight of the ECLD part: loss = anchor_weight*anchor + lambda*(4*EC + 2*TD)
+  anchor_weight: 1.0        # 0 = ablate the AR-teacher term (consistency-only run)
+  lambda_ramp_steps: 0      # staged dual distillation: ramp lambda 0 -> lambda over N steps
+                            #   (teacher-matching first, consistency second); 0 = static
+  checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
   anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
                             #   trajectory | landing (X_{s,t}(x_s))
   checkpoint_every_n_steps: 1000
+  # Target-metric validation: run the real decode loop (single-jump) on a few
+  # val prompts each validation -> val/tpf & val/acceptance_decode curves.
+  val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy
+  val_decode_max_new: 32
+  monitor: val/tpf          # checkpoint selection: val/tpf (beat the baseline on the
+  monitor_mode: max         #   target metric; NOISY early) | val/loss + min (smooth)
+  early_stop_patience: 5    # stop if val/loss fails to improve N validations in a row; 0 = off
 
 # Lightning Trainer kwargs, passed through verbatim (см. src/train.py)
 trainer:

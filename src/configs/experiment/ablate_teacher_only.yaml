@@ -1,0 +1,10 @@
+# @package _global_
+# Brief step 5 ablation: the AR-teacher term ALONE (consistency off).
+# Expectation: the diagonal learns, jumps get no training signal.
+#   uv run python src/train.py +experiment=ablate_teacher_only
+defaults:
+  - override /model: qwen2_0.5b
+
+train:
+  variant: block_wise
+  lambda: 0.0

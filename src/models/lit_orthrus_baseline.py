@@ -63,6 +63,7 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
         agree = (df_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[live]
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/teacher_agreement", agree.float().mean())
+        self._maybe_decode_val(batch, batch_idx)
         return loss
 
     # --- generation: one forward per draft --------------------------------------

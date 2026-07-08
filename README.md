@@ -10,7 +10,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: core implementation landed and smoke-verified** — adapter, three training variants (fixed / block-wise / baseline; all train end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (greedy bitwise + speculative sampling, `jumps+1` forwards per cycle), evaluation harness (mean±std, held-out val slice). GPU experiments pending; **Results** are TBD.
+> 🚧 **Status: core implementation landed and smoke-verified** — adapter, four training variants (fixed / block-wise / baseline / baseline-block-wise; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the brief. GPU experiments pending; **Results** are TBD.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -152,7 +152,7 @@ One frozen backbone, two attention paths (the Orthrus host), a Categorical Flow 
   - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
   - Time pairs `(s, t)` per sample (`train.time_sampling`): `triangle` (uniform on {s≤t}) | `sequential` | `paper` (t~U, s~U[0,t]).
 - **Training geometries** (`train.variant`): `fixed` — noise the whole sequence; `block_wise` — the exact inference geometry: clean AR prefix in the KV cache, a CLEAN in-block anchor position (the decode loop's pending token, see below) and a noisy K-token block; also shrinks every `[B,T,V]` loss tensor to `[B,K,V]`; `baseline` — Orthrus' own single-step masked-diffusion drafter (no time conditioning, barycenter as the simplex-native `[MASK]`).
-- **Decoding** (`FlowMapOrthrus.generate`): draft K fresh tokens in 1–few jumps → ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as a clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` (+`top_k`/`top_p`): speculative sampling (accept `min(1, p/q)`, residual resampling) — lossless **in distribution** for any drafter quality.
+- **Decoding** (`FlowMapOrthrus.generate`): draft K fresh tokens in 1–few jumps → ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as a clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ### Repository structure
 
@@ -168,13 +168,15 @@ FlowDraft/
     │   ├── model.py               # build_model: backbone + tokenizer + processor
     │   ├── factory.py             # build_lit: variant selection + checkpoint loading
     │   ├── lit_orthrus.py         # FlowMapOrthrus: loss, training, lossless generate
-    │   ├── lit_orthrus_block_wise.py  # training in the inference geometry
-    │   └── lit_orthrus_baseline.py    # Orthrus masked-diffusion baseline
+    │   ├── lit_orthrus_block_wise.py      # training in the inference geometry
+    │   ├── lit_orthrus_baseline.py        # Orthrus masked drafter (full-sequence)
+    │   └── lit_orthrus_baseline_block_wise.py  # Orthrus masked drafter, block-causal
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
-    ├── data/                      # YOUR Dataset / collate / DataLoader (build_dataloaders seam)
-    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*
+    ├── data/dataloaders.py        # Nemotron streaming: Dataset / collate / DataLoader
+    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*, experiment/*
     ├── train.py                   # training entrypoint
-    └── eval.py                    # dataset evaluation: acceptance / TPF / speedup / NLL
+    ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
+    └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
 ```
 
 ### Installation
@@ -205,14 +207,18 @@ with the tokenizer's chat template (`src/data/dataloaders.py`). Batch contract:
 on-device, never in the batch.
 
 ```bash
-./hf-auth.sh uv run python src/train.py                            # fixed variant
-./hf-auth.sh uv run python src/train.py train.variant=block_wise   # inference geometry
-./hf-auth.sh uv run python src/train.py train.variant=baseline     # Orthrus baseline
+./hf-auth.sh uv run python src/train.py train.variant=block_wise   # flow drafter (inference geometry)
+./hf-auth.sh uv run python src/train.py +experiment=baseline       # brief presets: baseline |
+                                                                   #   flowmap_staged | ablate_*
 ```
 
-Knobs live in `configs/train.yaml`: `lambda` (dual-distillation balance),
-`anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), optimizer,
-Lightning `trainer.*`. Checkpoints store only the DF head (~1.7 GB for 3B).
+Variants: `fixed` | `block_wise` | `baseline` | `baseline_block_wise`.
+Knobs live in `configs/train.yaml`: `lambda`/`anchor_weight`/`lambda_ramp_steps`
+(dual distillation + staging), `anchor_point`, `time_sampling`,
+`block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
+curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
+`trainer.*`. Checkpoints store only the DF head (~1.7 GB for 3B). The Russian
+section carries the full per-experiment guide.
 
 ### Evaluation
 
@@ -286,6 +292,7 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 
 - [Обзор](#обзор)
 - [Быстрый старт](#быстрый-старт)
+- [Эксперименты (этапы брифа)](#эксперименты-этапы-брифа)
 - [Контекст: узкое место декодирования](#контекст-узкое-место-декодирования)
 - [Host-фреймворк: Orthrus](#host-фреймворк-orthrus)
 - [Проблема](#проблема)
@@ -344,6 +351,117 @@ echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
 негейтированном бэкбоне — добавьте hydra-оверрайды
 `model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
 model.backbone.device_map=null`.
+
+### Эксперименты (этапы брифа)
+
+Каждый этап брифа — один пресет (`src/configs/experiment/`). Чекпоинты падают
+в `checkpoints/` (только DF-голова), кривые обучения — в TensorBoard:
+`uv run tensorboard --logdir checkpoints`.
+
+**Словарь кривых обучения:**
+
+| Кривая | Что означает | Что ждать |
+|---|---|---|
+| `train/loss` | полный лосс шага | ↓ (шумно: каждый шаг — свежие `(s,t)` и точка разреза) |
+| `loss/anchor` | `KL(sg(p_AR) ‖ π_{t,t})` — учится ли диагональ у верификатора | монотонно ↓ |
+| `loss/ec` | согласие прыжка с диагональю в точке приземления | ↓ по мере обучения диагонали |
+| `loss/td` | временной дрейф `‖∂_t π‖²` | всплеск после старта, затем умеренные значения; устойчивый 0 у обученной модели = мёртвый time-канал (сигнал к adaLN-апгрейду) |
+| `loss/lambda` | текущий вес ECLD | рамп 0→λ при staged, константа иначе |
+| `val/teacher_agreement` | доля позиций, где argmax драфтера = argmax верификатора; прокси acceptance | **главная кривая**: ↑ = проект едет |
+
+**Этап 1 — бейзлайн Orthrus:**
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=baseline
+```
+
+Одношаговая masked-diffusion голова (барицентр как `[MASK]`) на 0.5B бэкбоне
+в block-causal геометрии: каузально к закэшированному контексту,
+двунаправленно внутри блока, чистый якорь. Лосс — один KL-член к учителю.
+Смотреть: `train/loss` ↓, `val/teacher_agreement` ↑ (бейзлайн стартует выше
+flow-вариантов — реконструкция при видимых соседях проще транспорта из шума).
+
+**Этапы 2–3 — flow-map драфтер + staged dual distillation:**
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=flowmap_staged
+```
+
+CFM-драфтер в той же геометрии; λ рампится 0→1 за 2000 шагов — сначала
+учитель (якорь), затем консистентность, как требует бриф. Смотреть:
+`loss/anchor` падает с первого шага; `loss/ec` включается по мере рампа
+(виден на `loss/lambda`); `val/teacher_agreement` растёт медленнее
+бейзлайна на старте — норма, драфт из чистого шума требует больше шагов.
+Вариант со статичным λ (без staging):
+`./hf-auth.sh uv run python src/train.py train.variant=block_wise model=qwen2_0.5b`.
+
+**Этап 5 (абляции) — вклад каждого члена дистилляции:**
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only        # только якорь (lambda=0)
+./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only    # только консистентность (anchor_weight=0)
+```
+
+Ожидания: teacher-only — диагональ учится, прыжки без сигнала → acceptance
+низкий; consistency-only — самосогласованность без правды → acceptance
+коллапсирует. Обе строки идут в таблицу абляций отчёта.
+
+**Этап 5 (оценка) — валидация на датасете и таблица результатов:**
+
+Eval сам берёт префиксы val-среза Nemotron (`decode.n_prompts` сэмплов по
+`decode.prompt_len` токенов; срез held-out от обучающих сэмплов — train их
+пропускает). Метрики: **acceptance ± std** и **TPF ± std** (заголовочные),
+tokens/s + speedup против AR (диагностика), NLL продолжения (сэмплирование).
+Lossless утверждается **побитово** — падение прогона при расхождении.
+
+```bash
+# (i) AR-бейзлайн — знаменатели метрик (tpf_ar, tokens_per_s_ar), отдельный прогон не нужен
+# (ii) Orthrus masked-diffusion
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b variant=baseline_block_wise checkpoint=<ckpt>
+# (iii) flow-map, 1 прыжок (headline)
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b variant=block_wise checkpoint=<ckpt>
+# (iv) flow-map, несколько прыжков + фронтир acceptance-vs-passes (сетка K x jumps)
+./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=block_wise checkpoint=<ckpt> \
+    decode.block_size=4,8,16 decode.jumps=1,2,4
+```
+
+**Этап 4 — lossless при сэмплировании:**
+
+```bash
+# coupled (дефолт): побитовый lossless при T>0 — тот же сид даёт тот же текст, что AR
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
+# uncoupled (Левиафан): эквивалентность законов, нуль-калиброванный TV-тест
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> \
+    decode.temperature=0.8 decode.coupled=false decode.equiv_samples=500
+```
+
+**Кривые целевых метрик и анализ результатов:**
+
+Во время обучения, помимо лоссов, на каждой валидации гоняется настоящая
+decode-петля (одношаговая) на `train.val_decode_prompts` промптах — в
+TensorBoard появляются кривые **`val/tpf`** и **`val/acceptance_decode`**:
+это ровно те метрики, по которым проект сравнивается с бейзлайном, видимые
+по ходу обучения. Чекпоинт отбирается по лучшему `val/tpf`
+(`train.monitor`); осторожно — на малом числе промптов метрика шумная,
+поднимите `val_decode_prompts` до 8+, если селекция дёргается, либо
+вернитесь на `monitor: val/loss`. Ранняя остановка при росте лосса —
+`train.early_stop_patience` (валидаций подряд без улучшения val/loss).
+
+Каждый прогон `src/eval.py` дописывает JSON-строку в `results/eval.jsonl`
+(вариант, чекпоинт, K, jumps, температура, coupled, все метрики ± std).
+Накопив прогоны по конфигурациям — бейзлайн/flow, сетка K × jumps, greedy и
+сэмплирование — постройте фигуры отчёта одной командой:
+
+```bash
+uv run python src/plots.py           # results/eval.jsonl -> results/*.png
+```
+
+- `frontier.png` — фронтир acceptance-vs-passes (линия на каждую пару
+  вариант × K): главный график статьи — «сколько acceptance покупает
+  каждый дополнительный прыжок»;
+- `tpf.png` — TPF ± std по конфигурациям с горизонтальной AR-референс-линией:
+  всё, что выше неё, реально ускоряет декодирование;
+- `block_size.png` — TPF от размера блока K по вариантам.
 
 ### Контекст: узкое место декодирования
 
@@ -416,7 +534,7 @@ FlowDraft строится внутри **Orthrus** — каркаса lossless-
   - **TD** — ур. (16): временной дрейф `‖∂_t π_{s,t}‖²`.
   - Пары `(s, t)` на сэмпл (`train.time_sampling`): `triangle` (равномерно на {s≤t}) | `sequential` | `paper` (t~U, s~U[0,t]).
 - **Геометрии обучения** (`train.variant`): `fixed` — шумится вся последовательность; `block_wise` — в точности инференсная геометрия: чистый AR-префикс в KV-кэше, ЧИСТАЯ якорная позиция блока (pending-токен decode-петли, см. ниже) и шумный K-блок; заодно сжимает тензоры лосса `[B,T,V]` → `[B,K,V]`; `baseline` — одношаговый masked-diffusion драфтер самого Orthrus (без времени, барицентр как симплекс-нативный `[MASK]`).
-- **Декодирование** (`FlowMapOrthrus.generate`): драфт K свежих токенов за 1–несколько прыжков → ОДИН AR-forward верифицирует блок. Коррекция/бонус прошлого цикла не коммитится отдельным проходом: она едет чистым якорем внутри блока, и следующая верификация коммитит её K/V, одновременно оценивая драфты — **цикл = `jumps + 1` forward'ов** (паритет TPF с конвенцией Orthrus). `temperature=0`: жадная верификация, выход **побитово** равен `ar_generate`. `temperature>0` (+`top_k`/`top_p`): спекулятивное сэмплирование (приём `min(1, p/q)`, ресэмпл из остатка) — lossless **по распределению** при любом качестве драфтера.
+- **Декодирование** (`FlowMapOrthrus.generate`): драфт K свежих токенов за 1–несколько прыжков → ОДИН AR-forward верифицирует блок. Коррекция/бонус прошлого цикла не коммитится отдельным проходом: она едет чистым якорем внутри блока, и следующая верификация коммитит её K/V, одновременно оценивая драфты — **цикл = `jumps + 1` forward'ов** (паритет TPF с конвенцией Orthrus). `temperature=0`: жадная верификация, выход **побитово** равен `ar_generate`. `temperature>0` с Gumbel-связыванием (дефолт): пер-позиционный Gumbel-шум делает сэмплирование детерминированным argmax'ом — выход **побитово** равен сэмплирующему `ar_generate` с тем же сидом. Без связывания (`coupled=false`): спекулятивное сэмплирование Левиафана, lossless **по распределению**.
 
 ### Структура репозитория
 
@@ -432,13 +550,15 @@ FlowDraft/
     │   ├── model.py               # build_model: бэкбон + токенизатор + процессор
     │   ├── factory.py             # build_lit: выбор варианта + загрузка чекпоинта
     │   ├── lit_orthrus.py         # FlowMapOrthrus: лосс, обучение, lossless generate
-    │   ├── lit_orthrus_block_wise.py  # обучение в инференсной геометрии
-    │   └── lit_orthrus_baseline.py    # masked-diffusion бейзлайн Orthrus
+    │   ├── lit_orthrus_block_wise.py      # обучение в инференсной геометрии
+    │   ├── lit_orthrus_baseline.py        # masked-драфтер Orthrus (full-sequence)
+    │   └── lit_orthrus_baseline_block_wise.py  # masked-драфтер Orthrus, block-causal
     ├── preprocessor/df_processor.py   # токенизация + one-hot вершины симплекса
-    ├── data/                      # Dataset / collate / DataLoader (шов build_dataloaders)
-    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*
+    ├── data/dataloaders.py        # Nemotron-стриминг: Dataset / collate / DataLoader
+    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*, experiment/*
     ├── train.py                   # точка входа обучения
-    └── eval.py                    # оценка на датасете: acceptance / TPF / speedup / NLL
+    ├── eval.py                    # оценка на датасете: acceptance / TPF / NLL -> results/eval.jsonl
+    └── plots.py                   # фигуры отчёта: frontier / TPF-бары / TPF-от-K
 ```
 
 ### Установка
