@@ -1,6 +1,7 @@
 
 defaults:
   - model: llama3_3b
+  - data: math500   # HELD-OUT bench by default; data=nemotron -> in-distribution eval
   - _self_
 
 seed: 42
@@ -16,7 +17,8 @@ decode:
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
   n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
-  prompt_len: 32            # prefix length (tokens) taken from each sample
+  prompt_len: null          # null = the full rendered prompt (honest bench setting);
+                            #   int N = first N tokens only (prefix-continuation mode)
   temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = sampling
   top_k: null               # sampling only
   top_p: null               # sampling only
@@ -25,16 +27,10 @@ decode:
   equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
                             #   on the first prompt (e.g. 500 draws); 0 = off
 
-# Prompt source for dataset mode. The val slice IS held out from training
-# samples (train skips the first val_size of the same seeded stream), but it
-# is the SAME distribution — for a distribution-level held-out bench
-# (MATH-500 / HumanEval / MT-Bench style) point dataset/splits elsewhere.
-data:
-  dataset: nvidia/Nemotron-Post-Training-Dataset-v2
-  splits: [chat, code, math, stem]
-  streaming: true
-  shuffle_buffer: 1000
-  val_size: 256
-  batch_size: 4
-  max_length: 512
-  num_workers: 0
+# Prompt source lives in configs/data/. Two levels of held-out:
+#   data=math500  (default) — a DIFFERENT dataset never seen in training:
+#                 distribution-level held-out, the honest generalization number;
+#   data=nemotron            — the training distribution; its val slice is
+#                 sample-level held-out (train skips the first val_size of the
+#                 same seeded stream) but NOT distribution-level.
+# Report both: the gap between them is the drafter's overfit to the train mix.

@@ -23,6 +23,8 @@ app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 
 def _label(row):
     tag = row["variant"]
+    if row.get("dataset"):
+        tag += f" @{row['dataset'].split('/')[-1]}"  # held-out vs train distribution
     if row.get("temperature", 0) > 0:
         tag += f" T={row['temperature']}" + ("" if row.get("coupled", True) else " (uncoupled)")
     return tag
