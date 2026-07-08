@@ -1,7 +1,10 @@
 # @package _global_
-# Brief step 1: reproduce the Orthrus baseline at tractable scale.
-# 0.5B backbone, block-causal geometry (causal to context, bidirectional
-# within block), single-step masked drafting, drafter-only training.
+# Task stage 1: reproduce the Orthrus baseline at tractable scale.
+# 0.5B backbone, full-sequence recipe: a random fraction of positions is
+# masked (barycenter = the simplex-native [MASK]), the head reconstructs
+# them under one KL term to the frozen teacher; drafter-only training.
+# The inference-geometry retrain is a separate ADDITION preset:
+# +experiment=baseline_block_wise.
 #   uv run python src/train.py +experiment=baseline
 defaults:
   - override /model: qwen2_0.5b
@@ -11,5 +14,5 @@ defaults:
 output_dir: checkpoints/baseline
 
 train:
-  variant: baseline_block_wise
+  variant: baseline
   checkpoint_name: baseline-{step:07d}

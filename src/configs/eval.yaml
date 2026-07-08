@@ -1,7 +1,7 @@
 
 defaults:
   - model: llama3_3b
-  - data: math500   # HELD-OUT bench by default; data=nemotron -> in-distribution eval
+  - data: math500   # default: a dataset NEVER SEEN in training; data=nemotron -> training distribution
   - _self_
 
 seed: 42
@@ -23,14 +23,15 @@ decode:
   top_k: null               # sampling only
   top_p: null               # sampling only
   coupled: true             # temperature>0: true = Gumbel-coupled sampling — BIT-exact vs AR
-                            #   (per the brief); false = Leviathan — lossless in distribution
+                            #   (per the task PDF); false = Leviathan — lossless in distribution
   equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
                             #   on the first prompt (e.g. 500 draws); 0 = off
 
-# Prompt source lives in configs/data/. Two levels of held-out:
-#   data=math500  (default) — a DIFFERENT dataset never seen in training:
-#                 distribution-level held-out, the honest generalization number;
-#   data=nemotron            — the training distribution; its val slice is
-#                 sample-level held-out (train skips the first val_size of the
-#                 same seeded stream) but NOT distribution-level.
-# Report both: the gap between them is the drafter's overfit to the train mix.
+# Prompt source lives in configs/data/. Two datasets, two questions:
+#   data=math500  (default) — a DIFFERENT dataset the drafter never saw in
+#                 training: the honest generalization number;
+#   data=nemotron            — the training distribution; its val samples were
+#                 excluded from training (train skips the first val_size of
+#                 the same seeded stream) but the texts are of the same kind.
+# Report both: the gap between them shows how much the drafter overfits the
+# training mix.

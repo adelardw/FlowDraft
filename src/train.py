@@ -3,12 +3,13 @@ import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
 
-from src.data import build_dataloaders
+from src.data import build_dataloaders, quiet_download_logs
 from src.models.factory import build_lit
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
+    quiet_download_logs()
     L.seed_everything(cfg.seed, workers=True)
 
     model = build_lit(cfg, variant=cfg.train.get("variant", "fixed"))

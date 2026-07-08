@@ -1,5 +1,5 @@
 # @package _global_
-# Brief step 5 ablation: the AR-teacher term ALONE (consistency off).
+# Task stage 5 ablation: the AR-teacher term ALONE (consistency off).
 # Expectation: the diagonal learns, jumps get no training signal.
 #   uv run python src/train.py +experiment=ablate_teacher_only
 defaults:
@@ -8,6 +8,6 @@ defaults:
 output_dir: checkpoints/ablate-teacher
 
 train:
-  variant: block_wise
+  variant: fixed
   lambda: 0.0
   checkpoint_name: ablate-teacher-{step:07d}

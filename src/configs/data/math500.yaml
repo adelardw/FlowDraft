@@ -1,7 +1,7 @@
-# HELD-OUT benchmark: HuggingFaceH4/MATH-500 — a different DATASET, not just
-# held-out samples of the training stream. The drafter never sees these
+# Evaluation benchmark: HuggingFaceH4/MATH-500 — a DIFFERENT dataset, not
+# just set-aside samples of the training stream. The drafter never sees these
 # problems (training reads data=nemotron), so acceptance/TPF measured here is
-# out-of-distribution — the honest generalization number.
+# the honest generalization number.
 dataset: HuggingFaceH4/MATH-500
 splits: [test]              # the bench ships a single split
 text_field: problem         # no `messages` column — this text becomes the user turn
