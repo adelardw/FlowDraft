@@ -1,3 +1,4 @@
+import math
 import time
 
 import lightning as L
@@ -647,13 +648,38 @@ class FlowMapOrthrus(L.LightningModule):
             self.log("val/tpf", sum(tpfs) / len(tpfs))
 
     def configure_optimizers(self):
-        opt = self.cfg.train
-        return torch.optim.AdamW(
+        cfg = self.cfg.train
+        optimizer = torch.optim.AdamW(
             self.orthrus.df_parameters(),
-            lr=opt.lr,
-            weight_decay=opt.weight_decay,
-            betas=tuple(opt.betas),
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            betas=tuple(cfg.betas),
         )
+        schedule = cfg.get("lr_schedule", "cosine")
+        if schedule == "constant":
+            return optimizer
+        if schedule != "cosine":
+            raise ValueError(f"unknown lr_schedule='{schedule}' (constant | cosine)")
+        total = self.trainer.estimated_stepping_batches
+        if not math.isfinite(total):
+            # streaming dataset with no step bound: the cosine horizon is
+            # undefined — the schedule must know when training ends
+            raise ValueError(
+                "lr_schedule=cosine needs a finite training length: set "
+                "trainer.max_steps or trainer.limit_train_batches (+ max_epochs), "
+                "or switch to train.lr_schedule=constant"
+            )
+        from transformers import get_cosine_schedule_with_warmup
+
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=max(1, int(total * cfg.get("warmup_ratio", 0.05))),
+            num_training_steps=int(total),
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     def on_save_checkpoint(self, checkpoint):
         # Keep only the DF head (~1.7 GB for 3B instead of ~14 GB with the

@@ -23,7 +23,10 @@ train:
                             #   addition     — `+experiment=baseline_block_wise|flowmap_block_wise`
   block_size: 64            # K — block-wise only
   min_prefix: 1             # block-wise only: shortest clean prefix
-  lr: 1e-4
+  lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)
+  lr_schedule: cosine       # cosine (linear warmup -> cosine decay to 0, needs a finite
+                            #   trainer.max_steps or limit_train_batches+max_epochs) | constant
+  warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
   time_sampling: triangle   # triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1]) | paper (t~U, s~U[0,t])
@@ -48,7 +51,9 @@ trainer:
   accelerator: auto
   devices: auto
   precision: bf16-mixed
-  max_steps: 10000
+  max_steps: 10000            # -1 = no step bound (then bound by max_epochs)
+  max_epochs: null            # repetitions of the stream; see "Повторение потока" in README
+  limit_train_batches: null   # batches per repetition; null = the whole stream
   val_check_interval: 500
   log_every_n_steps: 10
   gradient_clip_val: 1.0
