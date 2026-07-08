@@ -10,7 +10,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: core implementation landed and smoke-verified** — adapter, four training variants (the task PDF's full-sequence fixed / baseline + our block-wise additions; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
+> 🚧 **Status: core implementation landed and smoke-verified** — adapter, four training variants (the task's full-sequence fixed / baseline + our block-wise additions; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -65,7 +65,7 @@ echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
 ./hf-auth.sh uv run python main.py -p "Once upon a time"
 #    -> generation + [lossless vs greedy AR: PASS]
 
-# 3. Train the drafter (fixed = the task PDF's full-sequence recipe; GPU recommended)
+# 3. Train the drafter (fixed = the task's full-sequence recipe; GPU recommended)
 ./hf-auth.sh uv run python src/train.py \
     trainer.max_steps=10000 data.batch_size=8
 #    watch: loss/anchor ↓, loss/ec ↓, loss/td sane, val/teacher_agreement ↑
@@ -116,7 +116,10 @@ The command summary:
 
 # Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
 #           (data=nemotron evaluates on the training distribution);
-#           block-size x jumps grid -> results/eval.jsonl -> report figures
+#           block-size x jumps grid -> results/eval.jsonl -> report figures.
+#           NOTE: decode.block_size = K, the number of tokens drafted per cycle at
+#           INFERENCE — a knob of EVERY variant (fixed included); it is unrelated
+#           to the block_wise TRAINING-geometry variant despite the similar name
 ./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=fixed checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
 uv run python src/plots.py
@@ -202,7 +205,7 @@ One frozen backbone, two attention paths (the Orthrus host), a Categorical Flow 
   - **EC** — eq. (18) of *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — jumps learn from the diagonal at their own landing point; truth flows `p_AR → π_{t,t} → π_{s,t}`.
   - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
   - Time pairs `(s, t)` per sample (`train.time_sampling`): `triangle` (uniform on {s≤t}) | `sequential` | `paper` (t~U, s~U[0,t]).
-- **Training geometries** (`train.variant`): the task PDF's variants are full-sequence — `fixed` (noise the whole sequence) and `baseline` (Orthrus' own single-step masked-diffusion drafter: no time conditioning, barycenter as the simplex-native `[MASK]`). Our **addition beyond the task**: `block_wise` / `baseline_block_wise` — the same two drafters retrained in the exact inference geometry (clean AR prefix in the KV cache, a CLEAN in-block anchor position — the decode loop's pending token, see below — and a noisy K-token block; also shrinks every `[B,T,V]` loss tensor to `[B,K,V]`).
+- **Training geometries** (`train.variant`): the task's variants are full-sequence — `fixed` (noise the whole sequence) and `baseline` (Orthrus' own single-step masked-diffusion drafter: no time conditioning, barycenter as the simplex-native `[MASK]`). Our **addition beyond the task**: `block_wise` / `baseline_block_wise` — the same two drafters retrained in the exact inference geometry (clean AR prefix in the KV cache, a CLEAN in-block anchor position — the decode loop's pending token, see below — and a noisy K-token block; also shrinks every `[B,T,V]` loss tensor to `[B,K,V]`).
 - **Decoding** (`FlowMapOrthrus.generate`): draft K fresh tokens in 1–few jumps → ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as a clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ### Repository structure
@@ -253,7 +256,7 @@ echo "HF_TOKEN=hf_..." > .env     # gated meta-llama access
 ```bash
 # generate from your prompts (greedy: bitwise-lossless check included)
 ./hf-auth.sh uv run python main.py -p "Once upon a time" -p "def main():"
-# sampling (lossless in distribution) + a trained drafter
+# sampling — bit-exact vs AR too (Gumbel coupling is the default; --no-coupled = lossless in distribution)
 ./hf-auth.sh uv run python main.py -p "..." --temperature 0.8 --top-k 50 \
     --jumps 2 --checkpoint checkpoints/last.ckpt
 ```
@@ -355,7 +358,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `checkpoint` | null | trained DF-head `.ckpt`; null = untrained drafter |
 | `variant` | `fixed` | must match how the checkpoint was trained |
 | `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
-| `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes (see the plain-words guide below) |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `block_wise` training variant (see the plain-words guide below) |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
 | `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
 | `decode.prompt_len` | null | null = the full rendered prompt; int N = first N tokens only |
@@ -406,6 +409,8 @@ bonus token if everything matched). Then the next cycle starts. The knobs:
 - `--block-size` (K) — how many tokens the drafter guesses per cycle. Bigger
   blocks promise more speedup, but the tail of a long guess relies on the
   guessed (unverified) beginning, so it gets rejected more often. Sweep 4–16.
+  Despite the similar name this has nothing to do with the `block_wise`
+  training variant — every drafter proposes blocks at inference.
 - `--jumps` — how many passes the drafter spends polishing its guess before
   showing it to the base model. Each extra pass makes the guess better but
   costs one forward: a cycle costs `jumps + 1` passes total. More jumps only
@@ -432,8 +437,8 @@ how fast. The verifier has the final word on every token.
 
 ### Evaluation
 
-Prefixes of validation samples are decoded twice — flow-draft vs plain AR — and
-compared. Greedy losslessness is asserted **bitwise**, not assumed.
+Dataset prompts (full rendered prompts by default; `decode.prompt_len=N` for
+N-token prefixes) are decoded twice — flow-draft vs plain AR — and compared. Greedy losslessness is asserted **bitwise**, not assumed.
 
 ```bash
 ./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # variant=fixed is the default
@@ -470,7 +475,7 @@ generation prompt) and decoded from the **full prompt**
 | Orthrus (masked-diffusion drafter) | TBD | TBD | TBD | ✅ |
 | **FlowDraft** (flow-map drafter) | TBD | TBD | TBD | ✅ |
 
-\* *TPF — metric definition TBD (to be fixed in the report).*
+\* *TPF — tokens per forward pass: `N generated / N forwards`, one cycle = `jumps + 1` forwards (formulas: the Russian guide).*
 
 **Ablations (TODO):** block size, jump count.
 
@@ -667,7 +672,10 @@ Lossless утверждается **побитово** — падение про
 ./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b variant=baseline checkpoint=<ckpt>
 # (iii) flow-map, 1 прыжок (основной замер)
 ./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b variant=fixed checkpoint=<ckpt>
-# (iv) flow-map, несколько прыжков: кривая acceptance от числа проходов (сетка K x jumps)
+# (iv) flow-map, несколько прыжков: кривая acceptance от числа проходов (сетка K x jumps).
+#      ВАЖНО: decode.block_size = K, число токенов черновика за цикл на ИНФЕРЕНСЕ —
+#      ручка ЛЮБОГО варианта (включая fixed); с вариантом ОБУЧЕНИЯ block_wise она
+#      не связана, несмотря на похожее имя
 ./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=fixed checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
 # каждая строка выше — на MATH-500, которого не было в обучении (дефолт data=math500);
@@ -863,7 +871,7 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 ```bash
 # генерация из ваших промптов (greedy: с побитовой lossless-проверкой)
 ./hf-auth.sh uv run python main.py -p "Once upon a time" -p "def main():"
-# сэмплирование (lossless по распределению) + обученный драфтер
+# сэмплирование — тоже побитово равно AR (Gumbel-связывание — дефолт; --no-coupled = lossless по распределению)
 ./hf-auth.sh uv run python main.py -p "..." --temperature 0.8 --top-k 50 \
     --jumps 2 --checkpoint checkpoints/last.ckpt
 ```
@@ -882,9 +890,13 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 ./hf-auth.sh uv run python src/train.py train.variant=block_wise   # ДОПОЛНЕНИЕ: инференсная геометрия
 ```
 
-Ручки — в `configs/train.yaml`: `lambda` (баланс двойной дистилляции),
-`anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), оптимизатор,
-Lightning `trainer.*`. Чекпоинты хранят DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется никогда).
+Ручки — в `configs/train.yaml`: `lambda`/`anchor_weight`/`lambda_ramp_steps`
+(двойная дистилляция + staging), `anchor_point`, `time_sampling`,
+`block_size`/`min_prefix` (block-wise варианты), `val_decode_prompts`
+(decode-петля на валидации → кривые `val/tpf` + монитор чекпоинтов),
+`early_stop_patience`, оптимизатор, Lightning `trainer.*`. Чекпоинты хранят
+DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется
+никогда). Полный построчный справочник — ниже.
 
 **Повторение потока (эпохи).** Датасет стриминговый, поэтому «эпоху»
 определяете вы. Каждая новая эпоха Trainer открывает поток заново в НОВОМ
@@ -959,7 +971,7 @@ cosine 2e-4 с 5% разогревом):
 | `checkpoint` | null | обученная DF-голова `.ckpt`; null = необученный драфтер |
 | `variant` | `fixed` | должен совпадать с тем, как учили чекпоинт |
 | `results_file` | `results/eval.jsonl` | каждый прогон дописывает JSON-строку (вход `src/plots.py`) |
-| `decode.block_size` / `decode.jumps` | 8 / 1 | K и число уточняющих проходов на инференсе (см. гид ниже) |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | K и число уточняющих проходов на инференсе — ручки ЛЮБОГО варианта; `block_size` НЕ связан с вариантом обучения `block_wise` (см. гид ниже) |
 | `decode.max_new_tokens` | 64 | сколько токенов генерировать на промпт |
 | `decode.n_prompts` | 64 | сколько промптов взять из датасета (100–200 для таблицы) |
 | `decode.prompt_len` | null | null = полный отрендеренный промпт; число N = первые N токенов |
@@ -1011,6 +1023,8 @@ cosine 2e-4 с 5% разогревом):
 - `--block-size` (K) — сколько токенов драфтер угадывает за цикл. Больше —
   выше потенциальное ускорение, но хвост длинной догадки опирается на её же
   непроверенное начало и отбрасывается чаще. Перебирайте 4–16.
+  Несмотря на похожее имя, к варианту обучения `block_wise` это отношения
+  не имеет — блоками на инференсе работает любой драфтер.
 - `--jumps` — сколько проходов драфтер тратит на «полировку» догадки, прежде
   чем показать её базовой модели. Каждый лишний проход улучшает догадку, но
   и стоит один forward: цикл обходится в `jumps + 1` проходов. Больше прыжков
@@ -1039,8 +1053,8 @@ cosine 2e-4 с 5% разогревом):
 
 ### Оценка
 
-Префиксы валидационных сэмплов декодируются дважды — flow-draft и чистый AR — и
-сравниваются. Жадный lossless утверждается **побитово**, а не предполагается.
+Промпты датасета (по умолчанию полные; `decode.prompt_len=N` — первые N
+токенов) декодируются дважды — flow-draft и чистый AR — и сравниваются. Жадный lossless утверждается **побитово**, а не предполагается.
 
 ```bash
 ./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # variant=fixed по умолчанию
@@ -1059,8 +1073,11 @@ AR — диагностика (зависит от железа/ядра). Яд�
 оценки — **MATH-500** (`data=math500` — этих текстов не было в обучении);
 `data=nemotron` — оценка на обучающем распределении (валидационные сэмплы
 в обучение не попадали, но тексты того же сорта). Разрыв между двумя цифрами —
-переобученность драфтера под обучающую смесь. Сэмплирующая оценка:
-`decode.temperature>0` — выходы lossless по распределению, побитовый флаг N/A.
+переобученность драфтера под обучающую смесь. Сэмплирующая оценка
+(`decode.temperature>0`): с Gumbel-связыванием (дефолт) выход по-прежнему
+побитово равен AR; только `decode.coupled=false` даёт lossless по
+распределению — там вместо побитового флага работает TV-тест
+(`decode.equiv_samples`).
 
 ### Результаты
 
@@ -1072,7 +1089,7 @@ AR — диагностика (зависит от железа/ядра). Яд�
 | Orthrus (masked-diffusion драфтер) | TBD | TBD | TBD | ✅ |
 | **FlowDraft** (flow-map драфтер) | TBD | TBD | TBD | ✅ |
 
-\* *TPF — определение метрики TBD (зафиксировать в отчёте).*
+\* *TPF — токенов на прямой проход: `N сгенерировано / N проходов`, цикл = `jumps + 1` проходов (формулы — в гиде выше).*
 
 **Абляции (TODO):** размер блока, число скачков.
 
