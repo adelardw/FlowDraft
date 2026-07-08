@@ -4,6 +4,7 @@
 
 defaults:
   - model: llama3_3b
+  - data: nemotron  # training distribution (см. configs/data/)
   - _self_          # keep last so values below override the groups above
 
 seed: 42
@@ -50,15 +51,6 @@ trainer:
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
 
-# consumed by src/data/dataloaders.py::build_dataloaders (streaming, no full download)
-data:
-  dataset: nvidia/Nemotron-Post-Training-Dataset-v2
-  splits: [chat, code, math, stem]   # interleaved; multilingual_{ja,de,it,es,fr} also available
-  streaming: true
-  shuffle_buffer: 1000
-  val_size: 256               # first N samples of the stream -> validation
-  batch_size: 4
-  max_length: 512
-  num_workers: 0              # streaming dataset: keep 0 unless sharding is configured
-
+# data.* lives in configs/data/ (defaults: nemotron); override fields inline:
+#   `uv run python src/train.py data.batch_size=8 data.max_length=1024`
 # block_size / jump_count are method knobs (ablated per the slides)

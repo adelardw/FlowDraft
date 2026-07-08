@@ -3,14 +3,19 @@ from torch.utils.data import DataLoader
 
 
 def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
-    """nvidia/Nemotron-Post-Training-Dataset-v2 -> ``(train_loader, val_loader)``.
+    """``cfg.data`` dataset -> ``(train_loader, val_loader)``.
 
-    Streaming — no full download: the requested category splits (``chat``,
-    ``code``, ``math``, ``stem``, ``multilingual_*``) are interleaved and
+    Streaming — no full download: the requested splits are interleaved and
     shuffled with a buffer; the first ``data.val_size`` samples become
-    validation, the rest stream into training. ``messages`` are rendered
-    with the tokenizer's chat template — the drafter must see the same
-    formatting the verifier will be served at inference.
+    validation, the rest stream into training. Two row formats are supported:
+
+    * ``messages`` (Nemotron-style chat) — rendered with the tokenizer's
+      chat template: the drafter must see the same formatting the verifier
+      will be served at inference;
+    * plain text (held-out benches: MATH-500 etc.) — the column named by
+      ``data.text_field`` (fallback: prompt/problem/question/text) is wrapped
+      as a single user turn with the generation prompt appended, i.e. exactly
+      what an instruct verifier receives at inference.
 
     Batch contract (what the models consume): ``input_ids [B, T]`` +
     ``attention_mask [B, T]``. The ``[B, T, V]`` simplex is built on-device
@@ -27,11 +32,25 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     ds = ds.shuffle(seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000))
 
     use_template = getattr(tokenizer, "chat_template", None) is not None
+    text_field = d.get("text_field", None)
+
+    def extract_messages(example):
+        if "messages" in example:
+            return [m for m in example["messages"] if m.get("content")]
+        for field in ([text_field] if text_field else ["prompt", "problem", "question", "text"]):
+            if example.get(field):
+                return [{"role": "user", "content": example[field]}]
+        raise KeyError(f"no text column found in row (keys: {list(example)}); set data.text_field")
 
     def render(example) -> str:
-        messages = [m for m in example["messages"] if m.get("content")]
+        messages = extract_messages(example)
         if use_template:
-            return tokenizer.apply_chat_template(messages, tokenize=False)
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False,
+                # bare-prompt rows: end with the assistant header so the
+                # continuation starts where inference would
+                add_generation_prompt="messages" not in example,
+            )
         return "\n".join(m["content"] for m in messages)
 
     def collate(examples):

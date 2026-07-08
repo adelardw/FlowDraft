@@ -101,14 +101,18 @@ def sampling_equivalence(model, prompt_ids, *, n_samples, block_size, jumps,
 
     c_fd, c_ar1, c_ar2 = Counter(), Counter(), Counter()
     for _ in range(n_samples):
+        # coupled=False is ESSENTIAL: this test targets the uncoupled
+        # (Leviathan) mode — with the coupled default every call would be
+        # deterministic (same seed), all three counters would collapse to a
+        # single token and the test would pass vacuously (TV = 0 = 0).
         c_fd[model.generate(
             input_ids=prompt_ids, block_size=block_size, jumps=jumps, max_new_tokens=1,
-            temperature=temperature, top_k=top_k, top_p=top_p,
+            temperature=temperature, top_k=top_k, top_p=top_p, coupled=False,
         )["new_tokens"][0]] += 1
         for c in (c_ar1, c_ar2):
             c[model.ar_generate(
                 input_ids=prompt_ids, max_new_tokens=1,
-                temperature=temperature, top_k=top_k, top_p=top_p,
+                temperature=temperature, top_k=top_k, top_p=top_p, coupled=False,
             )["new_tokens"][0]] += 1
 
     def tv(a, b):
@@ -118,10 +122,11 @@ def sampling_equivalence(model, prompt_ids, *, n_samples, block_size, jumps,
 
 
 def dataset_prompts(model, cfg):
-    """Prefixes of the first ``decode.n_prompts`` validation samples
-    (``decode.prompt_len`` tokens each) from ``src.data.build_dataloaders`` —
-    the same seam training reads, so acceptance is measured on the training
-    distribution. Yields ``(label, prompt_ids [1, P])``.
+    """The first ``decode.n_prompts`` validation samples of ``cfg.data`` —
+    the full rendered prompt each (``decode.prompt_len=N`` switches to
+    N-token prefixes). ``data=math500`` (default) is a distribution-level
+    held-out bench; ``data=nemotron`` reads the training distribution's val
+    slice. Yields ``(label, prompt_ids [1, P])``.
 
     For ad-hoc prompts use ``main.py`` — evaluation is dataset-only.
     """
@@ -130,7 +135,7 @@ def dataset_prompts(model, cfg):
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
     loader = val_loader if val_loader is not None else train_loader
     n_prompts = cfg.decode.get("n_prompts", 8)
-    prompt_len = cfg.decode.get("prompt_len", 32)
+    prompt_len = cfg.decode.get("prompt_len", None) or 10**9  # null -> full prompt
     taken = 0
     for batch in loader:
         ids, mask = batch["input_ids"], batch["attention_mask"]
@@ -191,6 +196,7 @@ def main(cfg: DictConfig) -> None:
         row = {
             "variant": cfg.get("variant", "fixed"),
             "model": cfg.model.name,
+            "dataset": cfg.data.dataset,
             "checkpoint": cfg.checkpoint,
             "block_size": dec.block_size,
             "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),

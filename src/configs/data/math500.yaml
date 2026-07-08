@@ -1,0 +1,13 @@
+# HELD-OUT benchmark: HuggingFaceH4/MATH-500 — a different DATASET, not just
+# held-out samples of the training stream. The drafter never sees these
+# problems (training reads data=nemotron), so acceptance/TPF measured here is
+# out-of-distribution — the honest generalization number.
+dataset: HuggingFaceH4/MATH-500
+splits: [test]              # the bench ships a single split
+text_field: problem         # no `messages` column — this text becomes the user turn
+streaming: true
+shuffle_buffer: 500
+val_size: 500               # the whole bench feeds the eval prompt stream
+batch_size: 4
+max_length: 512
+num_workers: 0

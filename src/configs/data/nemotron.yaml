@@ -1,0 +1,10 @@
+# Training distribution: nvidia/Nemotron-Post-Training-Dataset-v2 (streaming).
+# Consumed by src/data/dataloaders.py::build_dataloaders.
+dataset: nvidia/Nemotron-Post-Training-Dataset-v2
+splits: [chat, code, math, stem]   # interleaved; multilingual_{ja,de,it,es,fr} also available
+streaming: true
+shuffle_buffer: 1000
+val_size: 256               # first N samples of the stream -> validation
+batch_size: 4
+max_length: 512
+num_workers: 0              # streaming dataset: keep 0 unless sharding is configured

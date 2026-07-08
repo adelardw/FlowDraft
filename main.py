@@ -19,7 +19,11 @@ def generate(
     block_size: int = typer.Option(8, help="Drafted block size K."),
     jumps: int = typer.Option(1, help="Flow-map jumps per block."),
     max_new_tokens: int = typer.Option(64),
-    variant: str = typer.Option("fixed", help="fixed | block_wise | baseline"),
+    model_cfg: str = typer.Option(
+        None, "--model",
+        help="Model config name (llama3_3b | qwen2_0.5b) or an HF id with '/'.",
+    ),
+    variant: str = typer.Option("fixed", help="fixed | block_wise | baseline | baseline_block_wise"),
     checkpoint: str = typer.Option(None, help="Trained DF-head .ckpt; omit for the raw drafter."),
     temperature: float = typer.Option(0.0, help="0 = greedy; >0 = sampling (coupled: bitwise lossless)."),
     top_k: int = typer.Option(None, help="Sampling only."),
@@ -35,6 +39,9 @@ def generate(
     overrides = [f"variant={variant}"]
     if checkpoint:
         overrides.append(f"checkpoint={checkpoint}")
+    if model_cfg:
+        # config-group name (qwen2_0.5b) or a raw HF id (org/name)
+        overrides.append(f"model.name={model_cfg}" if "/" in model_cfg else f"model={model_cfg}")
     with hydra.initialize(version_base="1.3", config_path="src/configs"):
         cfg = hydra.compose(config_name="eval", overrides=overrides)
     torch.manual_seed(cfg.seed)

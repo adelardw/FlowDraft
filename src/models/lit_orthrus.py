@@ -100,7 +100,7 @@ class FlowMapOrthrus(L.LightningModule):
         mode = self.cfg.train.get("time_sampling", "triangle")
         sampler = getattr(self, f"sample_times_{mode}", None)
         if sampler is None:
-            raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle)")
+            raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle | paper)")
         s, t = sampler(batch, simplex.device)
         x0 = torch.distributions.Dirichlet(
             torch.ones(simplex.size(-1), device=simplex.device)
@@ -536,7 +536,11 @@ class FlowMapOrthrus(L.LightningModule):
             else:
                 token = probs.argmax(-1)
             emitted.append(int(token))
-            if eos_token_id is not None and int(token) == eos_token_id:
+            # no trailing forward after the LAST token: N tokens cost exactly
+            # prefill + (N-1) passes, so TPF_ar == 1.0, not N/(N+1)
+            if len(emitted) >= max_new_tokens or (
+                eos_token_id is not None and int(token) == eos_token_id
+            ):
                 break
             mask = torch.ones(1, cache.get_seq_length() + 1, dtype=torch.long, device=self.device)
             out = self.orthrus(token.view(1, 1), mask, past_key_values=cache)
