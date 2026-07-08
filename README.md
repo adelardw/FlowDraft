@@ -270,6 +270,41 @@ curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
 the frozen backbone is never written). The Russian
 section carries the full per-experiment guide.
 
+**Repeating the stream (epochs).** The dataset streams, so an "epoch" is
+whatever you define. Every new Trainer epoch re-opens the stream in a NEW
+order (per-epoch reshuffle; the validation slice is split off before the
+shuffle, so it never leaks into training). Two ways to bound a repetition:
+
+```bash
+# fixed sample pool, repeated N times — the paper-style "K examples x N epochs":
+uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=2 data.train_size=471952
+# or bound by steps per repetition instead of samples:
+uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=3 trainer.limit_train_batches=2000
+```
+
+Without `data.train_size` each repetition draws FRESH samples from the huge
+stream (more diversity, not strict epochs) — with it, exactly the same pool
+in a new order.
+
+**LR schedule.** Default: linear warmup (5% of steps) then cosine decay to
+zero — the peak is `train.lr`, the horizon is taken from `trainer.max_steps`
+(or `limit_train_batches` × `max_epochs`), the current value is logged as the
+`lr-AdamW` curve. `train.lr_schedule=constant` turns it off.
+
+Putting it together — the training budget of the Orthrus paper (2 epochs over
+472K packed sequences ≈ 1.9B tokens, global batch 128 × 2048 tokens, cosine
+2e-4 with 5% warmup):
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=baseline \
+    data.train_size=471952 data.batch_size=8 data.max_length=2048 \
+    trainer.accumulate_grad_batches=16 train.lr=2e-4 \
+    trainer.max_epochs=2 trainer.max_steps=7375
+```
+
+(`max_steps` = 471952 samples / (8 × 16) per optimizer step × 2 epochs; the
+cosine schedule needs it explicitly — a streaming loader has no length.)
+
 ### Configuration reference
 
 All configs live in `src/configs/` (hydra). Any key can be overridden from the
@@ -285,7 +320,9 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.variant` | `fixed` | which drafter to train: the task — `fixed` \| `baseline` (full-sequence); the addition — `block_wise` \| `baseline_block_wise` (inference geometry) |
 | `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
-| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only |
+| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
+| `train.lr_schedule` | `cosine` | `cosine` (linear warmup → cosine decay to 0; needs a finite `trainer.max_steps` or `limit_train_batches`+`max_epochs`) \| `constant` |
+| `train.warmup_ratio` | 0.05 | cosine only: fraction of total steps spent warming up |
 | `train.time_sampling` | `triangle` | how (s, t) pairs are drawn: `triangle` \| `sequential` \| `paper` |
 | `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
 | `train.anchor_weight` | 1.0 | weight of the AR-teacher anchor; 0 = teacher-off ablation |
@@ -320,7 +357,8 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 **`data/*` — dataset** (`nemotron` for training, `math500` — unseen during training — for eval):
 `dataset` (HF id), `splits`, `text_field` (column for plain-text benches),
 `streaming`, `shuffle_buffer`, `val_size` (first N stream samples → validation),
-`batch_size`, `max_length`, `num_workers`.
+`train_size` (null = the whole stream; int N = a fixed pool of N samples, so
+`trainer.max_epochs` repeats exactly them), `batch_size`, `max_length`, `num_workers`.
 
 **`experiment/*` — one preset per task stage, plus the addition presets.**
 Each sets its own `output_dir` and `train.checkpoint_name`, so runs never
@@ -822,6 +860,42 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 `anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), оптимизатор,
 Lightning `trainer.*`. Чекпоинты хранят DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется никогда).
 
+**Повторение потока (эпохи).** Датасет стриминговый, поэтому «эпоху»
+определяете вы. Каждая новая эпоха Trainer открывает поток заново в НОВОМ
+порядке (перемешивание пересеивается по эпохам; валидационный срез
+отрезается до перемешивания и в обучение не утекает). Ограничить повторение
+можно двумя способами:
+
+```bash
+# фиксированный пул сэмплов, повторённый N раз — «K примеров x N эпох» как в статье:
+uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=2 data.train_size=471952
+# или по числу шагов на повторение вместо числа сэмплов:
+uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=3 trainer.limit_train_batches=2000
+```
+
+Без `data.train_size` каждое повторение берёт из огромного потока СВЕЖИЕ
+сэмплы (больше разнообразия, но это не строгие эпохи) — с ним повторяется
+ровно тот же пул в новом порядке.
+
+**LR-расписание.** По умолчанию: линейный разогрев (5% шагов), затем
+косинусный спад к нулю — пик задаёт `train.lr`, горизонт берётся из
+`trainer.max_steps` (или `limit_train_batches` × `max_epochs`), текущее
+значение видно кривой `lr-AdamW`. `train.lr_schedule=constant` отключает.
+
+Всё вместе — учебный бюджет статьи Orthrus (2 эпохи по 472K упакованных
+последовательностей ≈ 1.9B токенов, глобальный батч 128 × 2048 токенов,
+cosine 2e-4 с 5% разогревом):
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=baseline \
+    data.train_size=471952 data.batch_size=8 data.max_length=2048 \
+    trainer.accumulate_grad_batches=16 train.lr=2e-4 \
+    trainer.max_epochs=2 trainer.max_steps=7375
+```
+
+(`max_steps` = 471952 сэмплов / (8 × 16) на оптимизаторный шаг × 2 эпохи;
+косинусному расписанию он нужен явно — у стримингового загрузчика нет длины.)
+
 ### Справочник конфигов
 
 Все конфиги — в `src/configs/` (hydra). Любой ключ переопределяется из
@@ -837,7 +911,9 @@ Lightning `trainer.*`. Чекпоинты хранят DF-голову + её Ad
 | `train.variant` | `fixed` | какой драфтер учить: из задания — `fixed` \| `baseline` (полноследовательные); дополнение — `block_wise` \| `baseline_block_wise` (инференсная геометрия) |
 | `train.block_size` | 64 | K — длина блока на обучении (block-wise варианты) |
 | `train.min_prefix` | 1 | минимальный чистый префикс перед блоком |
-| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW только по DF-голове |
+| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW только по DF-голове; `lr` — ПИК расписания |
+| `train.lr_schedule` | `cosine` | `cosine` (линейный разогрев → косинусный спад к 0; нужен конечный `trainer.max_steps` или `limit_train_batches`+`max_epochs`) \| `constant` |
+| `train.warmup_ratio` | 0.05 | только cosine: доля шагов на разогрев |
 | `train.time_sampling` | `triangle` | как сэмплируются пары (s, t): `triangle` \| `sequential` \| `paper` |
 | `train.lambda` | 1.0 | вес consistency-части (4·EC + 2·TD) |
 | `train.anchor_weight` | 1.0 | вес AR-якоря; 0 = абляция «без учителя» |
@@ -872,7 +948,8 @@ Lightning `trainer.*`. Чекпоинты хранят DF-голову + её Ad
 **`data/*` — датасет** (`nemotron` для обучения, `math500` — не встречался в обучении — для оценки):
 `dataset` (HF id), `splits`, `text_field` (колонка для текстовых бенчей),
 `streaming`, `shuffle_buffer`, `val_size` (первые N сэмплов потока → валидация),
-`batch_size`, `max_length`, `num_workers`.
+`train_size` (null = весь поток; число N = фиксированный пул из N сэмплов —
+`trainer.max_epochs` повторяет именно их), `batch_size`, `max_length`, `num_workers`.
 
 **`experiment/*` — по пресету на этап задания, плюс пресеты-дополнения.**
 Каждый задаёт свои `output_dir` и `train.checkpoint_name` — прогоны не

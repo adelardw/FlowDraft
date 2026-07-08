@@ -1,5 +1,39 @@
+import random
+
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
+
+
+class EpochShuffled(IterableDataset):
+    """Buffer-shuffle a stream with a per-epoch seed.
+
+    ``datasets`` forbids ``shuffle`` after ``skip``/``take`` (reordering the
+    shards would change which examples get skipped), so epoch-wise reshuffle
+    cannot be expressed with HF primitives once the val split is taken.
+    This wrapper keeps the HF chain order-frozen — membership of the split
+    never changes — and does the buffer shuffling itself, reseeded by
+    ``set_epoch`` so every repetition of the stream yields a new order.
+    """
+
+    def __init__(self, ds, seed: int, buffer_size: int):
+        self.ds, self.seed, self.buffer_size = ds, seed, buffer_size
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        buffer = []
+        for example in self.ds:
+            if len(buffer) < self.buffer_size:
+                buffer.append(example)
+                continue
+            i = rng.randrange(self.buffer_size)
+            yield buffer[i]
+            buffer[i] = example
+        rng.shuffle(buffer)
+        yield from buffer
 
 
 def quiet_download_logs():
@@ -37,6 +71,13 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
       as a single user turn with the generation prompt appended, i.e. exactly
       what an instruct verifier receives at inference.
 
+    Repeating the stream (multi-epoch training): every new Trainer epoch
+    re-opens the stream, and ``ReshuffleStreamingData`` (src/train.py) calls
+    ``set_epoch`` so the sample ORDER differs between repetitions. The
+    val/train split is taken BEFORE the shuffle on purpose: membership of the
+    validation slice must not depend on the epoch, otherwise reshuffling
+    would leak validation samples into training (see ``EpochShuffled``).
+
     Batch contract (what the models consume): ``input_ids [B, T]`` +
     ``attention_mask [B, T]``. The ``[B, T, V]`` simplex is built on-device
     inside the model — it never rides the DataLoader.
@@ -49,7 +90,6 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         for split in d.splits
     ]
     ds = streams[0] if len(streams) == 1 else interleave_datasets(streams)
-    ds = ds.shuffle(seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000))
 
     use_template = getattr(tokenizer, "chat_template", None) is not None
     text_field = d.get("text_field", None)
@@ -94,4 +134,12 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         )
 
     val_size = d.get("val_size", 256)
-    return make_loader(ds.skip(val_size)), make_loader(ds.take(val_size))
+    train_ds = ds.skip(val_size)
+    # data.train_size bounds the training pool to a FIXED set of samples, so
+    # trainer.max_epochs repeats exactly that set (an epoch in the strict
+    # sense) — still streaming, nothing is downloaded ahead. null/0 = the
+    # whole stream: repetitions then draw fresh samples in a fresh order.
+    if d.get("train_size", None):
+        train_ds = train_ds.take(d.train_size)
+    train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000))
+    return make_loader(train_ds), make_loader(ds.take(val_size))

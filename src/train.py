@@ -7,6 +7,23 @@ from src.data import build_dataloaders, quiet_download_logs
 from src.models.factory import build_lit
 
 
+class ReshuffleStreamingData(L.Callback):
+    """Multi-epoch training over a streaming dataset.
+
+    Every new Trainer epoch re-opens the stream from the start; without this
+    hook each repetition would replay the SAME sample order. ``set_epoch``
+    reseeds the shuffle buffer, so repetitions see the same data in a new
+    order — the streaming equivalent of an epoch. The val slice is split off
+    before the shuffle (see build_dataloaders), so its membership never
+    changes.
+    """
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        ds = getattr(trainer.train_dataloader, "dataset", None)
+        if hasattr(ds, "set_epoch"):
+            ds.set_epoch(trainer.current_epoch)
+
+
 @hydra.main(version_base="1.3", config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     quiet_download_logs()
@@ -37,6 +54,7 @@ def main(cfg: DictConfig) -> None:
             every_n_train_steps=cfg.train.get("checkpoint_every_n_steps", 1000),
         ),
         LearningRateMonitor(logging_interval="step"),
+        ReshuffleStreamingData(),
     ]
     # Stop when the validation loss starts GROWING (patience = how many
     # validations in a row it may fail to improve); 0 disables.
