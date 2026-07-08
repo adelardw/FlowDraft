@@ -72,6 +72,10 @@ echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
 #    checkpoints (DF head + Adam moments, ~5 GB for 3B) land in checkpoints/
 #    our ADDITION beyond the task — training in the exact inference geometry:
 #    append train.variant=block_wise
+#    epochs on top of streaming (nothing is downloaded ahead): a fixed pool of
+#    N samples repeated M times, each repetition in a new order —
+#    ./hf-auth.sh uv run python src/train.py \
+#        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
 
 # 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
@@ -95,23 +99,23 @@ is the Russian guide: [Эксперименты (этапы задания)](#э
 The command summary:
 
 ```bash
-# Task stage 1 — reproduce the Orthrus masked-diffusion baseline @ 0.5B
+# Stage 1 — reproduce the Orthrus masked-diffusion baseline @ 0.5B
 ./hf-auth.sh uv run python src/train.py +experiment=baseline
 
 # Stages 2-3 — flow-map drafter, staged dual distillation (teacher first, consistency ramped in)
 ./hf-auth.sh uv run python src/train.py +experiment=flowmap_staged
-
-# Term ablations — the results-table rows
-./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only
-./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only
 
 # Stage 4 — lossless at sampling: coupled = bitwise; uncoupled = null-calibrated TV test
 ./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
 ./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8 \
     decode.coupled=false decode.equiv_samples=500
 
-# Stage 5 — evaluation (default: MATH-500, a dataset never seen in training;
-#           data=nemotron evaluates on the training distribution),
+# Stage 5 (ablations) — the contribution of each distillation term
+./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only
+./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only
+
+# Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
+#           (data=nemotron evaluates on the training distribution);
 #           block-size x jumps grid -> results/eval.jsonl -> report figures
 ./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=fixed checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
@@ -219,8 +223,17 @@ FlowDraft/
     │   ├── lit_orthrus_baseline.py        # Orthrus masked drafter (full-sequence)
     │   └── lit_orthrus_baseline_block_wise.py  # ADDITION: masked drafter, block-causal
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
-    ├── data/dataloaders.py        # Nemotron streaming: Dataset / collate / DataLoader
-    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*, data/*, experiment/*
+    ├── data/dataloaders.py        # streaming Dataset / collate / DataLoader;
+    │                              #   EpochShuffled: repetitions in a new order (epochs)
+    ├── configs/                   # hydra configs
+    │   ├── train.yaml             # training entrypoint config
+    │   ├── eval.yaml              # evaluation entrypoint config
+    │   ├── model/                 # llama3_3b (default) | qwen2_0.5b (the task's 0.5B)
+    │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
+    │   └── experiment/            # one preset per task stage + additions:
+    │                              #   baseline | flowmap_staged | ablate_teacher_only |
+    │                              #   ablate_consistency_only | baseline_block_wise |
+    │                              #   flowmap_block_wise
     ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
@@ -547,6 +560,10 @@ echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
 #    чекпоинты (DF-голова + Adam-моменты, ~5 ГБ для 3B) падают в checkpoints/
 #    наше ДОПОЛНЕНИЕ сверх задания — обучение в точной инференсной геометрии:
 #    добавьте train.variant=block_wise
+#    эпохи поверх стриминга (ничего не скачивается заранее): фиксированный пул
+#    из N сэмплов, повторённый M раз, каждый повтор в новом порядке —
+#    ./hf-auth.sh uv run python src/train.py \
+#        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
 
 # 4. Замер acceptance / TPF против AR-бейзлайна (lossless утверждается побитово)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
@@ -605,6 +622,16 @@ CFM-драфтер в той же геометрии; λ рампится 0→1 
 Вариант со статичным λ (без staging):
 `./hf-auth.sh uv run python src/train.py model=qwen2_0.5b`.
 
+**Этап 4 — lossless при сэмплировании:**
+
+```bash
+# coupled (дефолт): побитовый lossless при T>0 — тот же сид даёт тот же текст, что AR
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
+# uncoupled (Левиафан): эквивалентность законов, нуль-калиброванный TV-тест
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> \
+    decode.temperature=0.8 decode.coupled=false decode.equiv_samples=500
+```
+
 **Этап 5 (абляции) — вклад каждого члена дистилляции:**
 
 ```bash
@@ -646,16 +673,6 @@ Lossless утверждается **побитово** — падение про
 # каждая строка выше — на MATH-500, которого не было в обучении (дефолт data=math500);
 # парная цифра на обучающем распределении — тот же прогон с data=nemotron:
 ./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b variant=fixed checkpoint=<ckpt> data=nemotron
-```
-
-**Этап 4 — lossless при сэмплировании:**
-
-```bash
-# coupled (дефолт): побитовый lossless при T>0 — тот же сид даёт тот же текст, что AR
-./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
-# uncoupled (Левиафан): эквивалентность законов, нуль-калиброванный TV-тест
-./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> \
-    decode.temperature=0.8 decode.coupled=false decode.equiv_samples=500
 ```
 
 **Дополнение (сверх задания) — обучение в инференсной геометрии:**
@@ -816,8 +833,17 @@ FlowDraft/
     │   ├── lit_orthrus_baseline.py        # masked-драфтер Orthrus (full-sequence)
     │   └── lit_orthrus_baseline_block_wise.py  # ДОПОЛНЕНИЕ: masked-драфтер, block-causal
     ├── preprocessor/df_processor.py   # токенизация + one-hot вершины симплекса
-    ├── data/dataloaders.py        # Nemotron-стриминг: Dataset / collate / DataLoader
-    ├── configs/                   # hydra: train.yaml, eval.yaml, model/*, data/*, experiment/*
+    ├── data/dataloaders.py        # стриминговый Dataset / collate / DataLoader;
+    │                              #   EpochShuffled: повторы в новом порядке (эпохи)
+    ├── configs/                   # hydra-конфиги
+    │   ├── train.yaml             # конфиг точки входа обучения
+    │   ├── eval.yaml              # конфиг точки входа оценки
+    │   ├── model/                 # llama3_3b (дефолт) | qwen2_0.5b (0.5B из задания)
+    │   ├── data/                  # nemotron (обучение) | math500 (оценка, не было в обучении)
+    │   └── experiment/            # по пресету на этап задания + дополнения:
+    │                              #   baseline | flowmap_staged | ablate_teacher_only |
+    │                              #   ablate_consistency_only | baseline_block_wise |
+    │                              #   flowmap_block_wise
     ├── train.py                   # точка входа обучения
     ├── eval.py                    # оценка на датасете: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # фигуры отчёта: frontier / TPF-бары / TPF-от-K
