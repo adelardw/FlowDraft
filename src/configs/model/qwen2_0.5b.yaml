@@ -1,4 +1,4 @@
-# The brief's tractable scale: a 0.5B AR backbone (drafter-only training).
+# The 0.5B scale the task PDF asks for (drafter-only training).
 # Select with `model=qwen2_0.5b`. Qwen2 attention carries QKV biases — the
 # adapter clones them into the DF twins automatically.
 

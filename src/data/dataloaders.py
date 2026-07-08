@@ -2,6 +2,26 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 
+def quiet_download_logs():
+    """Keep ALL transfer chatter out of the training/eval console.
+
+    Streaming pulls parquet shards over HTTP for the whole run; with hydra's
+    root logger at INFO that means one line with a signed URL per range
+    request (httpx), plus "Resolving data files" / "Fetching N files"
+    progress bars from datasets and huggingface_hub. None of it is training
+    signal. Errors (level >= ERROR) still come through.
+    """
+    import logging
+
+    for name in ("httpx", "httpcore", "datasets", "huggingface_hub", "fsspec", "filelock", "urllib3"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    from datasets import disable_progress_bars
+    from huggingface_hub.utils import disable_progress_bars as hub_disable_progress_bars
+
+    disable_progress_bars()
+    hub_disable_progress_bars()
+
+
 def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     """``cfg.data`` dataset -> ``(train_loader, val_loader)``.
 
@@ -12,7 +32,7 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     * ``messages`` (Nemotron-style chat) — rendered with the tokenizer's
       chat template: the drafter must see the same formatting the verifier
       will be served at inference;
-    * plain text (held-out benches: MATH-500 etc.) — the column named by
+    * plain text (evaluation benches: MATH-500 etc.) — the column named by
       ``data.text_field`` (fallback: prompt/problem/question/text) is wrapped
       as a single user turn with the generation prompt appended, i.e. exactly
       what an instruct verifier receives at inference.

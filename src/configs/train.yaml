@@ -12,12 +12,15 @@ output_dir: checkpoints     # artifacts live at project root, gitignored
 
 # --- training (OrthrusLitModule.configure_optimizers) ---
 train:
-  variant: fixed            # fixed (full-sequence, lit_orthrus)
-                            # | block_wise (inference geometry: clean AR prefix in KV + noisy K-block)
-                            # | baseline (Orthrus masked drafter, full-sequence)
-                            # | baseline_block_wise (Orthrus masked drafter, block-causal geometry)
-                            # Presets for the brief's stages: `+experiment=baseline|flowmap_staged|
-                            #   ablate_teacher_only|ablate_consistency_only` (see configs/experiment/)
+  variant: fixed            # TASK variants (full-sequence, per the project task):
+                            #   fixed (flow-map drafter, lit_orthrus)
+                            #   | baseline (Orthrus masked drafter)
+                            # ADDITION beyond the task (the inference geometry):
+                            #   block_wise (clean AR prefix in KV + noisy K-block)
+                            #   | baseline_block_wise (masked drafter, block-causal)
+                            # Presets (see configs/experiment/):
+                            #   task stages — `+experiment=baseline|flowmap_staged|ablate_*`
+                            #   addition     — `+experiment=baseline_block_wise|flowmap_block_wise`
   block_size: 64            # K — block-wise only
   min_prefix: 1             # block-wise only: shortest clean prefix
   lr: 1e-4

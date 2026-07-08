@@ -1,0 +1,15 @@
+# @package _global_
+# ADDITION (beyond the task): the flow-map drafter retrained in the exact
+# inference geometry — clean AR prefix in the KV cache, clean in-block
+# anchor, noisy K-block. Same staged dual distillation as flowmap_staged;
+# pair with baseline_block_wise for a geometry-for-geometry comparison.
+#   uv run python src/train.py +experiment=flowmap_block_wise
+defaults:
+  - override /model: qwen2_0.5b
+
+output_dir: checkpoints/flowmap-block-wise
+
+train:
+  variant: block_wise
+  lambda_ramp_steps: 2000
+  checkpoint_name: flowmap-block-wise-{step:07d}

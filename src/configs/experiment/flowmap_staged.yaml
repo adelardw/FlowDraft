@@ -1,7 +1,9 @@
 # @package _global_
-# Brief steps 2-3: the Categorical Flow Map drafter with STAGED dual
+# Task stages 2-3: the Categorical Flow Map drafter with STAGED dual
 # distillation — teacher-matching first (lambda ramps from 0), consistency
-# second. Same 0.5B backbone and block-causal geometry as the baseline.
+# second. Same 0.5B backbone and full-sequence geometry as the baseline.
+# The inference-geometry retrain is a separate ADDITION preset:
+# +experiment=flowmap_block_wise.
 #   uv run python src/train.py +experiment=flowmap_staged
 defaults:
   - override /model: qwen2_0.5b
@@ -9,6 +11,6 @@ defaults:
 output_dir: checkpoints/flowmap-staged
 
 train:
-  variant: block_wise
+  variant: fixed
   lambda_ramp_steps: 2000
   checkpoint_name: flowmap-staged-{step:07d}

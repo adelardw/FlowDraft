@@ -124,9 +124,9 @@ def sampling_equivalence(model, prompt_ids, *, n_samples, block_size, jumps,
 def dataset_prompts(model, cfg):
     """The first ``decode.n_prompts`` validation samples of ``cfg.data`` —
     the full rendered prompt each (``decode.prompt_len=N`` switches to
-    N-token prefixes). ``data=math500`` (default) is a distribution-level
-    held-out bench; ``data=nemotron`` reads the training distribution's val
-    slice. Yields ``(label, prompt_ids [1, P])``.
+    N-token prefixes). ``data=math500`` (default) is a benchmark the drafter
+    never saw in training; ``data=nemotron`` reads the training
+    distribution's val slice. Yields ``(label, prompt_ids [1, P])``.
 
     For ad-hoc prompts use ``main.py`` — evaluation is dataset-only.
     """
@@ -156,6 +156,9 @@ def dataset_prompts(model, cfg):
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="eval")
 def main(cfg: DictConfig) -> None:
+    from src.data import quiet_download_logs
+
+    quiet_download_logs()
     torch.manual_seed(cfg.seed)
     model = build_lit(cfg)
 
