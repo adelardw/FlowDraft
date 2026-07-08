@@ -15,12 +15,22 @@ class EpochShuffled(IterableDataset):
     ``set_epoch`` so every repetition of the stream yields a new order.
     """
 
-    def __init__(self, ds, seed: int, buffer_size: int):
+    def __init__(self, ds, seed: int, buffer_size: int, size: int | None = None):
         self.ds, self.seed, self.buffer_size = ds, seed, buffer_size
+        self.size = size
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+
+    def __len__(self):
+        # Known only when the pool is bounded (data.train_size). With a known
+        # length the Trainer derives steps per epoch and the cosine-LR horizon
+        # itself — data.train_size + trainer.max_epochs needs no manual
+        # max_steps arithmetic.
+        if self.size is None:
+            raise TypeError("unbounded stream has no length")
+        return self.size
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
@@ -139,7 +149,9 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
     # whole stream: repetitions then draw fresh samples in a fresh order.
-    if d.get("train_size", None):
-        train_ds = train_ds.take(d.train_size)
-    train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000))
+    train_size = d.get("train_size", None)
+    if train_size:
+        train_ds = train_ds.take(train_size)
+    train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000),
+                             size=train_size)
     return make_loader(train_ds), make_loader(ds.take(val_size))
