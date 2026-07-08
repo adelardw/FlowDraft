@@ -6,5 +6,10 @@
 defaults:
   - override /model: qwen2_0.5b
 
+# own dir + filename: runs of different presets never overwrite each other's
+# checkpoints (incl. last.ckpt) or TensorBoard logs
+output_dir: checkpoints/baseline
+
 train:
   variant: baseline_block_wise
+  checkpoint_name: baseline-{step:07d}

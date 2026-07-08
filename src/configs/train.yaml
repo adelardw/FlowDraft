@@ -30,7 +30,7 @@ train:
                             #   (teacher-matching first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
   anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
-                            #   trajectory | landing (X_{s,t}(x_s))
+                            #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
   checkpoint_every_n_steps: 1000
   # Target-metric validation: run the real decode loop (single-jump) on a few
   # val prompts each validation -> val/tpf & val/acceptance_decode curves.

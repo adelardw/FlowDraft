@@ -22,6 +22,7 @@
 
 - [Overview](#overview)
 - [Quickstart](#quickstart)
+- [Experiments (brief stages)](#experiments-brief-stages)
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
@@ -34,6 +35,8 @@
 - [Installation](#installation) 🚧
 - [Usage](#usage) 🚧
 - [Training](#training) 🚧
+- [Configuration reference](#configuration-reference)
+- [Inference parameters, in plain words](#inference-parameters-in-plain-words)
 - [Evaluation](#evaluation) 🚧
 - [Results](#results) 🚧
 - [References](#references)
@@ -80,6 +83,41 @@ Laptop debugging: `src/train.py` and `src/eval.py` also run on a small ungated
 backbone — append the hydra overrides
 `model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
 model.backbone.device_map=null`.
+
+### Experiments (brief stages)
+
+Every stage of the brief is one preset in `src/configs/experiment/`. The
+**detailed walkthrough — what each stage means, which training curves to
+watch, expected behaviour, results-table rows, and the analysis pipeline —
+is the Russian guide: [Эксперименты (этапы брифа)](#эксперименты-этапы-брифа).**
+The command summary:
+
+```bash
+# Stage 1 — reproduce the Orthrus masked-diffusion baseline @ 0.5B
+./hf-auth.sh uv run python src/train.py +experiment=baseline
+
+# Stages 2-3 — flow-map drafter, staged dual distillation (teacher first, consistency ramped in)
+./hf-auth.sh uv run python src/train.py +experiment=flowmap_staged
+
+# Term ablations — the results-table rows
+./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only
+./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only
+
+# Stage 4 — lossless at sampling: coupled = bitwise; uncoupled = null-calibrated TV test
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
+./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8 \
+    decode.coupled=false decode.equiv_samples=500
+
+# Stage 5 — evaluation (held-out MATH-500 by default; data=nemotron for in-distribution),
+#           block-size x jumps grid -> results/eval.jsonl -> report figures
+./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=block_wise checkpoint=<ckpt> \
+    decode.block_size=4,8,16 decode.jumps=1,2,4
+uv run python src/plots.py
+```
+
+Training curves land in TensorBoard (`uv run tensorboard --logdir checkpoints`);
+metric formulas and the training↔eval correspondence are spelled out in the
+Russian guide.
 
 ### Background: the decoding bottleneck
 
@@ -221,6 +259,112 @@ curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
 the frozen backbone is never written). The Russian
 section carries the full per-experiment guide.
 
+### Configuration reference
+
+All configs live in `src/configs/` (hydra). Any key can be overridden from the
+command line (`train.lr=3e-4`), config groups are swapped whole
+(`model=qwen2_0.5b data=nemotron`), presets are added with `+experiment=...`.
+
+**`train.yaml` — training (`src/train.py`)**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `seed` | 42 | global RNG seed: data shuffle, noise draws, init |
+| `output_dir` | `checkpoints` | where checkpoints and TensorBoard logs land |
+| `train.variant` | `fixed` | which drafter to train: `fixed` \| `block_wise` \| `baseline` \| `baseline_block_wise` |
+| `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
+| `train.min_prefix` | 1 | shortest clean prefix before the training block |
+| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only |
+| `train.time_sampling` | `triangle` | how (s, t) pairs are drawn: `triangle` \| `sequential` \| `paper` |
+| `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
+| `train.anchor_weight` | 1.0 | weight of the AR-teacher anchor; 0 = teacher-off ablation |
+| `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
+| `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
+| `train.checkpoint_name` | `flowdraft-{step:07d}` | checkpoint filename pattern — set your own per experiment (quote on CLI: `'train.checkpoint_name="my-run-{step:07d}"'`) |
+| `train.checkpoint_every_n_steps` | 1000 | how often to checkpoint |
+| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | run the real decode loop on N val prompts each validation → `val/tpf`, `val/acceptance_decode`; 0 = off |
+| `train.monitor` / `monitor_mode` | `val/tpf` / `max` | which curve selects the best checkpoint |
+| `train.early_stop_patience` | 5 | stop after N validations without `val/loss` improvement; 0 = off |
+| `trainer.*` | — | passed verbatim to `lightning.Trainer` (precision, max_steps, …) |
+
+**`eval.yaml` — metrics on a dataset (`src/eval.py`)**
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `checkpoint` | null | trained DF-head `.ckpt`; null = untrained drafter |
+| `variant` | `fixed` | must match how the checkpoint was trained |
+| `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes (see the plain-words guide below) |
+| `decode.max_new_tokens` | 64 | tokens generated per prompt |
+| `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
+| `decode.prompt_len` | null | null = the full rendered prompt; int N = first N tokens only |
+| `decode.temperature` / `top_k` / `top_p` | 0 / null / null | 0 = greedy; >0 = sampling |
+| `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
+| `decode.equiv_samples` | 0 | uncoupled only: N draws for the TV law-equivalence test; 0 = off |
+
+**`model/*` — backbone** (`llama3_3b` default, `qwen2_0.5b` the brief's scale):
+`name` (HF id), `backbone.dtype`, `backbone.device_map`,
+`backbone.attn_implementation` (`sdpa` default \| `flex_attention` GPU-only \| `eager`).
+
+**`data/*` — dataset** (`nemotron` for training, `math500` held-out for eval):
+`dataset` (HF id), `splits`, `text_field` (column for plain-text benches),
+`streaming`, `shuffle_buffer`, `val_size` (first N stream samples → validation),
+`batch_size`, `max_length`, `num_workers`.
+
+**`experiment/*` — one preset per brief stage.** Each sets its own
+`output_dir` and `train.checkpoint_name`, so runs never overwrite each other:
+
+| Preset | Sets | Checkpoints |
+| --- | --- | --- |
+| `baseline` | `variant=baseline_block_wise` | `checkpoints/baseline/baseline-*.ckpt` |
+| `flowmap_staged` | `variant=block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowmap-staged/flowmap-staged-*.ckpt` |
+| `ablate_teacher_only` | `lambda=0` | `checkpoints/ablate-teacher/ablate-teacher-*.ckpt` |
+| `ablate_consistency_only` | `anchor_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
+
+Your own experiment (e.g. the `anchor_point` study) — override name and dir
+so it gets its own shelf too:
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=flowmap_staged \
+    train.anchor_point=landing \
+    output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
+```
+
+### Inference parameters, in plain words
+
+One decode cycle works like this: the drafter guesses a whole block of tokens
+at once, the frozen base model checks the guess in a single pass, the leading
+tokens that match what the base model would have said are kept, and the base
+model adds one token of its own (the fix for the first wrong guess — or a
+bonus token if everything matched). Then the next cycle starts. The knobs:
+
+- `--block-size` (K) — how many tokens the drafter guesses per cycle. Bigger
+  blocks promise more speedup, but the tail of a long guess relies on the
+  guessed (unverified) beginning, so it gets rejected more often. Sweep 4–16.
+- `--jumps` — how many passes the drafter spends polishing its guess before
+  showing it to the base model. Each extra pass makes the guess better but
+  costs one forward: a cycle costs `jumps + 1` passes total. More jumps only
+  pay off if the extra accepted tokens outweigh the extra passes.
+- `--max-new-tokens` — response length cap.
+- `--temperature` — 0: always take the most likely token; the output is
+  guaranteed identical to the plain base model, checked bit-for-bit. Above 0:
+  random sampling, livelier text.
+- `--top-k` / `--top-p` — sampling only: limit the draw to the k most likely
+  tokens / the smallest set covering probability p.
+- `--coupled` (on by default) — when sampling, the drafter and the base model
+  draw their randomness from one shared, seeded source. Result: even the
+  *sampled* text is exactly the text the plain base model would produce with
+  that seed — token for token. `--sampling-seed` picks which text that is;
+  `--no-coupled` switches to classic speculative sampling (same distribution,
+  not the same tokens).
+- `--variant` + `--checkpoint` — which drafter geometry to load and its
+  trained weights. Without a checkpoint the drafter is untrained: output is
+  still exact, it just accepts almost nothing (slow).
+- `--model` — the backbone: a config name (`qwen2_0.5b`) or an HF id.
+
+None of these affect *what* is generated beyond the guarantees above — only
+how fast. The verifier has the final word on every token.
+
 ### Evaluation
 
 Prefixes of validation samples are decoded twice — flow-draft vs plain AR — and
@@ -314,6 +458,8 @@ Developed as part of the **Summer of Machine Learning at Skoltech (SMILES)**, Sk
 - [Установка](#установка) 🚧
 - [Использование](#использование) 🚧
 - [Обучение](#обучение) 🚧
+- [Справочник конфигов](#справочник-конфигов)
+- [Параметры инференса простыми словами](#параметры-инференса-простыми-словами)
 - [Оценка](#оценка) 🚧
 - [Результаты](#результаты) 🚧
 - [Ссылки](#ссылки)
@@ -641,6 +787,116 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 Ручки — в `configs/train.yaml`: `lambda` (баланс двойной дистилляции),
 `anchor_point`, `time_sampling`, `block_size`/`min_prefix` (block-wise), оптимизатор,
 Lightning `trainer.*`. Чекпоинты хранят DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется никогда).
+
+### Справочник конфигов
+
+Все конфиги — в `src/configs/` (hydra). Любой ключ переопределяется из
+командной строки (`train.lr=3e-4`), группы меняются целиком
+(`model=qwen2_0.5b data=nemotron`), пресеты добавляются `+experiment=...`.
+
+**`train.yaml` — обучение (`src/train.py`)**
+
+| Ключ | Дефолт | Что делает |
+| --- | --- | --- |
+| `seed` | 42 | глобальный сид: перемешивание данных, шум, инициализация |
+| `output_dir` | `checkpoints` | куда падают чекпоинты и логи TensorBoard |
+| `train.variant` | `fixed` | какой драфтер учить: `fixed` \| `block_wise` \| `baseline` \| `baseline_block_wise` |
+| `train.block_size` | 64 | K — длина блока на обучении (block-wise варианты) |
+| `train.min_prefix` | 1 | минимальный чистый префикс перед блоком |
+| `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW только по DF-голове |
+| `train.time_sampling` | `triangle` | как сэмплируются пары (s, t): `triangle` \| `sequential` \| `paper` |
+| `train.lambda` | 1.0 | вес consistency-части (4·EC + 2·TD) |
+| `train.anchor_weight` | 1.0 | вес AR-якоря; 0 = абляция «без учителя» |
+| `train.lambda_ramp_steps` | 0 | staged-дистилляция: lambda 0 → `lambda` за N шагов; 0 = статично |
+| `train.anchor_point` | `trajectory` | где якорь берёт диагональ: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
+| `train.checkpoint_name` | `flowdraft-{step:07d}` | шаблон имени чекпоинта — задавайте свой на каждый эксперимент (в CLI брать в кавычки: `'train.checkpoint_name="my-run-{step:07d}"'`) |
+| `train.checkpoint_every_n_steps` | 1000 | как часто сохранять |
+| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | настоящая петля декодирования на N val-промптах каждую валидацию → `val/tpf`, `val/acceptance_decode`; 0 = выкл |
+| `train.monitor` / `monitor_mode` | `val/tpf` / `max` | по какой кривой выбирается лучший чекпоинт |
+| `train.early_stop_patience` | 5 | стоп после N валидаций без улучшения `val/loss`; 0 = выкл |
+| `trainer.*` | — | прокидывается в `lightning.Trainer` как есть (precision, max_steps, …) |
+
+**`eval.yaml` — метрики на датасете (`src/eval.py`)**
+
+| Ключ | Дефолт | Что делает |
+| --- | --- | --- |
+| `checkpoint` | null | обученная DF-голова `.ckpt`; null = необученный драфтер |
+| `variant` | `fixed` | должен совпадать с тем, как учили чекпоинт |
+| `results_file` | `results/eval.jsonl` | каждый прогон дописывает JSON-строку (вход `src/plots.py`) |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | K и число уточняющих проходов на инференсе (см. гид ниже) |
+| `decode.max_new_tokens` | 64 | сколько токенов генерировать на промпт |
+| `decode.n_prompts` | 64 | сколько промптов взять из датасета (100–200 для таблицы) |
+| `decode.prompt_len` | null | null = полный отрендеренный промпт; число N = первые N токенов |
+| `decode.temperature` / `top_k` / `top_p` | 0 / null / null | 0 = greedy; >0 = сэмплирование |
+| `decode.coupled` | true | T>0: Gumbel-связанное сэмплирование — побитово равно AR |
+| `decode.equiv_samples` | 0 | только uncoupled: N выборок для TV-теста равенства законов; 0 = выкл |
+
+**`model/*` — бэкбон** (`llama3_3b` дефолт, `qwen2_0.5b` — масштаб брифа):
+`name` (HF id), `backbone.dtype`, `backbone.device_map`,
+`backbone.attn_implementation` (`sdpa` дефолт \| `flex_attention` только GPU \| `eager`).
+
+**`data/*` — датасет** (`nemotron` для обучения, `math500` — held-out для оценки):
+`dataset` (HF id), `splits`, `text_field` (колонка для текстовых бенчей),
+`streaming`, `shuffle_buffer`, `val_size` (первые N сэмплов потока → валидация),
+`batch_size`, `max_length`, `num_workers`.
+
+**`experiment/*` — по пресету на этап брифа.** Каждый задаёт свои
+`output_dir` и `train.checkpoint_name` — прогоны не перетирают друг друга
+(в том числе `last.ckpt`):
+
+| Пресет | Задаёт | Чекпоинты |
+| --- | --- | --- |
+| `baseline` | `variant=baseline_block_wise` | `checkpoints/baseline/baseline-*.ckpt` |
+| `flowmap_staged` | `variant=block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowmap-staged/flowmap-staged-*.ckpt` |
+| `ablate_teacher_only` | `lambda=0` | `checkpoints/ablate-teacher/ablate-teacher-*.ckpt` |
+| `ablate_consistency_only` | `anchor_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
+
+Свой эксперимент (например, серия по `anchor_point` после основных этапов,
+или block-wise против fixed) — переопределите имя и каталог, чтобы у него
+тоже была своя полка:
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=flowmap_staged \
+    train.anchor_point=landing \
+    output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
+```
+
+### Параметры инференса простыми словами
+
+Один цикл декодирования устроен так: драфтер угадывает сразу целый блок
+токенов, замороженная базовая модель проверяет догадку за один проход,
+совпавшее начало блока принимается, и базовая модель добавляет один свой
+токен (исправление первой ошибки — или бонус, если совпало всё). Дальше —
+следующий цикл. Ручки:
+
+- `--block-size` (K) — сколько токенов драфтер угадывает за цикл. Больше —
+  выше потенциальное ускорение, но хвост длинной догадки опирается на её же
+  непроверенное начало и отбрасывается чаще. Перебирайте 4–16.
+- `--jumps` — сколько проходов драфтер тратит на «полировку» догадки, прежде
+  чем показать её базовой модели. Каждый лишний проход улучшает догадку, но
+  и стоит один forward: цикл обходится в `jumps + 1` проходов. Больше прыжков
+  окупается, только если дополнительно принятые токены перевешивают
+  дополнительные проходы.
+- `--max-new-tokens` — потолок длины ответа.
+- `--temperature` — 0: всегда самый вероятный токен; выход гарантированно
+  совпадает с чистой базовой моделью, это проверяется побайтово. Больше 0 —
+  случайное сэмплирование, текст живее.
+- `--top-k` / `--top-p` — только при сэмплировании: ограничить выбор k самыми
+  вероятными токенами / наименьшим набором с суммарной вероятностью p.
+- `--coupled` (включено по умолчанию) — при сэмплировании драфтер и базовая
+  модель берут случайность из одного общего источника с сидом. В итоге даже
+  *сэмплированный* текст — ровно тот, что выдала бы чистая базовая модель с
+  этим сидом, токен в токен. `--sampling-seed` выбирает, какой именно это
+  текст; `--no-coupled` — классическое спекулятивное сэмплирование (то же
+  распределение, но не те же токены).
+- `--variant` + `--checkpoint` — геометрия драфтера и его обученные веса.
+  Без чекпоинта драфтер необучен: выход всё равно точный, просто почти ничего
+  не принимается (медленно).
+- `--model` — бэкбон: имя конфига (`qwen2_0.5b`) или HF id.
+
+Ни одна из этих ручек не меняет, *что* будет сгенерировано (сверх гарантий
+выше) — только как быстро. Последнее слово по каждому токену — за
+верификатором.
 
 ### Оценка
 
