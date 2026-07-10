@@ -47,6 +47,16 @@ class FlowMapOrthrus(L.LightningModule):
         self.strict_loading = False
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
 
+    @property
+    def device(self) -> torch.device:
+        # HF `device_map` places the backbone straight on the accelerator
+        # WITHOUT Lightning knowing: outside a Trainer the mixin's device
+        # keeps saying "cpu", so prompts/masks built with `self.device`
+        # (eval.py, generate) land on the wrong device and the embedding
+        # lookup crashes. Derive the truth from where the weights actually
+        # are — correct both under device_map and after Trainer moves.
+        return self.orthrus.model.get_input_embeddings().weight.device
+
     # --- mechanism passthrough ------------------------------------------------
 
     def forward(self, *args, **kwargs):

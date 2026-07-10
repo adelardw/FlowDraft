@@ -35,12 +35,12 @@ train:
   lambda_ramp_steps: 0      # staged dual distillation: ramp lambda 0 -> lambda over N steps
                             #   (teacher-matching first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
-  anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
+  anchor_point: landing  # where the AR anchor evaluates the diagonal pi_{t,t}:
                             #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
   checkpoint_every_n_steps: 1000
   # Target-metric validation: run the real decode loop (single-jump) on a few
   # val prompts each validation -> val/tpf & val/acceptance_decode curves.
-  val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy
+  val_decode_prompts: 10     # 0 = off; raise (8+) if checkpoint selection looks noisy
   val_decode_max_new: 32
   monitor: val/tpf          # checkpoint selection: val/tpf (beat the baseline on the
   monitor_mode: max         #   target metric; NOISY early) | val/loss + min (smooth)
@@ -51,9 +51,9 @@ trainer:
   accelerator: auto
   devices: auto
   precision: bf16-mixed
-  max_steps: 10000            # -1 = no step bound (then bound by max_epochs)
-  max_epochs: null            # repetitions of the stream; see "Повторение потока" in README
-  limit_train_batches: null   # batches per repetition; null = the whole stream
+  max_steps: -1            # -1 = no step bound (then bound by max_epochs)
+  max_epochs: 2            # repetitions of the stream; see "Повторение потока" in README
+  limit_train_batches: 25000   # batches per repetition; null = the whole stream
   val_check_interval: 500
   log_every_n_steps: 10
   gradient_clip_val: 1.0
