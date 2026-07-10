@@ -135,6 +135,16 @@ Training curves land in TensorBoard (`uv run tensorboard --logdir checkpoints`);
 metric formulas and the training↔eval correspondence are spelled out in the
 Russian guide.
 
+To mirror the same metrics to Weights & Biases, authenticate once with
+`uv run wandb login` (or set `WANDB_API_KEY`) and enable the opt-in sink:
+
+```bash
+./hf-auth.sh uv run python src/train.py \
+    wandb.enabled=true wandb.project=flowdraft wandb.name=qwen2-fixed
+```
+
+Use `wandb.offline=true` to record locally and upload later with `wandb sync`.
+
 ### Background: the decoding bottleneck
 
 - **AR LLMs** decode strictly sequentially: *L* tokens → *L* forward passes (memory-bandwidth bound).
@@ -332,7 +342,11 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | Key | Default | What it does |
 | --- | --- | --- |
 | `seed` | 42 | global RNG seed: data shuffle, noise draws, init |
-| `output_dir` | `checkpoints` | where checkpoints and TensorBoard logs land |
+| `output_dir` | `checkpoints` | where checkpoints, TensorBoard logs, and local W&B data land |
+| `wandb.enabled` | false | mirror all Lightning training/validation metrics to W&B |
+| `wandb.project` / `entity` / `name` | `flowdraft` / null / null | W&B destination and optional run name; null uses W&B defaults |
+| `wandb.group` / `tags` | null / [] | optional W&B organization metadata |
+| `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
 | `train.variant` | `fixed` | which drafter to train: the task — `fixed` \| `baseline` (full-sequence); the addition — `block_wise` \| `baseline_block_wise` (inference geometry) |
 | `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
@@ -588,6 +602,16 @@ model.backbone.device_map=null`.
 Каждый этап задания проекта — один пресет, то есть готовый набор настроек (`src/configs/experiment/`). Чекпоинты падают
 в `checkpoints/` (DF-голова + Adam-моменты, без бэкбона), кривые обучения — в TensorBoard:
 `uv run tensorboard --logdir checkpoints`.
+
+Те же метрики можно отправлять в Weights & Biases. Один раз выполните
+`uv run wandb login` (или задайте `WANDB_API_KEY`), затем включите sink:
+
+```bash
+./hf-auth.sh uv run python src/train.py \
+    wandb.enabled=true wandb.project=flowdraft wandb.name=qwen2-fixed
+```
+
+`wandb.offline=true` сохраняет прогон локально для последующего `wandb sync`.
 
 **Словарь кривых обучения:**
 
@@ -945,7 +969,11 @@ cosine 2e-4 с 5% разогревом):
 | Ключ | Дефолт | Что делает |
 | --- | --- | --- |
 | `seed` | 42 | глобальный сид: перемешивание данных, шум, инициализация |
-| `output_dir` | `checkpoints` | куда падают чекпоинты и логи TensorBoard |
+| `output_dir` | `checkpoints` | куда падают чекпоинты, логи TensorBoard и локальные данные W&B |
+| `wandb.enabled` | false | отправлять все training/validation-метрики Lightning в W&B |
+| `wandb.project` / `entity` / `name` | `flowdraft` / null / null | проект, команда/пользователь и имя прогона; null берёт дефолт W&B |
+| `wandb.group` / `tags` | null / [] | необязательная группировка прогонов в W&B |
+| `wandb.offline` | false | писать локально для последующего `wandb sync`, не загружая сразу |
 | `train.variant` | `fixed` | какой драфтер учить: из задания — `fixed` \| `baseline` (полноследовательные); дополнение — `block_wise` \| `baseline_block_wise` (инференсная геометрия) |
 | `train.block_size` | 64 | K — длина блока на обучении (block-wise варианты) |
 | `train.min_prefix` | 1 | минимальный чистый префикс перед блоком |

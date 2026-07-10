@@ -10,6 +10,17 @@ defaults:
 seed: 42
 output_dir: checkpoints     # artifacts live at project root, gitignored
 
+# TensorBoard is always written locally. Enable W&B to mirror the same
+# Lightning metrics; authenticate with `uv run wandb login` or WANDB_API_KEY.
+wandb:
+  enabled: false
+  project: flowdraft
+  entity: null              # W&B team/user; null uses the CLI/env default
+  name: null                # run display name; null lets W&B generate one
+  group: null               # optional experiment/ablation group
+  tags: []
+  offline: false            # true writes a local run for a later `wandb sync`
+
 # --- training (OrthrusLitModule.configure_optimizers) ---
 train:
   variant: fixed            # TASK variants (full-sequence, per the project task):

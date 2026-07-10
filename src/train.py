@@ -1,6 +1,7 @@
 import hydra
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 
 from src.data import build_dataloaders, quiet_download_logs
@@ -22,6 +23,33 @@ class ReshuffleStreamingData(L.Callback):
         ds = getattr(trainer.train_dataloader, "dataset", None)
         if hasattr(ds, "set_epoch"):
             ds.set_epoch(trainer.current_epoch)
+
+
+def build_loggers(cfg: DictConfig):
+    """Keep local TensorBoard logs and optionally mirror every metric to W&B."""
+    loggers = [TensorBoardLogger(save_dir=cfg.output_dir)]
+    wandb_cfg = cfg.get("wandb", {})
+    if not wandb_cfg.get("enabled", False):
+        return loggers
+
+    # Import lazily so local/TensorBoard-only runs do not initialize W&B.
+    from lightning.pytorch.loggers import WandbLogger
+
+    kwargs = {
+        "project": wandb_cfg.get("project", "flowdraft"),
+        "save_dir": cfg.output_dir,
+        "offline": wandb_cfg.get("offline", False),
+        "log_model": False,
+    }
+    for key in ("entity", "name", "group"):
+        value = wandb_cfg.get(key)
+        if value is not None:
+            kwargs[key] = value
+    tags = wandb_cfg.get("tags")
+    if tags:
+        kwargs["tags"] = list(tags)
+    loggers.append(WandbLogger(**kwargs))
+    return loggers
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="train")
@@ -64,6 +92,7 @@ def main(cfg: DictConfig) -> None:
     trainer = L.Trainer(
         callbacks=callbacks,
         default_root_dir=cfg.output_dir,
+        logger=build_loggers(cfg),
         **OmegaConf.to_container(cfg.trainer, resolve=True),
     )
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
