@@ -77,6 +77,16 @@ echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
 #    ./hf-auth.sh uv run python src/train.py \
 #        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
 
+For multi-GPU training, let Lightning run DDP and specify the GPU count:
+
+```bash
+./hf-auth.sh uv run python src/train.py \
+    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
+    data.batch_size=8 trainer.max_steps=10000
+```
+
+Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
+
 # 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
 
@@ -583,6 +593,16 @@ echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
 #    из N сэмплов, повторённый M раз, каждый повтор в новом порядке —
 #    ./hf-auth.sh uv run python src/train.py \
 #        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
+
+Для обучения на нескольких GPU используйте DDP Lightning и укажите число GPU:
+
+```bash
+./hf-auth.sh uv run python src/train.py \
+    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
+    data.batch_size=8 trainer.max_steps=10000
+```
+
+Во время обучения `model.backbone.device_map` всегда отключается: device map Hugging Face нужен для inference-шардинга, а DDP требует полную реплику модели на каждом GPU. `data.batch_size` в команде задан на один GPU; для большего эффективного глобального batch используйте `trainer.accumulate_grad_batches`.
 
 # 4. Замер acceptance / TPF против AR-бейзлайна (lossless утверждается побитово)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt

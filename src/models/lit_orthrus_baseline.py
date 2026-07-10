@@ -19,6 +19,11 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
     receives no gradients.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # This variant never passes (s, t), so DDP must not await it.
+        self.orthrus.time_embed.requires_grad_(False)
+
     # --- training: mask-and-reconstruct distillation ---------------------------
 
     def _masked_step(self, batch):
@@ -54,15 +59,15 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
         loss, _, _, _ = self._masked_step(batch)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, df_logits, teacher_logits, masked = self._masked_step(batch)
         live = batch["attention_mask"][:, 1:].bool() & masked[:, 1:]
         agree = (df_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[live]
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/teacher_agreement", agree.float().mean())
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
         self._maybe_decode_val(batch, batch_idx)
         return loss
 

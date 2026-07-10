@@ -19,6 +19,11 @@ class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
     anchor come from the parent's :meth:`_prepare_block`.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Block-wise baseline also never supplies flow-map times.
+        self.orthrus.time_embed.requires_grad_(False)
+
     def _masked_step(self, batch):
         teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor = self._prepare_block(batch)
         vocab = self.df_processor.vocab_size
@@ -37,15 +42,15 @@ class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
         loss, _, _, _ = self._masked_step(batch)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, df_logits, teacher_logits, block_mask = self._masked_step(batch)
         live = block_mask.bool()
         agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/teacher_agreement", agree.float().mean())
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
         self._maybe_decode_val(batch, batch_idx)
         return loss
 

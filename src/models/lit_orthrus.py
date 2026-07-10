@@ -223,7 +223,7 @@ class FlowMapOrthrus(L.LightningModule):
         lam = self._lambda()
         aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
         loss = aw * anchor + lam * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td, "loss/lambda": lam})
+        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td, "loss/lambda": lam}, sync_dist=True)
         return loss
 
     # --- generation: the model generates, start to finish ----------------------
@@ -603,7 +603,7 @@ class FlowMapOrthrus(L.LightningModule):
         loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, s, t)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -613,8 +613,8 @@ class FlowMapOrthrus(L.LightningModule):
         # matches the verifier's argmax (shifted: teacher@i predicts i+1).
         mask = batch["attention_mask"][:, 1:].bool()
         agree = (draft_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[mask]
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/teacher_agreement", agree.float().mean())
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
         self._maybe_decode_val(batch, batch_idx)
         return loss
 
@@ -644,8 +644,8 @@ class FlowMapOrthrus(L.LightningModule):
             accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
             tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
         if tpfs:
-            self.log("val/acceptance_decode", sum(accs) / len(accs))
-            self.log("val/tpf", sum(tpfs) / len(tpfs))
+            self.log("val/acceptance_decode", sum(accs) / len(accs), sync_dist=True)
+            self.log("val/tpf", sum(tpfs) / len(tpfs), sync_dist=True)
 
     def configure_optimizers(self):
         cfg = self.cfg.train

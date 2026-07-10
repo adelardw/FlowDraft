@@ -1,11 +1,65 @@
 import hydra
 import lightning as L
+import torch
+from loguru import logger
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.strategies import DDPStrategy
+from torch.nn.parallel import DistributedDataParallel
 from omegaconf import DictConfig, OmegaConf
 
 from src.data import build_dataloaders, quiet_download_logs
 from src.models.factory import build_lit
+
+
+def configure_training_device_placement(cfg: DictConfig) -> None:
+    """Use Lightning DDP, not Accelerate inference dispatch, for training."""
+    device_map = cfg.model.backbone.get("device_map")
+    if device_map is not None:
+        logger.warning(
+            "Ignoring model.backbone.device_map={} for training; Lightning "
+            "will place a full model replica on each DDP rank.",
+            device_map,
+        )
+        cfg.model.backbone.device_map = None
+
+
+class CurrentStreamDDPStrategy(DDPStrategy):
+    """Initialize DDP on the stream used by Lightning forwards.
+
+    Lightning 2.6 wraps DDP in a temporary CUDA stream. PyTorch 2.12 then
+    observes the DDP-created AccumulateGrad nodes on that stream while the
+    training forward runs on the default stream.
+    """
+
+    def _setup_model(self, model):
+        return DistributedDataParallel(
+            module=model,
+            device_ids=self.determine_ddp_device_ids(),
+            **self._ddp_kwargs,
+        )
+
+
+def configure_ddp_strategy(trainer_kwargs: dict) -> None:
+    """Use stream-consistent DDP for explicit or automatic multi-GPU DDP."""
+    strategy = trainer_kwargs.get("strategy", "auto")
+    if strategy == "ddp":
+        trainer_kwargs["strategy"] = CurrentStreamDDPStrategy()
+        return
+    if strategy != "auto" or trainer_kwargs.get("accelerator", "auto") not in {"auto", "gpu", "cuda"}:
+        return
+
+    devices = trainer_kwargs.get("devices", "auto")
+    if devices == "auto":
+        count = torch.cuda.device_count()
+    elif isinstance(devices, int) and devices < 0:
+        count = torch.cuda.device_count()
+    elif isinstance(devices, (list, tuple)):
+        count = len(devices)
+    else:
+        count = int(devices)
+    if count > 1:
+        trainer_kwargs["strategy"] = CurrentStreamDDPStrategy()
 
 
 class ReshuffleStreamingData(L.Callback):
@@ -56,7 +110,7 @@ def build_loggers(cfg: DictConfig):
 def main(cfg: DictConfig) -> None:
     quiet_download_logs()
     L.seed_everything(cfg.seed, workers=True)
-
+    configure_training_device_placement(cfg)
     model = build_lit(cfg, variant=cfg.train.get("variant", "fixed"))
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
@@ -89,11 +143,13 @@ def main(cfg: DictConfig) -> None:
     patience = cfg.train.get("early_stop_patience", 0)
     if patience > 0 and val_loader is not None:
         callbacks.append(EarlyStopping(monitor="val/loss", mode="min", patience=patience))
+    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
+    configure_ddp_strategy(trainer_kwargs)
     trainer = L.Trainer(
         callbacks=callbacks,
         default_root_dir=cfg.output_dir,
         logger=build_loggers(cfg),
-        **OmegaConf.to_container(cfg.trainer, resolve=True),
+        **trainer_kwargs,
     )
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 

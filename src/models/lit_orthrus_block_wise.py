@@ -154,14 +154,14 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         lam = self._lambda()
         aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
         loss = aw * anchor_loss + lam * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td, "loss/lambda": lam})
+        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td, "loss/lambda": lam}, sync_dist=True)
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.compute_loss(*self._shared_step(batch))
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -170,7 +170,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         block_mask = rest[-3]
         # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
         agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[block_mask.bool()]
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/teacher_agreement", agree.float().mean())
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
         self._maybe_decode_val(batch, batch_idx)
         return loss

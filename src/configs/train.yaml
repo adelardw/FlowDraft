@@ -61,6 +61,7 @@ train:
 trainer:
   accelerator: auto
   devices: auto
+  strategy: auto             # auto selects DDP when multiple GPU devices are requested
   precision: bf16-mixed
   max_steps: 10000            # -1 = no step bound (then bound by max_epochs)
   max_epochs: null            # repetitions of the stream; see "Повторение потока" in README

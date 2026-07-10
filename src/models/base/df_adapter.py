@@ -77,8 +77,8 @@ class OrthrusAttentionAdapter(nn.Module):
 
     def df_parameters(self):
         """Trainable parameters of the DF path (feed these to the optimizer)."""
-        yield from self.df_weights
-        yield from self.time_embed.parameters()
+        yield from (parameter for parameter in self.df_weights if parameter.requires_grad)
+        yield from (parameter for parameter in self.time_embed.parameters() if parameter.requires_grad)
 
     def _df_inputs_embeds(self, input_ids):
         """Simplex point ``[B, T, V]`` (or int ids) -> ``inputs_embeds``.
