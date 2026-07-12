@@ -87,6 +87,33 @@ For multi-GPU training, let Lightning run DDP and specify the GPU count:
 
 Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
 
+### H100 sparse-attention setup
+
+The paper-style `+experiment=baseline` uses PyTorch **FlexAttention** for its
+256 isolated masked blocks. On Hopper (H100/H200) and Blackwell, it selects
+FlexAttention's `FLASH` backend (the FlashAttention-4 path); on older CUDA
+GPUs it falls back to FlexAttention's Triton backend with the same sparse-mask
+semantics but lower throughput.
+
+Install FA4 manually on the CUDA node (it is deliberately not a project
+dependency, so CPU/macOS development environments remain lightweight):
+
+```bash
+uv pip install ninja packaging
+uv pip install --no-build-isolation "flash-attn-4[cu13]"
+```
+
+Verify the required training API before launching a run:
+
+```bash
+uv run python -c "from torch.nn.attention.flex_attention import flex_attention; print('FlexAttention: OK')"
+uv run python -c "import flash_attn; print('flash-attn: OK')"
+```
+
+`flash-attn-4` accelerates the Hopper/Blackwell backend; FlexAttention is the
+required component for sparse baseline training. CPU, Apple Silicon, and
+CUDA builds without FlexAttention use neither of these paths.
+
 # 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
 

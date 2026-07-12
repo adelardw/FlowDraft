@@ -82,15 +82,17 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         # though all blocks are concatenated for one efficient DF forward.
         offsets = torch.arange(width, device=ids.device)
         position_ids = (anchors[:, None] + offsets).flatten()[None].expand(ids.size(0), -1)
-        structural_mask = self._block_mask(
-            cache.get_seq_length(), anchors, block, x_in.dtype, x_in.device
-        ).expand(ids.size(0), -1, -1, -1)
+        # The official FlexAttention mask uses one causal limit per synthetic
+        # query. It represents this sparse relation directly, instead of a
+        # dense [8192, 10240] SDPA mask.
+        causal_limit = anchors.repeat_interleave(width)[None].expand(ids.size(0), -1)
         df_all = self.orthrus(
-            attention_mask=structural_mask,
             inputs_embeds=x_in,
             use_df=True,
             past_key_values=cache,
             position_ids=position_ids,
+            causal_limit=causal_limit,
+            diffusion_block_size=width,
         ).logits.view(ids.size(0), count, width, -1)
         df_logits = df_all[:, :, 1:]
 

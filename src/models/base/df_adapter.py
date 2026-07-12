@@ -5,6 +5,92 @@ from torch.func import functional_call
 from src.models.base.fte import FlowTimeEmbedding
 
 
+def _make_dual_pass_block_mask(batch, heads, q_len, ar_len, block_size, causal_limit):
+    """Paper's sparse AR-cache + independent diffusion-block mask.
+
+    Based on the MIT-licensed official Orthrus implementation
+    (chiennv2000/orthrus, ``generate_dual_pass_mask``).  Import lazily: the
+    CPU/macOS development build does not ship FlexAttention, while the H100
+    training environment does.
+    """
+    try:
+        from torch.nn.attention.flex_attention import create_block_mask
+    except ImportError as exc:
+        raise RuntimeError(
+            "Paper sparse baseline needs PyTorch FlexAttention. Install a CUDA "
+            "PyTorch build that provides torch.nn.attention.flex_attention."
+        ) from exc
+
+    def mask_fn(b, h, q_idx, kv_idx):
+        is_ar = kv_idx < ar_len
+        allow_ar = is_ar & (kv_idx <= causal_limit[b, q_idx])
+        allow_block = (~is_ar) & ((q_idx // block_size) == ((kv_idx - ar_len) // block_size))
+        return allow_ar | allow_block
+
+    return create_block_mask(
+        mask_fn, B=batch, H=heads, Q_LEN=q_len, KV_LEN=ar_len + q_len, BLOCK_SIZE=128
+    )
+
+
+def _install_qwen3_flex_df_attention(module):
+    """Patch Qwen3 attention with Orthrus's sparse diffusion-only path.
+
+    The ordinary AR path remains the upstream HF implementation. During a DF
+    call ``functional_call`` has already substituted Q/K/V with their
+    trainable twins; this function reads frozen AR K/V from the cache and
+    applies the official FlexAttention block mask without ever appending DF
+    K/V to that cache.
+    """
+    if getattr(module, "_flowdraft_flex_df_installed", False):
+        return
+    try:
+        from torch.nn.attention.flex_attention import flex_attention
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+    except ImportError:
+        # Kept importable on non-CUDA development hosts. A paper-baseline run
+        # will raise a direct, actionable error from _make_dual_pass_block_mask.
+        return
+
+    compiled = torch.compile(flex_attention, dynamic=False)
+    original_forward = module.forward
+
+    def forward(hidden_states, position_embeddings, attention_mask, past_key_values=None,
+                use_df=False, ar_seq_len=None, flex_block_mask=None, **kwargs):
+        if not use_df:
+            return original_forward(hidden_states, position_embeddings, attention_mask,
+                                    past_key_values=past_key_values, **kwargs)
+        if past_key_values is None or ar_seq_len is None or flex_block_mask is None:
+            raise ValueError("DF FlexAttention requires AR cache, ar_seq_len, and flex_block_mask")
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, module.head_dim)
+        q = module.q_norm(module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        k = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        v = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        cache_layer = past_key_values.layers[module.layer_idx]
+        k = torch.cat([cache_layer.keys[:, :, :ar_seq_len], k], dim=2)
+        v = torch.cat([cache_layer.values[:, :, :ar_seq_len], v], dim=2)
+        # FA4's CuTeDSL FLASH backend is Hopper/Blackwell-only. Keep the
+        # same sparse block semantics on older CUDA GPUs through FlexAttention
+        # Triton, which is slower but avoids falling back to dense SDPA.
+        is_hopper_or_newer = q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 9
+        q_bs, kv_bs = flex_block_mask.BLOCK_SIZE
+        kernel_options = (
+            {"BACKEND": "FLASH", "sparse_block_size": (int(q_bs), int(kv_bs))}
+            if is_hopper_or_newer
+            else {"BACKEND": "TRITON"}
+        )
+        out = compiled(
+            q, k, v, block_mask=flex_block_mask, enable_gqa=True,
+            kernel_options=kernel_options,
+        )
+        out = out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+        return module.o_proj(out), None
+
+    module.forward = forward
+    module._flowdraft_flex_df_installed = True
+
+
 class OrthrusAttentionAdapter(nn.Module):
     """Wrap ANY HF causal LM with a frozen AR path + a trainable DF path.
 
@@ -56,6 +142,12 @@ class OrthrusAttentionAdapter(nn.Module):
         self.time_embed = FlowTimeEmbedding(self.model.config.hidden_size).to(
             device=embed_weight.device, dtype=embed_weight.dtype
         )
+        # The paper's training kernel is Qwen3-specific. Patch only Qwen3
+        # attention modules; other model families retain the portable SDPA DF
+        # implementation below.
+        if self.model.config.model_type == "qwen3":
+            for layer in self.model.model.layers:
+                _install_qwen3_flex_df_attention(layer.self_attn)
 
     def _clone_df_weights(self):
         """Collect the projections matched by name and clone their parameters."""
@@ -138,6 +230,8 @@ class OrthrusAttentionAdapter(nn.Module):
         s=None,
         t=None,
         past_key_values=None,
+        causal_limit=None,
+        diffusion_block_size=None,
         **kwargs,
     ):
         ## input_ids - AR IDS or OHE IDS FOR DF!
@@ -169,19 +263,37 @@ class OrthrusAttentionAdapter(nn.Module):
                 s = torch.as_tensor(s, device=inputs_embeds.device).reshape(-1).expand(batch)
                 t = torch.as_tensor(t, device=inputs_embeds.device).reshape(-1).expand(batch)
                 inputs_embeds = inputs_embeds + self.time_embed(s, t)[:, None, :].to(inputs_embeds.dtype)
+            flex_block_mask = None
+            if causal_limit is not None:
+                if diffusion_block_size is None:
+                    raise ValueError("diffusion_block_size is required with causal_limit")
+                if past_key_values is None:
+                    raise ValueError("paper FlexAttention DF path requires an AR cache")
+                flex_block_mask = _make_dual_pass_block_mask(
+                    batch, self.model.config.num_attention_heads, q_len, committed_len,
+                    int(diffusion_block_size), causal_limit,
+                )
+            # Qwen normally materializes a causal 4-D mask before calling
+            # each attention layer. The patched DF attention ignores that
+            # mask and consumes ``flex_block_mask`` instead, so pass an
+            # explicit mapping of Nones to prevent recreating the dense mask.
+            model_attention_mask = (
+                {kind: None for kind in set(self.model.config.layer_types)}
+                if flex_block_mask is not None
+                else self._df_no_mask(
+                    attention_mask, batch, q_len, committed_len + q_len,
+                    inputs_embeds.dtype, inputs_embeds.device,
+                )
+            )
             out = functional_call(
                 self.model,
                 dict(zip(self._df_names, self.df_weights)),
                 kwargs=dict(
                     inputs_embeds=inputs_embeds,
-                    attention_mask=self._df_no_mask(
-                        attention_mask,
-                        batch,
-                        q_len,
-                        committed_len + q_len,
-                        inputs_embeds.dtype,
-                        inputs_embeds.device,
-                    ),
+                    attention_mask=model_attention_mask,
+                    use_df=use_df,
+                    ar_seq_len=committed_len if flex_block_mask is not None else None,
+                    flex_block_mask=flex_block_mask,
                     **kwargs,
                 ),
             )
