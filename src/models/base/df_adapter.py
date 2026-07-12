@@ -45,7 +45,11 @@ def _install_qwen3_flex_df_attention(module):
         return
     try:
         from torch.nn.attention.flex_attention import flex_attention
-        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        from transformers.models.qwen3.modeling_qwen3 import (
+            ALL_ATTENTION_FUNCTIONS,
+            apply_rotary_pos_emb,
+            eager_attention_forward,
+        )
     except ImportError:
         # Kept importable on non-CUDA development hosts. A paper-baseline run
         # will raise a direct, actionable error from _make_dual_pass_block_mask.
@@ -59,17 +63,38 @@ def _install_qwen3_flex_df_attention(module):
         if not use_df:
             return original_forward(hidden_states, position_embeddings, attention_mask,
                                     past_key_values=past_key_values, **kwargs)
-        if past_key_values is None or ar_seq_len is None or flex_block_mask is None:
-            raise ValueError("DF FlexAttention requires AR cache, ar_seq_len, and flex_block_mask")
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, module.head_dim)
         q = module.q_norm(module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         k = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         v = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
-        cache_layer = past_key_values.layers[module.layer_idx]
-        k = torch.cat([cache_layer.keys[:, :, :ar_seq_len], k], dim=2)
-        v = torch.cat([cache_layer.values[:, :, :ar_seq_len], v], dim=2)
+        if past_key_values is not None:
+            # DF K/V are transient. Read the committed AR cache directly
+            # instead of calling Cache.update(), which would pollute it.
+            cache_layer = past_key_values.layers[module.layer_idx]
+            cache_len = ar_seq_len if ar_seq_len is not None else cache_layer.keys.shape[2]
+            k = torch.cat([cache_layer.keys[:, :, :cache_len], k], dim=2)
+            v = torch.cat([cache_layer.values[:, :, :cache_len], v], dim=2)
+        if flex_block_mask is None:
+            # Decoding, validation decode, and the non-paper variants retain
+            # the original dense bidirectional DF behavior. FlexAttention is
+            # only needed for paper training's many isolated blocks.
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                module.config._attn_implementation, eager_attention_forward
+            )
+            out, weights = attention_interface(
+                module, q, k, v, attention_mask,
+                dropout=0.0 if not module.training else module.attention_dropout,
+                scaling=module.scaling,
+                sliding_window=module.sliding_window,
+                is_causal=False,
+                **kwargs,
+            )
+            out = out.reshape(*input_shape, -1).contiguous()
+            return module.o_proj(out), weights
+        if past_key_values is None or ar_seq_len is None:
+            raise ValueError("sparse DF FlexAttention requires an AR cache and ar_seq_len")
         # FA4's CuTeDSL FLASH backend is Hopper/Blackwell-only. Keep the
         # same sparse block semantics on older CUDA GPUs through FlexAttention
         # Triton, which is slower but avoids falling back to dense SDPA.
