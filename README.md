@@ -100,7 +100,8 @@ dependency, so CPU/macOS development environments remain lightweight):
 
 ```bash
 uv pip install ninja packaging
-uv pip install --no-build-isolation "flash-attn-4[cu13]"
+# FA4 is currently distributed as a prerelease.
+uv pip install --prerelease=allow --no-build-isolation "flash-attn-4[cu13]"
 ```
 
 Verify the required training API before launching a run:
