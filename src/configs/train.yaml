@@ -9,6 +9,9 @@ defaults:
 
 seed: 42
 output_dir: checkpoints     # artifacts live at project root, gitignored
+# Lightning resume checkpoint. Unlike evaluation's `checkpoint`, this restores
+# model, AdamW, scheduler, global step, and callback state.
+resume_from_checkpoint: null
 
 # TensorBoard is always written locally. Enable W&B to mirror the same
 # Lightning metrics; authenticate with `uv run wandb login` or WANDB_API_KEY.

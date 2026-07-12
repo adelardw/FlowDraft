@@ -151,7 +151,12 @@ def main(cfg: DictConfig) -> None:
         logger=build_loggers(cfg),
         **trainer_kwargs,
     )
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(
+        model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=cfg.get("resume_from_checkpoint"),
+    )
 
 
 if __name__ == "__main__":

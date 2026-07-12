@@ -336,6 +336,17 @@ curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
 the frozen backbone is never written). The Russian
 section carries the full per-experiment guide.
 
+**Resume after interruption.** `last.ckpt` is updated every 1,000 optimizer
+steps by default. Resume the full Lightning state—DF weights, AdamW, cosine
+schedule, global step, and callbacks—with:
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=baseline \
+    resume_from_checkpoint=checkpoints/baseline/last.ckpt \
+    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
+    trainer.accumulate_grad_batches=64
+```
+
 **Repeating the stream (epochs).** The dataset streams, so an "epoch" is
 whatever you define. Every new Trainer epoch re-opens the stream in a NEW
 order (per-epoch reshuffle; the validation slice is split off before the
