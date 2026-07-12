@@ -1,59 +1,112 @@
 import torch
 import torch.nn.functional as F
+from transformers import DynamicCache
 
-from src.models.lit_orthrus import FlowMapOrthrus
+from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
 
 
-class FlowMapOrthrusBaseline(FlowMapOrthrus):
-    """Orthrus masked-diffusion baseline — the comparison row FlowDraft must beat.
+class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
+    """Paper-faithful Orthrus masked-block baseline.
 
-    Single-step masked diffusion drafter: no time conditioning, ONE DF
-    forward per draft, block positions conditionally independent — the
-    acceptance ceiling the flow-map drafter is built to raise. The "masked"
-    input on the simplex is the barycenter (uniform over V): a
-    zero-information point, the simplex analogue of a [MASK] token.
-
-    Inherits everything else from the fixed variant (adapter, checkpoints,
-    generate/ar_generate loop, eval compatibility); overrides only the
-    training objective and the draft step. ``time_embed`` is never used and
-    receives no gradients.
+    A frozen AR pass builds the clean cache.  The diffusion pass then contains
+    ``anchors_per_sequence`` independent blocks of size ``K`` (one visible
+    anchor plus ``K - 1`` masks). Its
+    4-D mask lets a block attend only to the AR prefix before its anchor and
+    to itself bidirectionally; it can never read future clean tokens or any
+    other block.  This is the dual-pass block-masking geometry of Orthrus,
+    rather than full-sequence random token masking.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # This variant never passes (s, t), so DDP must not await it.
         self.orthrus.time_embed.requires_grad_(False)
 
-    # --- training: mask-and-reconstruct distillation ---------------------------
+    def _sample_anchors(self, attention_mask, block: int, count: int):
+        """Uniform anchor positions shared across the micro-batch.
+
+        The paper uses a micro-batch of one; sharing positions also keeps a
+        larger local batch compatible with one cache and one sparse mask.
+        """
+        min_prefix = int(self.cfg.train.get("min_prefix", 1))
+        true_min = int(attention_mask.sum(dim=1).min())
+        # ``block`` includes the visible anchor; only the remaining K-1
+        # positions are drafted.
+        high = true_min - (block - 1)
+        if high <= min_prefix:
+            raise ValueError(
+                f"sequence length {true_min} cannot fit a block of size {block}"
+            )
+        return torch.randint(min_prefix, high, (count,), device=attention_mask.device)
+
+    def _block_mask(self, prefix_len, anchors, block, dtype, device):
+        """Mask cache+query keys for independent anchored DF blocks."""
+        batch = 1  # expanded below; all rows share this structural mask.
+        width = block
+        q_len = anchors.numel() * width
+        mask = torch.full((batch, 1, q_len, prefix_len + q_len), torch.finfo(dtype).min,
+                          dtype=dtype, device=device)
+        for n, anchor in enumerate(anchors.tolist()):
+            rows = slice(n * width, (n + 1) * width)
+            # Frozen AR cache before the in-block anchor.
+            mask[:, :, rows, :anchor] = 0
+            # Anchor plus its mask span is fully bidirectional, but no other
+            # synthetic block is visible.
+            cols = slice(prefix_len + n * width, prefix_len + (n + 1) * width)
+            mask[:, :, rows, cols] = 0
+        return mask
 
     def _masked_step(self, batch):
-        ids, mask = batch["input_ids"], batch["attention_mask"]
-        live = mask.bool()
-        x1 = batch.get("simplex")
-        if x1 is None:
-            x1 = self.df_processor.to_simplex(ids, attention_mask=mask)
+        ids, attention_mask = batch["input_ids"], batch["attention_mask"]
+        block = int(self.cfg.train.get("block_size", 32))
+        count = int(self.cfg.train.get("anchors_per_sequence", 256))
+        anchors = self._sample_anchors(attention_mask, block, count)
 
-        # mask rate ~ U(0, 1] per sample — the single-step masked-diffusion
-        # recipe; masked positions get the barycenter, the rest stay one-hot
-        rate = torch.rand(ids.size(0), 1, device=ids.device).clamp(min=0.05)
-        masked = (torch.rand_like(ids, dtype=torch.float) < rate) & live
-        barycenter = torch.full_like(x1, 1.0 / x1.size(-1))
-        x_in = torch.where(masked[..., None], barycenter, x1)
-        x_in = x_in * mask[..., None].to(x_in.dtype)  # pads stay the zero sentinel
-
+        # One clean AR pass supplies both exact teacher rows and the shared
+        # AR-only KV cache.  The DF forward below never appends to it.
+        cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad():
-            teacher_logits = self.orthrus(ids, mask).logits
-        df_logits = self.orthrus(x_in, mask, use_df=True).logits  # no (s, t)
+            teacher_full = self.orthrus(ids, attention_mask, past_key_values=cache).logits
 
-        # df position i reconstructs token i; teacher_logits[:, i-1] is the
-        # AR distribution of token i — hence the shift; only masked
-        # positions carry loss (the others were given away clean)
-        loss = self._masked_kl(
-            F.log_softmax(teacher_logits[:, :-1].float(), -1),
-            F.log_softmax(df_logits[:, 1:].float(), -1),
-            masked[:, 1:] & live[:, 1:],
+        width = block
+        drafted = block - 1
+        if drafted <= 0:
+            raise ValueError("baseline block_size must be at least 2 (anchor + one mask)")
+        anchor_ids = ids[:, anchors]  # [B, A]
+        embed = self.orthrus.model.get_input_embeddings()
+        anchor_embeds = embed(anchor_ids).unsqueeze(2)
+        mask_embed = self.orthrus.mask_embedding.to(anchor_embeds.dtype)[None, None]
+        masked_embeds = mask_embed.expand(ids.size(0), count, drafted, -1)
+        x_in = torch.cat([anchor_embeds, masked_embeds], dim=2).flatten(1, 2)
+
+        # Each synthetic block keeps the original absolute positions, even
+        # though all blocks are concatenated for one efficient DF forward.
+        offsets = torch.arange(width, device=ids.device)
+        position_ids = (anchors[:, None] + offsets).flatten()[None].expand(ids.size(0), -1)
+        structural_mask = self._block_mask(
+            cache.get_seq_length(), anchors, block, x_in.dtype, x_in.device
+        ).expand(ids.size(0), -1, -1, -1)
+        df_all = self.orthrus(
+            attention_mask=structural_mask,
+            inputs_embeds=x_in,
+            use_df=True,
+            past_key_values=cache,
+            position_ids=position_ids,
+        ).logits.view(ids.size(0), count, width, -1)
+        df_logits = df_all[:, :, 1:]
+
+        # AR row p predicts token p+1, exactly the first drafted position.
+        teacher_logits = torch.stack(
+            [teacher_full[:, p : p + drafted] for p in anchors.tolist()], dim=1
         )
-        return loss, df_logits, teacher_logits, masked
+        live = torch.stack(
+            [attention_mask[:, p + 1 : p + 1 + drafted] for p in anchors.tolist()], dim=1
+        ).bool()
+        loss = self._masked_kl(
+            F.log_softmax(teacher_logits.float(), -1),
+            F.log_softmax(df_logits.float(), -1),
+            live,
+        )
+        return loss, df_logits, teacher_logits, live
 
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._masked_step(batch)
@@ -63,35 +116,33 @@ class FlowMapOrthrusBaseline(FlowMapOrthrus):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, df_logits, teacher_logits, masked = self._masked_step(batch)
-        live = batch["attention_mask"][:, 1:].bool() & masked[:, 1:]
-        agree = (df_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[live]
+        loss, df_logits, teacher_logits, live = self._masked_step(batch)
+        agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
         self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
         self._maybe_decode_val(batch, batch_idx)
         return loss
 
-    # --- generation: one forward per draft --------------------------------------
-
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
-        """Barycenter block -> ONE DF forward; ``q`` = its softmax.
-
-        Only ``jumps=1`` is meaningful: a single-step drafter has no jump
-        schedule (that limitation is the baseline's whole point). The
-        pending correction/bonus token, when given, rides as a clean one-hot
-        position 0 (see the parent) and is sliced off the returned proposal.
-
-        Returns ``(draft_ids [1, K], q [1, K, V])`` for the K fresh positions.
-        """
         if len(times) != 2:
             raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
-        vocab = self.df_processor.vocab_size
-        x_in = torch.full((1, block_size, vocab), 1.0 / vocab, device=self.device)
+        embed = self.orthrus.model.get_input_embeddings()
+        # Orthrus defines K as the complete parallel block, including its
+        # clean anchor.  Thus a K=32 baseline proposal contains 31 fresh
+        # tokens.
+        drafted = block_size - 1
+        if drafted <= 0:
+            raise ValueError("baseline block_size must be at least 2 (anchor + one mask)")
+        masks = self.orthrus.mask_embedding.to(self.device).expand(1, drafted, -1)
         if anchor_token is not None:
-            anchor = F.one_hot(anchor_token.view(1, 1), vocab).to(x_in.dtype)
-            x_in = torch.cat([anchor, x_in], dim=1)
+            anchor = embed(anchor_token.view(1, 1))
+            x_in = torch.cat([anchor, masks], dim=1)
+        else:
+            x_in = masks
         mask = torch.ones(1, cache.get_seq_length() + x_in.size(1), dtype=torch.long, device=self.device)
-        logits = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits
+        logits = self.orthrus(
+            attention_mask=mask, inputs_embeds=x_in, use_df=True, past_key_values=cache
+        ).logits
         q = (logits[:, 1:] if anchor_token is not None else logits).float().softmax(-1)
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q

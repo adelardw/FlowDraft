@@ -48,6 +48,11 @@ class OrthrusAttentionAdapter(nn.Module):
         self.w_names = tuple(w_names)
         self._df_names, self.df_weights, self.n_dual = self._clone_df_weights()
         embed_weight = self.model.get_input_embeddings().weight
+        # Orthrus feeds a dedicated mask embedding to the diffusion view.  It
+        # must not mutate the frozen token embedding table, so keep it beside
+        # the DF projections.  Initializing at the vocabulary mean is a
+        # neutral starting point while allowing distillation to specialize it.
+        self.mask_embedding = nn.Parameter(embed_weight.detach().mean(0, keepdim=True))
         self.time_embed = FlowTimeEmbedding(self.model.config.hidden_size).to(
             device=embed_weight.device, dtype=embed_weight.dtype
         )
@@ -78,6 +83,8 @@ class OrthrusAttentionAdapter(nn.Module):
     def df_parameters(self):
         """Trainable parameters of the DF path (feed these to the optimizer)."""
         yield from (parameter for parameter in self.df_weights if parameter.requires_grad)
+        if self.mask_embedding.requires_grad:
+            yield self.mask_embedding
         yield from (parameter for parameter in self.time_embed.parameters() if parameter.requires_grad)
 
     def _df_inputs_embeds(self, input_ids):
@@ -127,6 +134,7 @@ class OrthrusAttentionAdapter(nn.Module):
         attention_mask=None,
         *,
         use_df: bool = False,
+        inputs_embeds=None,
         s=None,
         t=None,
         past_key_values=None,
@@ -141,7 +149,18 @@ class OrthrusAttentionAdapter(nn.Module):
             # prefix from the cache; its own block K/V (DF weights) are
             # cropped away so the shared cache stays AR-only.
             committed_len = past_key_values.get_seq_length() if past_key_values is not None else 0
-            inputs_embeds = self._df_inputs_embeds(input_ids)
+            if inputs_embeds is None:
+                inputs_embeds = self._df_inputs_embeds(input_ids)
+            elif inputs_embeds.dim() != 3:
+                raise ValueError(
+                    "DF inputs_embeds must have shape [B, T, H], got "
+                    f"{tuple(inputs_embeds.shape)}"
+                )
+            else:
+                inputs_embeds = inputs_embeds.to(
+                    dtype=self.model.get_input_embeddings().weight.dtype,
+                    device=self.model.get_input_embeddings().weight.device,
+                )
             batch, q_len = inputs_embeds.shape[:2]
             if (s is None) != (t is None):
                 raise ValueError("flow-map conditioning needs both s and t (or neither)")
@@ -175,4 +194,3 @@ class OrthrusAttentionAdapter(nn.Module):
         if s is not None or t is not None:
             raise ValueError("s/t are flow-map (DF) conditioning; the AR path takes none")
         return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-

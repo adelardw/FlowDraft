@@ -1,5 +1,6 @@
 import random
 
+import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -44,6 +45,41 @@ class EpochShuffled(IterableDataset):
             buffer[i] = example
         rng.shuffle(buffer)
         yield from buffer
+
+
+class PackedTokenStream(IterableDataset):
+    """Pack rendered examples into fixed-length token sequences.
+
+    Orthrus trains on packed 2048-token instances.  Packing after stream
+    shuffling preserves the requested training-mixture order while ensuring
+    every emitted item is a real fixed-size sequence (no padding budget).
+    """
+
+    def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
+        self.ds, self.tokenize, self.max_length, self.size = ds, tokenize, max_length, size
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.ds, "set_epoch"):
+            self.ds.set_epoch(epoch)
+
+    def __len__(self):
+        if self.size is None:
+            raise TypeError("an unbounded packed stream has no length")
+        return self.size
+
+    def __iter__(self):
+        pending, emitted = [], 0
+        for example in self.ds:
+            pending.extend(self.tokenize(example))
+            while len(pending) >= self.max_length:
+                ids, pending = pending[: self.max_length], pending[self.max_length :]
+                yield {
+                    "input_ids": torch.tensor(ids, dtype=torch.long),
+                    "attention_mask": torch.ones(self.max_length, dtype=torch.long),
+                }
+                emitted += 1
+                if self.size is not None and emitted >= self.size:
+                    return
 
 
 def quiet_download_logs():
@@ -135,11 +171,11 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         )
         return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
 
-    def make_loader(split_ds):
+    def make_loader(split_ds, *, packed=False):
         return DataLoader(
             split_ds,
             batch_size=d.batch_size,
-            collate_fn=collate,
+            collate_fn=None if packed else collate,
             num_workers=d.get("num_workers", 0),
         )
 
@@ -150,8 +186,26 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
     # whole stream: repetitions then draw fresh samples in a fresh order.
     train_size = d.get("train_size", None)
-    if train_size:
+    pack_sequences = d.get("pack_sequences", False)
+    if train_size and not pack_sequences:
         train_ds = train_ds.take(train_size)
     train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000),
-                             size=train_size)
-    return make_loader(train_ds), make_loader(ds.take(val_size))
+                             size=None if pack_sequences else train_size)
+
+    if pack_sequences:
+        def tokenize_for_pack(example):
+            text = render(example)
+            ids = tokenizer(
+                text,
+                add_special_tokens=not use_template,
+                truncation=False,
+            )["input_ids"]
+            # Keep separate conversations from becoming one synthetic turn.
+            if tokenizer.eos_token_id is not None:
+                ids.append(tokenizer.eos_token_id)
+            return ids
+
+        train_ds = PackedTokenStream(
+            train_ds, tokenize_for_pack, max_length=d.max_length, size=train_size
+        )
+    return make_loader(train_ds, packed=pack_sequences), make_loader(ds.take(val_size))

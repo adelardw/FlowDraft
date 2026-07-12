@@ -1,0 +1,23 @@
+# Orthrus paper backbone scale.  Qwen3 exposes the same attention projection
+# names as Qwen2, so the generic Q/K/V diffusion adapter applies unchanged.
+name: Qwen/Qwen3-1.7B
+
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: sdpa
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false
+
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right
+  trust_remote_code: false
+
+adapter:
+  w_names: [q_proj, k_proj, v_proj]

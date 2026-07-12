@@ -296,8 +296,10 @@ on-device, never in the batch.
 ./hf-auth.sh uv run python src/train.py train.variant=block_wise   # ADDITION: inference geometry
 ```
 
-Variants — the task: `fixed` | `baseline` (full-sequence); our addition:
-`block_wise` | `baseline_block_wise` (the inference geometry).
+Variants: `fixed` is the project flow-map objective; `baseline` is the
+paper-style Orthrus recipe (frozen AR cache plus 256 isolated anchored masked
+blocks); `block_wise` and `baseline_block_wise` are the project’s single-block
+inference-geometry variants.
 Knobs live in `configs/train.yaml`: `lambda`/`anchor_weight`/`lambda_ramp_steps`
 (dual distillation + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
@@ -312,8 +314,9 @@ order (per-epoch reshuffle; the validation slice is split off before the
 shuffle, so it never leaks into training). Two ways to bound a repetition:
 
 ```bash
-# fixed sample pool, repeated N times — the paper-style "K examples x N epochs":
-uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=2 data.train_size=471952
+# Orthrus paper preset: 600K packed sequences, 2 epochs, Qwen3-1.7B.
+# On 8 GPUs it uses micro-batch 1 and accumulation 16 (global batch 128):
+uv run python src/train.py +experiment=baseline trainer.devices=8
 # or bound by steps per repetition instead of samples:
 uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=3 trainer.limit_train_batches=2000
 ```
@@ -327,19 +330,18 @@ zero — the peak is `train.lr`, the horizon is taken from `trainer.max_steps`
 (or `limit_train_batches` × `max_epochs`), the current value is logged as the
 `lr-AdamW` curve. `train.lr_schedule=constant` turns it off.
 
-Putting it together — the training budget of the Orthrus paper (2 epochs over
-472K packed sequences ≈ 1.9B tokens, global batch 128 × 2048 tokens, cosine
-2e-4 with 5% warmup):
+The Orthrus paper preset uses 2 epochs over 600K packed 2048-token sequences,
+256 anchored masked blocks of size 32 per sequence, global batch 128, cosine
+2e-4, and 5% warmup. For two GPUs, preserve the global batch with 64
+accumulation steps:
 
 ```bash
 ./hf-auth.sh uv run python src/train.py +experiment=baseline \
-    data.train_size=471952 data.batch_size=8 data.max_length=2048 \
-    trainer.accumulate_grad_batches=16 train.lr=2e-4 \
-    trainer.max_epochs=2 trainer.max_steps=7375
+    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
+    trainer.accumulate_grad_batches=64
 ```
 
-(`max_steps` = 471952 samples / (8 × 16) per optimizer step × 2 epochs; the
-cosine schedule needs it explicitly — a streaming loader has no length.)
+(`max_steps=9375` = 600000 samples × 2 epochs / global batch 128.)
 
 ### Configuration reference
 

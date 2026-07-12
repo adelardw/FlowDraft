@@ -1,13 +1,10 @@
 # @package _global_
-# Task stage 1: reproduce the Orthrus baseline at tractable scale.
-# 0.5B backbone, full-sequence recipe: a random fraction of positions is
-# masked (barycenter = the simplex-native [MASK]), the head reconstructs
-# them under one KL term to the frozen teacher; drafter-only training.
-# The inference-geometry retrain is a separate ADDITION preset:
-# +experiment=baseline_block_wise.
+# Paper-faithful Orthrus baseline: frozen Qwen3-1.7B AR backbone plus
+# trainable Q/K/V diffusion projections.  Each packed 2048-token sequence
+# contributes 256 independently anchored, 32-token masked blocks.
 #   uv run python src/train.py +experiment=baseline
 defaults:
-  - override /model: qwen2_0.5b
+  - override /model: qwen3_1.7b
 
 # own dir + filename: runs of different presets never overwrite each other's
 # checkpoints (incl. last.ckpt) or TensorBoard logs
@@ -15,4 +12,23 @@ output_dir: checkpoints/baseline
 
 train:
   variant: baseline
+  block_size: 32
+  anchors_per_sequence: 256
+  lr: 2e-4
+  warmup_ratio: 0.05
+  early_stop_patience: 0
   checkpoint_name: baseline-{step:07d}
+
+data:
+  splits: [chat, math, code]
+  pack_sequences: true
+  train_size: 600000
+  batch_size: 1
+  max_length: 2048
+
+trainer:
+  # Paper: 8 devices x local batch 1 x accumulation 16 = global batch 128.
+  # On fewer GPUs, increase accumulation to preserve that product.
+  max_epochs: 2
+  max_steps: 9375
+  accumulate_grad_batches: 16
