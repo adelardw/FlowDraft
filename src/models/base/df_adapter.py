@@ -55,7 +55,7 @@ def _install_qwen3_flex_df_attention(module):
         # will raise a direct, actionable error from _make_dual_pass_block_mask.
         return
 
-    compiled = torch.compile(flex_attention, dynamic=False)
+    compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
     original_forward = module.forward
 
     def forward(hidden_states, position_embeddings, attention_mask, past_key_values=None,

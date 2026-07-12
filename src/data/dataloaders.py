@@ -165,6 +165,9 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
             return_simplex=False,
             truncation=True,
             max_length=d.max_length,
+            # Fixed shapes avoid a new FlexAttention compilation whenever a
+            # one-example validation batch has a different rendered length.
+            padding="max_length" if d.get("pad_to_max_length", False) else True,
             # the chat template already carries BOS & co — adding them again
             # would double <|begin_of_text|> and shift every position
             add_special_tokens=not use_template,
