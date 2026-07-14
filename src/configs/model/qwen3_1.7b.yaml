@@ -23,5 +23,5 @@ tokenizer:
 
 adapter:
   # Official Orthrus maintains a separate diffusion attention projection
-  # path; Q/K/V/O are initialized from their frozen AR counterparts.
-  w_names: [q_proj, k_proj, v_proj, o_proj]
+  # path; only Q/K/V are initialized from their frozen AR counterparts.
+  w_names: [q_proj, k_proj, v_proj]
