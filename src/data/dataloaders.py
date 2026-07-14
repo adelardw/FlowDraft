@@ -1,9 +1,5 @@
-import hashlib
-import json
 import os
 import random
-import time
-from pathlib import Path
 
 import torch
 from omegaconf import DictConfig
@@ -83,21 +79,6 @@ class PackedTokenStream(IterableDataset):
         _, world_size = self._rank_and_world()
         return self.size // world_size
 
-    def count_sequences(self) -> int:
-        """Count complete packed sequences without materializing tensors.
-
-        This deliberately uses the exact rendering/tokenization function used
-        by ``__iter__``. It makes the optimizer horizon a property of the
-        source corpus rather than a hand-maintained packed-length constant.
-        """
-        pending_tokens = 0
-        emitted = 0
-        for example in self.ds:
-            pending_tokens += len(self.tokenize(example))
-            whole, pending_tokens = divmod(pending_tokens, self.max_length)
-            emitted += whole
-        return emitted
-
     def __iter__(self):
         pending, emitted = [], 0
         rank, world_size = self._rank_and_world()
@@ -117,52 +98,6 @@ class PackedTokenStream(IterableDataset):
                         "input_ids": torch.tensor(ids, dtype=torch.long),
                         "attention_mask": torch.ones(self.max_length, dtype=torch.long),
                     }
-
-
-def _packing_manifest_path(cfg: DictConfig, data, tokenizer) -> Path:
-    """Stable cache key for the transformation that determines packed length."""
-    fingerprint = {
-        "dataset": data.dataset,
-        "revision": data.get("revision"),
-        "splits": list(data.splits),
-        "seed": cfg.seed,
-        "source_train_size": data.get("train_size"),
-        "max_length": data.max_length,
-        "tokenizer": getattr(tokenizer, "name_or_path", None),
-        "chat_template": getattr(tokenizer, "chat_template", None),
-    }
-    digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:12]
-    return Path(cfg.output_dir) / f"packing-manifest-{digest}.json"
-
-
-def _infer_packed_size(stream: PackedTokenStream, cfg: DictConfig, data, tokenizer) -> int:
-    """Count packed sequences once and share the result across DDP ranks."""
-    path = _packing_manifest_path(cfg, data, tokenizer)
-    if path.exists():
-        payload = json.loads(path.read_text())
-        return int(payload["packed_sequences"])
-
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-    if rank == 0:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        count = stream.count_sequences()
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"packed_sequences": count}, indent=2) + "\n")
-        os.replace(temporary, path)
-        print(f"Packed {data.train_size:,} source examples into {count:,} sequences; cached {path}")
-        return count
-
-    # Lightning's subprocess DDP launcher invokes this setup on every rank.
-    # Rank zero owns the one expensive scan; other ranks wait for its manifest.
-    deadline = time.monotonic() + 3600
-    while time.monotonic() < deadline:
-        if path.exists():
-            payload = json.loads(path.read_text())
-            return int(payload["packed_sequences"])
-        time.sleep(1)
-    raise TimeoutError(f"timed out waiting for rank-zero packing manifest: {path}")
-
-
 def quiet_download_logs():
     """Keep ALL transfer chatter out of the training/eval console.
 
@@ -296,11 +231,11 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
                 ids.append(tokenizer.eos_token_id)
             return ids
 
+        # The finite 600K-source stream controls when an epoch ends. Do not
+        # make a second full streaming/tokenization pass just to count its
+        # packed output; the paper-reported optimizer horizon lives in the
+        # baseline preset instead.
         train_ds = PackedTokenStream(train_ds, tokenize_for_pack, max_length=d.max_length)
-        # Count the exact finite packing transform once. This observed value
-        # provides ``len`` for Lightning's epoch accounting and cosine LR
-        # horizon; it never limits what the iterator emits.
-        train_ds.size = _infer_packed_size(train_ds, cfg, d, tokenizer)
     return make_loader(train_ds, packed=pack_sequences), (
         make_loader(val_ds) if val_ds is not None else None
     )
