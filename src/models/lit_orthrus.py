@@ -618,6 +618,15 @@ class FlowMapOrthrus(L.LightningModule):
         self._maybe_decode_val(batch, batch_idx)
         return loss
 
+    def on_validation_epoch_start(self):
+        # Decode metrics are intentionally sampled from several consecutive
+        # validation batches. ``data.batch_size=1`` is required by the paper
+        # recipe, so restricting decoding to batch zero would otherwise turn
+        # any requested sample count into a single prompt.
+        self._val_decode_remaining = self.cfg.train.get("val_decode_prompts", 0)
+        self._val_decode_accs = []
+        self._val_decode_tpfs = []
+
     @torch.no_grad()
     def _maybe_decode_val(self, batch, batch_idx):
         """The REAL target metrics as validation curves: run the lossless
@@ -626,13 +635,14 @@ class FlowMapOrthrus(L.LightningModule):
         what training should improve to beat the baseline, and what the
         checkpoint monitor tracks; ``train.val_decode_prompts=0`` disables.
         """
-        n = self.cfg.train.get("val_decode_prompts", 0)
-        if n <= 0 or batch_idx != 0:
+        remaining = getattr(self, "_val_decode_remaining", 0)
+        if remaining <= 0:
             return
         max_new = self.cfg.train.get("val_decode_max_new", 32)
         block = self.cfg.train.get("block_size", 8)
         accs, tpfs = [], []
-        for i in range(min(n, batch["input_ids"].size(0))):
+        decoded = 0
+        for i in range(min(remaining, batch["input_ids"].size(0))):
             live = int(batch["attention_mask"][i].sum())
             plen = min(max(live // 2, 2), 32)
             if live < plen + 2:
@@ -643,9 +653,17 @@ class FlowMapOrthrus(L.LightningModule):
             )
             accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
             tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
-        if tpfs:
-            self.log("val/acceptance_decode", sum(accs) / len(accs), sync_dist=True)
-            self.log("val/tpf", sum(tpfs) / len(tpfs), sync_dist=True)
+            decoded += 1
+        self._val_decode_remaining -= decoded
+        self._val_decode_accs.extend(accs)
+        self._val_decode_tpfs.extend(tpfs)
+        if self._val_decode_remaining == 0 and self._val_decode_tpfs:
+            self.log(
+                "val/acceptance_decode",
+                sum(self._val_decode_accs) / len(self._val_decode_accs),
+                sync_dist=True,
+            )
+            self.log("val/tpf", sum(self._val_decode_tpfs) / len(self._val_decode_tpfs), sync_dist=True)
 
     def configure_optimizers(self):
         cfg = self.cfg.train

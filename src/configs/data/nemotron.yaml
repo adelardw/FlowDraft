@@ -1,6 +1,9 @@
 # Training distribution: nvidia/Nemotron-Post-Training-Dataset-v2 (streaming).
 # Consumed by src/data/dataloaders.py::build_dataloaders.
 dataset: nvidia/Nemotron-Post-Training-Dataset-v2
+# Set to a Hub commit SHA for a fully reproducible corpus snapshot. null uses
+# the dataset's current main revision.
+revision: null
 splits: [chat, code, math, stem]   # interleaved; multilingual_{ja,de,it,es,fr} also available
 streaming: true
 shuffle_buffer: 1000

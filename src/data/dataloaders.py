@@ -1,4 +1,9 @@
+import hashlib
+import json
+import os
 import random
+import time
+from pathlib import Path
 
 import torch
 from omegaconf import DictConfig
@@ -58,6 +63,13 @@ class PackedTokenStream(IterableDataset):
     def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
         self.ds, self.tokenize, self.max_length, self.size = ds, tokenize, max_length, size
 
+    @staticmethod
+    def _rank_and_world() -> tuple[int, int]:
+        """DDP ranks share one global packed corpus, not duplicate it."""
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        return rank, world_size
+
     def set_epoch(self, epoch: int):
         if hasattr(self.ds, "set_epoch"):
             self.ds.set_epoch(epoch)
@@ -65,21 +77,90 @@ class PackedTokenStream(IterableDataset):
     def __len__(self):
         if self.size is None:
             raise TypeError("an unbounded packed stream has no length")
-        return self.size
+        # ``size`` is the global packed count. Every rank receives a disjoint,
+        # equal-sized shard so DDP ranks always execute the same number of
+        # batches. The at-most ``world_size - 1`` tail sequences are dropped.
+        _, world_size = self._rank_and_world()
+        return self.size // world_size
+
+    def count_sequences(self) -> int:
+        """Count complete packed sequences without materializing tensors.
+
+        This deliberately uses the exact rendering/tokenization function used
+        by ``__iter__``. It makes the optimizer horizon a property of the
+        source corpus rather than a hand-maintained packed-length constant.
+        """
+        pending_tokens = 0
+        emitted = 0
+        for example in self.ds:
+            pending_tokens += len(self.tokenize(example))
+            whole, pending_tokens = divmod(pending_tokens, self.max_length)
+            emitted += whole
+        return emitted
 
     def __iter__(self):
         pending, emitted = [], 0
+        rank, world_size = self._rank_and_world()
+        usable = None if self.size is None else self.size - (self.size % world_size)
         for example in self.ds:
             pending.extend(self.tokenize(example))
             while len(pending) >= self.max_length:
                 ids, pending = pending[: self.max_length], pending[self.max_length :]
-                yield {
-                    "input_ids": torch.tensor(ids, dtype=torch.long),
-                    "attention_mask": torch.ones(self.max_length, dtype=torch.long),
-                }
                 emitted += 1
-                if self.size is not None and emitted >= self.size:
+                if usable is not None and emitted > usable:
                     return
+                # All ranks reproduce the deterministic packing pass, then
+                # take a disjoint round-robin shard of its output. Sharding
+                # before packing would create rank-dependent packing waste.
+                if (emitted - 1) % world_size == rank:
+                    yield {
+                        "input_ids": torch.tensor(ids, dtype=torch.long),
+                        "attention_mask": torch.ones(self.max_length, dtype=torch.long),
+                    }
+
+
+def _packing_manifest_path(cfg: DictConfig, data, tokenizer) -> Path:
+    """Stable cache key for the transformation that determines packed length."""
+    fingerprint = {
+        "dataset": data.dataset,
+        "revision": data.get("revision"),
+        "splits": list(data.splits),
+        "seed": cfg.seed,
+        "source_train_size": data.get("train_size"),
+        "max_length": data.max_length,
+        "tokenizer": getattr(tokenizer, "name_or_path", None),
+        "chat_template": getattr(tokenizer, "chat_template", None),
+    }
+    digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:12]
+    return Path(cfg.output_dir) / f"packing-manifest-{digest}.json"
+
+
+def _infer_packed_size(stream: PackedTokenStream, cfg: DictConfig, data, tokenizer) -> int:
+    """Count packed sequences once and share the result across DDP ranks."""
+    path = _packing_manifest_path(cfg, data, tokenizer)
+    if path.exists():
+        payload = json.loads(path.read_text())
+        return int(payload["packed_sequences"])
+
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    if rank == 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        count = stream.count_sequences()
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"packed_sequences": count}, indent=2) + "\n")
+        os.replace(temporary, path)
+        print(f"Packed {data.train_size:,} source examples into {count:,} sequences; cached {path}")
+        return count
+
+    # Lightning's subprocess DDP launcher invokes this setup on every rank.
+    # Rank zero owns the one expensive scan; other ranks wait for its manifest.
+    deadline = time.monotonic() + 3600
+    while time.monotonic() < deadline:
+        if path.exists():
+            payload = json.loads(path.read_text())
+            return int(payload["packed_sequences"])
+        time.sleep(1)
+    raise TimeoutError(f"timed out waiting for rank-zero packing manifest: {path}")
 
 
 def quiet_download_logs():
@@ -120,9 +201,8 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     Repeating the stream (multi-epoch training): every new Trainer epoch
     re-opens the stream, and ``ReshuffleStreamingData`` (src/train.py) calls
     ``set_epoch`` so the sample ORDER differs between repetitions. The
-    val/train split is taken BEFORE the shuffle on purpose: membership of the
-    validation slice must not depend on the epoch, otherwise reshuffling
-    would leak validation samples into training (see ``EpochShuffled``).
+    Validation is a separate deterministic read, so it does not reduce the
+    fixed raw-example training sample used by the paper recipe.
 
     Batch contract (what the models consume): ``input_ids [B, T]`` +
     ``attention_mask [B, T]``. The ``[B, T, V]`` simplex is built on-device
@@ -131,10 +211,10 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     from datasets import interleave_datasets, load_dataset
 
     d = cfg.data
-    streams = [
-        load_dataset(d.dataset, split=split, streaming=d.get("streaming", True))
-        for split in d.splits
-    ]
+    load_kwargs = {"streaming": d.get("streaming", True)}
+    if d.get("revision") is not None:
+        load_kwargs["revision"] = d.revision
+    streams = [load_dataset(d.dataset, split=split, **load_kwargs) for split in d.splits]
     ds = streams[0] if len(streams) == 1 else interleave_datasets(streams)
 
     use_template = getattr(tokenizer, "chat_template", None) is not None
@@ -183,17 +263,25 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         )
 
     val_size = d.get("val_size", 256)
-    train_ds = ds.skip(val_size)
+    # Validation is a separate read of the source stream. It must not consume
+    # rows from the paper-faithful 600K-example training sample.
+    val_ds = ds.take(val_size) if val_size else None
+    train_ds = ds
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
     # whole stream: repetitions then draw fresh samples in a fresh order.
     train_size = d.get("train_size", None)
     pack_sequences = d.get("pack_sequences", False)
-    if train_size and not pack_sequences:
+    if pack_sequences and not train_size:
+        raise ValueError(
+            "packed training needs a finite data.train_size so the packing "
+            "preflight can derive the cosine schedule horizon"
+        )
+    if train_size:
         train_ds = train_ds.take(train_size)
     train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000),
-                             size=None if pack_sequences else train_size)
+                             size=train_size)
 
     if pack_sequences:
         def tokenize_for_pack(example):
@@ -208,7 +296,11 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
                 ids.append(tokenizer.eos_token_id)
             return ids
 
-        train_ds = PackedTokenStream(
-            train_ds, tokenize_for_pack, max_length=d.max_length, size=train_size
-        )
-    return make_loader(train_ds, packed=pack_sequences), make_loader(ds.take(val_size))
+        train_ds = PackedTokenStream(train_ds, tokenize_for_pack, max_length=d.max_length)
+        # Count the exact finite packing transform once. This observed value
+        # provides ``len`` for Lightning's epoch accounting and cosine LR
+        # horizon; it never limits what the iterator emits.
+        train_ds.size = _infer_packed_size(train_ds, cfg, d, tokenizer)
+    return make_loader(train_ds, packed=pack_sequences), (
+        make_loader(val_ds) if val_ds is not None else None
+    )

@@ -1,6 +1,6 @@
 # @package _global_
 # Paper-faithful Orthrus baseline: frozen Qwen3-1.7B AR backbone plus
-# trainable Q/K/V/O diffusion projections. Each packed 2048-token sequence
+# trainable Q/K/V diffusion projections. Each packed 2048-token sequence
 # contributes 256 independently anchored, 32-token masked blocks.
 #   uv run python src/train.py +experiment=baseline
 defaults:
@@ -18,6 +18,9 @@ train:
   warmup_ratio: 0.05
   early_stop_patience: 0
   checkpoint_name: baseline-{step:07d}
+  # Decode metrics are computed over consecutive validation prompts. 16 is
+  # stable enough for checkpoint selection without making validation dominant.
+  val_decode_prompts: 16
 
 data:
   splits: [chat, math, code]
@@ -31,5 +34,7 @@ trainer:
   # Paper: 8 devices x local batch 1 x accumulation 16 = global batch 128.
   # On fewer GPUs, increase accumulation to preserve that product.
   max_epochs: 2
-  max_steps: 9375
+  # The packing preflight derives the finite length and cosine horizon from
+  # the 600K raw-example corpus; do not cap the packed output by hand.
+  max_steps: -1
   accumulate_grad_batches: 16
