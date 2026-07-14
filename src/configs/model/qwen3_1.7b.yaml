@@ -7,9 +7,10 @@ backbone:
   revision: main
   dtype: bfloat16
   device_map: auto
-  # AR uses SDPA; the paper baseline's DF training path is patched to use
-  # FlexAttention's sparse FLASH backend directly.
-  attn_implementation: sdpa
+  # Dense AR teacher/verifier calls use FlashAttention-4 on H100. The paper
+  # baseline's custom sparse DF mask remains routed through FlexAttention's
+  # FLASH backend, which also lowers to FA4.
+  attn_implementation: flash_attention_4
   low_cpu_mem_usage: true
   trust_remote_code: false
   use_cache: false
