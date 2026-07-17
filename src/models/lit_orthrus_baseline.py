@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import DynamicCache
 
 from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
@@ -38,22 +39,6 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
             )
         return torch.randint(min_prefix, high, (count,), device=attention_mask.device)
 
-    def _block_mask(self, prefix_len, anchors, block, dtype, device):
-        """Mask cache+query keys for independent anchored DF blocks."""
-        batch = 1  # expanded below; all rows share this structural mask.
-        width = block
-        q_len = anchors.numel() * width
-        mask = torch.full((batch, 1, q_len, prefix_len + q_len), torch.finfo(dtype).min,
-                          dtype=dtype, device=device)
-        for n, anchor in enumerate(anchors.tolist()):
-            rows = slice(n * width, (n + 1) * width)
-            # Frozen AR cache before the in-block anchor.
-            mask[:, :, rows, :anchor] = 0
-            # Anchor plus its mask span is fully bidirectional, but no other
-            # synthetic block is visible.
-            cols = slice(prefix_len + n * width, prefix_len + (n + 1) * width)
-            mask[:, :, rows, cols] = 0
-        return mask
 
     def _masked_step(self, batch):
         ids, attention_mask = batch["input_ids"], batch["attention_mask"]
@@ -97,18 +82,37 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         df_logits = df_all[:, :, 1:]
 
         # AR row p predicts token p+1, exactly the first drafted position.
-        teacher_logits = torch.stack(
-            [teacher_full[:, p : p + drafted] for p in anchors.tolist()], dim=1
-        )
-        live = torch.stack(
-            [attention_mask[:, p + 1 : p + 1 + drafted] for p in anchors.tolist()], dim=1
-        ).bool()
-        loss = self._masked_kl(
-            F.log_softmax(teacher_logits.float(), -1),
-            F.log_softmax(df_logits.float(), -1),
-            live,
-        )
+        gather = anchors[:, None] + torch.arange(drafted, device=ids.device)
+        teacher_logits = teacher_full[:, gather]
+        live = attention_mask[:, gather + 1].bool()
+        loss = self._masked_kl_chunked(teacher_logits, df_logits, live)
         return loss, df_logits, teacher_logits, live
+
+    def _masked_kl_chunked(self, teacher_logits, draft_logits, live):
+        vocab = draft_logits.size(-1)
+        teacher_flat = teacher_logits.reshape(-1, vocab)
+        draft_flat = draft_logits.reshape(-1, vocab)
+        live_flat = live.reshape(-1).float()
+        n_live = live_flat.sum()
+
+        def term(draft_chunk, teacher_chunk, live_chunk):
+            log_draft = F.log_softmax(draft_chunk.float(), -1)
+            log_teacher = F.log_softmax(teacher_chunk.float(), -1)
+            kl = (log_teacher.exp() * (log_teacher - log_draft)).sum(-1)
+            return (kl * live_chunk).sum()
+
+        chunk = int(self.cfg.train.get("kl_chunk", 4096)) 
+        total = draft_flat.new_zeros((), dtype=torch.float32)
+        for start in range(0, draft_flat.size(0), chunk):
+            stop = start + chunk
+            total = total + checkpoint(
+                term,
+                draft_flat[start:stop],
+                teacher_flat[start:stop],
+                live_flat[start:stop],
+                use_reentrant=False,
+            )
+        return total / n_live.clamp(min=1.0)
 
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._masked_step(batch)

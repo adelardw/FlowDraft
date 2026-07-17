@@ -12,7 +12,7 @@ output_dir: checkpoints/baseline
 
 train:
   variant: baseline
-  block_size: 32
+  block_size: 8
   anchors_per_sequence: 256
   lr: 2e-4
   warmup_ratio: 0.05
@@ -38,4 +38,4 @@ trainer:
   # yields ceil(471952 / 128) * 2 = 7,376 optimizer updates. This is only the
   # cosine horizon; the loader itself ends epochs by exhausting 600K raw rows.
   max_steps: 7376
-  accumulate_grad_batches: 16
+  accumulate_grad_batches: 128
