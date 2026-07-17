@@ -20,6 +20,13 @@ def build_model(cfg: DictConfig):
           - ``processor`` builds the simplex/one-hot endpoints for the df path.
     """
     backbone_kwargs = OmegaConf.to_container(cfg.backbone, resolve=True)
+    # These are FlowDraft runtime options, not Hugging Face
+    # ``from_pretrained`` arguments. Compile only the frozen AR branch: the
+    # DF branch uses ``torch.func.functional_call`` to substitute trainable
+    # Q/K/V twins and must keep calling the original module.
+    compile_ar = backbone_kwargs.pop("compile_ar", False)
+    compile_mode = backbone_kwargs.pop("compile_mode", "default")
+    compile_dynamic = backbone_kwargs.pop("compile_dynamic", False)
     tokenizer_kwargs = OmegaConf.to_container(cfg.tokenizer, resolve=True)
 
     backbone = AutoModelForCausalLM.from_pretrained(**backbone_kwargs)
@@ -36,6 +43,8 @@ def build_model(cfg: DictConfig):
 
     df_processor = DiffusionProcessor.from_model(tokenizer, backbone)
     model = OrthrusAttentionAdapter(backbone, w_names=list(cfg.adapter.w_names))
+    if compile_ar:
+        model.enable_ar_compile(mode=compile_mode, dynamic=compile_dynamic)
 
     n_total = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)

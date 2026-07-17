@@ -156,6 +156,11 @@ class OrthrusAttentionAdapter(nn.Module):
     def __init__(self, model, w_names=("q_proj", "k_proj", "v_proj")):
         super().__init__()
         self.model = model
+        # Kept outside ``nn.Module`` registration. A compiled wrapper holds a
+        # reference to ``self.model``; registering both would duplicate model
+        # paths in state_dict/DDP traversal. The original remains the sole
+        # registered backbone and the DF path always calls it directly.
+        self.__dict__["_compiled_ar_model"] = None
         self.w_names = tuple(w_names)
         self._df_names, self.df_weights, self.n_dual = self._clone_df_weights()
         embed_weight = self.model.get_input_embeddings().weight
@@ -173,6 +178,20 @@ class OrthrusAttentionAdapter(nn.Module):
         if self.model.config.model_type == "qwen3":
             for layer in self.model.model.layers:
                 _install_qwen3_flex_df_attention(layer.self_attn)
+
+    def enable_ar_compile(self, *, mode: str = "default", dynamic: bool = False) -> None:
+        """Compile only frozen AR forwards.
+
+        The baseline's AR teacher has a stable packed ``[1, 2048]`` shape and
+        runs under ``no_grad``. In contrast, the DF path must remain eager
+        because it uses :func:`torch.func.functional_call` to substitute the
+        trainable diffusion projections for one forward. Keeping the compiled
+        callable unregistered also avoids a second backbone path in DDP and
+        checkpoints.
+        """
+        self.__dict__["_compiled_ar_model"] = torch.compile(
+            self.model, mode=mode, fullgraph=False, dynamic=dynamic
+        )
 
     def _clone_df_weights(self):
         """Collect the projections matched by name and clone their parameters."""
@@ -330,4 +349,5 @@ class OrthrusAttentionAdapter(nn.Module):
         # takes to fine-tune this path.
         if s is not None or t is not None:
             raise ValueError("s/t are flow-map (DF) conditioning; the AR path takes none")
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        ar_model = self.__dict__["_compiled_ar_model"] or self.model
+        return ar_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
