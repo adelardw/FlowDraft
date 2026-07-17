@@ -15,8 +15,8 @@ backbone:
   low_cpu_mem_usage: true
   trust_remote_code: false
   use_cache: false
-  # Opt-in: compile only the frozen AR teacher/verifier branch. The DF path
-  # remains eager because it substitutes trainable Q/K/V via functional_call.
+  # Opt-in: compile only the fixed-shape frozen AR teacher. Generation,
+  # verification and the DF functional_call path remain eager.
   compile_ar: false
   compile_mode: default
   compile_dynamic: false

@@ -180,14 +180,16 @@ class OrthrusAttentionAdapter(nn.Module):
                 _install_qwen3_flex_df_attention(layer.self_attn)
 
     def enable_ar_compile(self, *, mode: str = "default", dynamic: bool = False) -> None:
-        """Compile only frozen AR forwards.
+        """Compile the fixed-shape frozen AR teacher forward.
 
-        The baseline's AR teacher has a stable packed ``[1, 2048]`` shape and
-        runs under ``no_grad``. In contrast, the DF path must remain eager
-        because it uses :func:`torch.func.functional_call` to substitute the
-        trainable diffusion projections for one forward. Keeping the compiled
-        callable unregistered also avoids a second backbone path in DDP and
-        checkpoints.
+        The baseline explicitly opts its packed ``[B, 2048]`` teacher call in
+        through ``use_compiled_ar=True``. Generation and validation decoding
+        retain variable cache lengths and stay eager; compiling them would
+        exhaust Dynamo's shape-specialization cache. The DF path also remains
+        eager because it uses :func:`torch.func.functional_call` to substitute
+        the trainable diffusion projections for one forward. Keeping the
+        compiled callable unregistered avoids a second backbone path in DDP
+        and checkpoints.
         """
         self.__dict__["_compiled_ar_model"] = torch.compile(
             self.model, mode=mode, fullgraph=False, dynamic=dynamic
@@ -276,6 +278,7 @@ class OrthrusAttentionAdapter(nn.Module):
         past_key_values=None,
         causal_limit=None,
         diffusion_block_size=None,
+        use_compiled_ar: bool = False,
         **kwargs,
     ):
         ## input_ids - AR IDS or OHE IDS FOR DF!
@@ -350,6 +353,6 @@ class OrthrusAttentionAdapter(nn.Module):
         if s is not None or t is not None:
             raise ValueError("s/t are flow-map (DF) conditioning; the AR path takes none")
         ar_model = self.__dict__["_compiled_ar_model"]
-        if ar_model is None:
+        if ar_model is None or not use_compiled_ar:
             ar_model = self.model
         return ar_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)

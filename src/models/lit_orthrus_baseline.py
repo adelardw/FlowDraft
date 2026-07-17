@@ -50,7 +50,13 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         # AR-only KV cache.  The DF forward below never appends to it.
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad():
-            teacher_full = self.orthrus(ids, attention_mask, past_key_values=cache).logits
+            # The paper baseline packs every training/validation item to a
+            # fixed 2048-token shape. This is the sole AR call routed through
+            # the optional compiled wrapper; generation has variable cache
+            # lengths and must remain eager to avoid recompilation churn.
+            teacher_full = self.orthrus(
+                ids, attention_mask, past_key_values=cache, use_compiled_ar=True
+            ).logits
 
         width = block
         drafted = block - 1
