@@ -349,5 +349,7 @@ class OrthrusAttentionAdapter(nn.Module):
         # takes to fine-tune this path.
         if s is not None or t is not None:
             raise ValueError("s/t are flow-map (DF) conditioning; the AR path takes none")
-        ar_model = self.__dict__["_compiled_ar_model"] or self.model
+        ar_model = self.__dict__["_compiled_ar_model"]
+        if ar_model is None:
+            ar_model = self.model
         return ar_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
