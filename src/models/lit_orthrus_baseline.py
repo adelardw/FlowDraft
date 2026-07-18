@@ -147,11 +147,61 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
+    @staticmethod
+    def _position_metrics(df_logits, teacher_logits, live):
+        """Greedy draft quality at every fresh-block position.
+
+        ``accuracy_pos_j`` is independent teacher-top-1 agreement at position
+        ``j``. ``acceptance_pos_j`` is stricter: it is one only when every
+        greedy draft from position 1 through ``j`` matches its AR verifier
+        row. The latter is exactly the event needed for a verifier to accept
+        token ``j`` in a speculative block.
+        """
+        matches = df_logits.argmax(-1).eq(teacher_logits.argmax(-1)) & live
+        # A padded position invalidates subsequent positions in that block;
+        # valid packed baseline anchors have no padding, but keeping this
+        # explicit makes validation with ordinary padded examples correct too.
+        prefix_live = live.to(torch.int32).cumprod(dim=-1).bool()
+        prefix_matches = matches.to(torch.int32).cumprod(dim=-1).bool()
+
+        dims = (0, 1)  # aggregate local batch and sampled anchors
+        accuracy_denominator = live.sum(dim=dims).clamp_min(1)
+        acceptance_denominator = prefix_live.sum(dim=dims).clamp_min(1)
+        accuracy = matches.sum(dim=dims) / accuracy_denominator
+        acceptance = prefix_matches.sum(dim=dims) / acceptance_denominator
+
+        full_blocks = prefix_live[..., -1]
+        mean_accepted = (
+            prefix_matches.sum(dim=-1)[full_blocks].float().mean()
+            if full_blocks.any()
+            else torch.zeros((), device=df_logits.device)
+        )
+        return accuracy, acceptance, mean_accepted
+
     def validation_step(self, batch, batch_idx):
         loss, df_logits, teacher_logits, live = self._masked_step(batch)
         agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
         self.log("val/loss", loss, prog_bar=True, sync_dist=True)
         self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+        accuracy, acceptance, mean_accepted = self._position_metrics(
+            df_logits, teacher_logits, live
+        )
+        # Position 01 is the first fresh token after the clean anchor. Keep
+        # fixed-width names so W&B/TensorBoard plots sort in generation order.
+        self.log_dict(
+            {
+                **{
+                    f"val/accuracy_pos_{position + 1:02d}": value
+                    for position, value in enumerate(accuracy)
+                },
+                **{
+                    f"val/acceptance_pos_{position + 1:02d}": value
+                    for position, value in enumerate(acceptance)
+                },
+                "val/accepted_tokens_per_block": mean_accepted,
+            },
+            sync_dist=True,
+        )
         self._maybe_decode_val(batch, batch_idx)
         return loss
 
