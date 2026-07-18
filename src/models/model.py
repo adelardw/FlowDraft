@@ -23,7 +23,7 @@ def build_model(cfg: DictConfig):
     # These are FlowDraft runtime options, not Hugging Face
     # ``from_pretrained`` arguments. Compile only the frozen AR branch: the
     # DF branch uses ``torch.func.functional_call`` to substitute trainable
-    # Q/K/V twins and must keep calling the original module.
+    # diffusion-attention twins and must keep calling the original module.
     compile_ar = backbone_kwargs.pop("compile_ar", False)
     compile_mode = backbone_kwargs.pop("compile_mode", "default")
     compile_dynamic = backbone_kwargs.pop("compile_dynamic", False)

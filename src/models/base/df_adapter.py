@@ -36,8 +36,8 @@ def _install_qwen3_flex_df_attention(module):
     """Patch Qwen3 attention with Orthrus's sparse diffusion-only path.
 
     The ordinary AR path remains the upstream HF implementation. During a DF
-    call ``functional_call`` has already substituted Q/K/V with their
-    trainable twins; this function reads frozen AR K/V from the cache and
+    call ``functional_call`` has already substituted the diffusion-attention
+    modules with their trainable twins; this function reads frozen AR K/V from the cache and
     applies the official FlexAttention block mask without ever appending DF
     K/V to that cache.
     """
@@ -120,18 +120,19 @@ class OrthrusAttentionAdapter(nn.Module):
     """Wrap ANY HF causal LM with a frozen AR path + a trainable DF path.
 
     Orthrus weight init: every ``nn.Linear`` whose attribute name matches
-    ``w_names`` (``q_proj`` / ``k_proj`` / ``v_proj`` — configurable per model
-    family) gets a trainable twin (``W_Q -> W_Q_diff`` etc.), created as a copy
-    of the frozen weight and registered on the adapter — so the twins are in
-    the computational graph and in ``state_dict()``, while the backbone itself
-    is never modified.
+    ``w_names`` (for Qwen3: Q/K/V/O projections and Q/K norms) gets a
+    trainable twin, created as a copy of the frozen parameter and registered
+    on the adapter — so the twins are in the computational graph and in
+    ``state_dict()``, while the backbone itself is never modified.
 
     Routing is stateless. The DF path runs the *same* backbone through
     :func:`torch.func.functional_call`, which substitutes the matched
     projection weights with their twins for exactly one forward — no module
     surgery, no mode flags, nothing to restore afterwards. Norms, MLP,
     ``o_proj``, embeddings and the LM head are therefore shared by
-    construction.
+    construction. The official Orthrus Qwen implementation does *not* share
+    the attention output projection or Q/K normalization with AR, so those
+    modules belong in Qwen3's default ``w_names`` too.
 
     Shared KV cache (Orthrus contract): the cache holds AR-path K/V of
     *committed* tokens only. Pass ``past_key_values`` (a mutable HF ``Cache``,
@@ -153,7 +154,7 @@ class OrthrusAttentionAdapter(nn.Module):
     needs no changes if you unfreeze it.
     """
 
-    def __init__(self, model, w_names=("q_proj", "k_proj", "v_proj")):
+    def __init__(self, model, w_names=("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")):
         super().__init__()
         self.model = model
         # Kept outside ``nn.Module`` registration. A compiled wrapper holds a
@@ -196,20 +197,30 @@ class OrthrusAttentionAdapter(nn.Module):
         )
 
     def _clone_df_weights(self):
-        """Collect the projections matched by name and clone their parameters."""
+        """Clone parameters of every configured diffusion-attention module.
+
+        Attention projections are ``nn.Linear``, but Qwen3's per-head Q/K
+        RMSNorms are custom modules. Matching modules rather than only Linear
+        layers is what lets the DF path faithfully use ``q_norm_diff`` and
+        ``k_norm_diff`` as in the official Orthrus implementation.
+        """
         matched = [
             (name, module)
             for name, module in self.model.named_modules()
-            if isinstance(module, nn.Linear)
-            and (name in self.w_names or name.rsplit(".", 1)[-1] in self.w_names)
+            if name and (name in self.w_names or name.rsplit(".", 1)[-1] in self.w_names)
+            and any(True for _ in module.named_parameters(recurse=False))
         ]
         if not matched:
-            linears = sorted(
-                {n.rsplit(".", 1)[-1] for n, m in self.model.named_modules() if isinstance(m, nn.Linear)}
+            parameterized_modules = sorted(
+                {
+                    n.rsplit(".", 1)[-1]
+                    for n, m in self.model.named_modules()
+                    if any(True for _ in m.named_parameters(recurse=False))
+                }
             )
             raise ValueError(
-                f"No nn.Linear matched w_names={self.w_names}. "
-                f"Linear attribute names in this model: {linears}"
+                f"No parameterized module matched w_names={self.w_names}. "
+                f"Parameterized module attribute names in this model: {parameterized_modules}"
             )
         names, twins = [], []
         for module_name, module in matched:
@@ -285,8 +296,8 @@ class OrthrusAttentionAdapter(nn.Module):
         if past_key_values is not None:
             kwargs.update(past_key_values=past_key_values, use_cache=True)
         if use_df:
-            # DF PATH: same backbone, Q/K/V substituted by their trainable
-            # twins for this single call. The drafter reads the committed AR
+            # DF PATH: same backbone, diffusion-attention modules substituted
+            # by their trainable twins for this single call. The drafter reads the committed AR
             # prefix from the cache; its own block K/V (DF weights) are
             # cropped away so the shared cache stays AR-only.
             committed_len = past_key_values.get_seq_length() if past_key_values is not None else 0

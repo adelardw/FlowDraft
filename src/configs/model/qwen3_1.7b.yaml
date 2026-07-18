@@ -1,5 +1,5 @@
 # Orthrus paper backbone scale.  Qwen3 exposes the same attention projection
-# names as Qwen2, so the generic Q/K/V diffusion adapter applies unchanged.
+# names as Qwen2, while its Q/K norms are named ``q_norm`` / ``k_norm``.
 name: Qwen/Qwen3-1.7B
 
 backbone:
@@ -29,6 +29,6 @@ tokenizer:
   trust_remote_code: false
 
 adapter:
-  # Official Orthrus maintains a separate diffusion attention projection
-  # path; only Q/K/V are initialized from their frozen AR counterparts.
-  w_names: [q_proj, k_proj, v_proj]
+  # Official Orthrus maintains a full separate diffusion attention path:
+  # Q/K/V/O projections plus the per-head Q/K normalization weights.
+  w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]
