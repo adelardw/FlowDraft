@@ -51,9 +51,14 @@ class EpochShuffled(IterableDataset):
 class PackedTokenStream(IterableDataset):
     """Pack rendered examples into fixed-length token sequences.
 
-    Orthrus trains on packed 2048-token instances.  Packing after stream
+    Orthrus trains on packed 2048-token instances. Packing after stream
     shuffling preserves the requested training-mixture order while ensuring
     every emitted item is a real fixed-size sequence (no padding budget).
+
+    ``document_ids`` travels alongside the packed tokens. It is deliberately
+    not an attention mask: the AR teacher still sees the packed context, but
+    the masked-block trainer can reject anchors whose drafted span would cross
+    an EOS-delimited source-example boundary.
     """
 
     def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
@@ -80,13 +85,23 @@ class PackedTokenStream(IterableDataset):
         return self.size // world_size
 
     def __iter__(self):
-        pending, emitted = [], 0
+        pending, pending_document_ids, emitted, document_id = [], [], 0, 0
         rank, world_size = self._rank_and_world()
         usable = None if self.size is None else self.size - (self.size % world_size)
         for example in self.ds:
-            pending.extend(self.tokenize(example))
+            token_ids = self.tokenize(example)
+            pending.extend(token_ids)
+            # The EOS appended by ``tokenize_for_pack`` belongs to this
+            # document. An anchor may learn to predict that EOS, but may not
+            # draft any token from the following packed document.
+            pending_document_ids.extend([document_id] * len(token_ids))
+            document_id += 1
             while len(pending) >= self.max_length:
                 ids, pending = pending[: self.max_length], pending[self.max_length :]
+                document_ids, pending_document_ids = (
+                    pending_document_ids[: self.max_length],
+                    pending_document_ids[self.max_length :],
+                )
                 emitted += 1
                 if usable is not None and emitted > usable:
                     return
@@ -97,6 +112,7 @@ class PackedTokenStream(IterableDataset):
                     yield {
                         "input_ids": torch.tensor(ids, dtype=torch.long),
                         "attention_mask": torch.ones(self.max_length, dtype=torch.long),
+                        "document_ids": torch.tensor(document_ids, dtype=torch.long),
                     }
 def quiet_download_logs():
     """Keep ALL transfer chatter out of the training/eval console.

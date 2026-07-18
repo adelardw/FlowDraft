@@ -14,6 +14,9 @@ train:
   variant: baseline
   block_size: 8
   anchors_per_sequence: 256
+  # Packed documents remain visible to the AR teacher, but no masked draft
+  # span may cross the EOS boundary into a different source example.
+  respect_document_boundaries: true
   lr: 2e-4
   warmup_ratio: 0.05
   early_stop_patience: 0

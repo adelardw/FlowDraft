@@ -22,29 +22,49 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         super().__init__(*args, **kwargs)
         self.orthrus.time_embed.requires_grad_(False)
 
-    def _sample_anchors(self, attention_mask, block: int, count: int):
+    def _sample_anchors(self, attention_mask, block: int, count: int, document_ids=None):
         """Uniform anchor positions shared across the micro-batch.
 
         The paper uses a micro-batch of one; sharing positions also keeps a
         larger local batch compatible with one cache and one sparse mask.
         """
         min_prefix = int(self.cfg.train.get("min_prefix", 1))
-        true_min = int(attention_mask.sum(dim=1).min())
-        # ``block`` includes the visible anchor; only the remaining K-1
-        # positions are drafted.
-        high = true_min - (block - 1)
-        if high <= min_prefix:
+        # ``block`` includes the visible anchor. A valid window contains the
+        # anchor plus its K-1 drafted positions, all of which must be live.
+        # With packed data, it must also be entirely within one source
+        # document. In particular, the appended EOS can be predicted, but a
+        # span beginning before EOS cannot continue into the next document.
+        live_windows = attention_mask.bool().unfold(1, block, 1).all(dim=-1)
+        valid = live_windows
+        if document_ids is not None and bool(
+            self.cfg.train.get("respect_document_boundaries", True)
+        ):
+            if document_ids.shape != attention_mask.shape:
+                raise ValueError("document_ids must have the same shape as attention_mask")
+            document_windows = document_ids.unfold(1, block, 1)
+            valid = valid & (document_windows == document_windows[..., :1]).all(dim=-1)
+
+        # Positions are shared across the local micro-batch because the DF
+        # sparse mask and cache are batched. Keep only positions valid for
+        # every row, then sample with replacement as the previous sampler did.
+        shared = valid.all(dim=0)
+        candidates = torch.nonzero(shared, as_tuple=False).flatten()
+        candidates = candidates[candidates >= min_prefix]
+        if candidates.numel() == 0:
             raise ValueError(
-                f"sequence length {true_min} cannot fit a block of size {block}"
+                f"no shared within-document anchor can fit a block of size {block}; "
+                f"min_prefix={min_prefix}"
             )
-        return torch.randint(min_prefix, high, (count,), device=attention_mask.device)
+        return candidates[torch.randint(candidates.numel(), (count,), device=attention_mask.device)]
 
 
     def _masked_step(self, batch):
         ids, attention_mask = batch["input_ids"], batch["attention_mask"]
         block = int(self.cfg.train.get("block_size", 32))
         count = int(self.cfg.train.get("anchors_per_sequence", 256))
-        anchors = self._sample_anchors(attention_mask, block, count)
+        anchors = self._sample_anchors(
+            attention_mask, block, count, batch.get("document_ids")
+        )
 
         # One clean AR pass supplies both exact teacher rows and the shared
         # AR-only KV cache.  The DF forward below never appends to it.
