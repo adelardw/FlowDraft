@@ -8,7 +8,18 @@ seed: 42
 checkpoint: null            # path to a FlowDraft/Orthrus .ckpt (DF head only); null = untrained drafter
 checkpoint_config: true     # restore saved model/train config and variant; false = use explicit eval config
 results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
+per_prompt_file: results/eval-prompts.jsonl
+run_id: null
+experiment_id: null          # stable configuration ID shared across training seeds
+split_label: null
+lossless_policy: assert       # assert (canonical) | diagnose (throughput audit) | ignore
 variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
+
+# Eager is the canonical bitwise-correctness backend. SDPA throughput audits
+# override this explicitly and use lossless_policy=diagnose.
+model:
+  backbone:
+    attn_implementation: eager
 
 # Evaluate the complete rendered dataset sample. Individual data configs keep
 # max_length for bounded training/validation batches, but that limit must not
@@ -24,6 +35,7 @@ decode:
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
   n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
+  prompt_offset: 0          # skip this many usable prompts (disjoint dev/test slices)
   prompt_len: null          # null = the full rendered prompt (honest bench setting);
                             #   int N = first N tokens only (prefix-continuation mode)
   temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = sampling

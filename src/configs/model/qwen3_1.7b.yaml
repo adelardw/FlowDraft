@@ -21,6 +21,10 @@ backbone:
   compile_ar: false
   compile_mode: default
   compile_dynamic: false
+  # Memory fallback for packed full-sequence FlowDraft. Keep off unless the
+  # 2048-token feasibility probe OOMs; non-reentrant checkpointing preserves
+  # gradients through the functional DF parameter substitution.
+  gradient_checkpointing: false
 
 tokenizer:
   pretrained_model_name_or_path: ${..name}

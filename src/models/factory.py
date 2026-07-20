@@ -20,6 +20,7 @@ _RUNTIME_BACKBONE_KEYS = {
     "compile_mode",
     "device_map",
     "dtype",
+    "gradient_checkpointing",
     "low_cpu_mem_usage",
 }
 
@@ -126,6 +127,9 @@ def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
     model.checkpoint_path = str(checkpoint_path)
     model.checkpoint_global_step = checkpoint.get("global_step")
     model.checkpoint_epoch = checkpoint.get("epoch")
+    campaign = checkpoint.get("campaign_metadata", {})
+    model.checkpoint_elapsed_seconds = campaign.get("elapsed_seconds")
+    model.checkpoint_device_hours = campaign.get("device_hours")
     logger.info(
         f"loaded {len(trainable_state)} DF tensors from {checkpoint_path} "
         f"(step={model.checkpoint_global_step}, epoch={model.checkpoint_epoch})"
@@ -194,4 +198,10 @@ def build_lit(
     model = Module(cfg)
     if checkpoint is not None:
         _load_df_state(model, checkpoint, checkpoint_path)
+        hparams = _checkpoint_hparams(checkpoint)
+        model.checkpoint_seed = hparams.get("seed")
+        wandb = hparams.get("wandb", {})
+        model.checkpoint_run_name = (
+            wandb.get("name") if isinstance(wandb, Mapping) else None
+        )
     return model

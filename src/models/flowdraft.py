@@ -174,6 +174,56 @@ class FlowDraft(L.LightningModule):
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
         return kl[live].mean()
 
+    def _packed_document_layout(self, batch, dtype):
+        """Build document-local masks for packed full-sequence training.
+
+        Packed examples concatenate unrelated source documents. The AR path
+        remains causal within each source document and the diffusion path is
+        bidirectional only within that same document. Positions restart at
+        every document boundary, and next-token losses exclude transitions
+        between adjacent packed documents.
+
+        Returns ``(df_mask, ar_mask, position_ids, transition_live)``. For an
+        ordinary, unpacked batch the masks/positions are ``None`` and the
+        transition mask is the usual shifted padding mask.
+        """
+        live = batch["attention_mask"].bool()
+        document_ids = batch.get("document_ids")
+        respect = bool(self.cfg.train.get("respect_document_boundaries", True))
+        if document_ids is None or not respect:
+            return None, None, None, live[:, 1:]
+        if document_ids.shape != live.shape:
+            raise ValueError("document_ids must have the same shape as attention_mask")
+
+        batch_size, width = live.shape
+        device = live.device
+        token_index = torch.arange(width, device=device).expand(batch_size, -1)
+        boundary = torch.ones_like(live)
+        boundary[:, 1:] = document_ids[:, 1:] != document_ids[:, :-1]
+        starts = torch.where(boundary, token_index, torch.zeros_like(token_index))
+        document_start = starts.cummax(dim=1).values
+        position_ids = token_index - document_start
+
+        same_document = document_ids[:, :, None] == document_ids[:, None, :]
+        key_live = live[:, None, :]
+        df_allowed = same_document & key_live
+        causal = token_index[:, :, None] >= token_index[:, None, :]
+        ar_allowed = df_allowed & causal
+        floor = torch.finfo(dtype).min
+
+        def additive(allowed):
+            mask = torch.zeros(
+                batch_size, 1, width, width, dtype=dtype, device=device
+            )
+            return mask.masked_fill(~allowed[:, None], floor)
+
+        transition_live = (
+            live[:, 1:]
+            & live[:, :-1]
+            & (document_ids[:, 1:] == document_ids[:, :-1])
+        )
+        return additive(df_allowed), additive(ar_allowed), position_ids, transition_live
+
     def _td_term(self, pi, gamma, s, t, live, forward_dt):
         """Finite-difference temporal drift inside ``s <= t' <= 1``.
 
@@ -193,7 +243,20 @@ class FlowDraft(L.LightningModule):
         weighted = gamma.squeeze(-1).pow(2) * drift
         return weighted[live].mean() if live.any() else pi.sum() * 0.0
 
-    def compute_loss(self, batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t):
+    def compute_loss(
+        self,
+        batch,
+        teacher_logits,
+        draft_logits,
+        x_s,
+        x_t,
+        x1,
+        s,
+        t,
+        df_attention_mask=None,
+        position_ids=None,
+        endpoint_live=None,
+    ):
         """Categorical flow-map training plus optional AR distillation.
 
         The paper's diagonal VFM objective and off-diagonal ECLD objective are
@@ -238,13 +301,21 @@ class FlowDraft(L.LightningModule):
         anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
         if anchor_input is None:
             raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
-        diag_logits = self.orthrus(anchor_input, mask, use_df=True, s=t, t=t).logits
+        model_mask = df_attention_mask if df_attention_mask is not None else mask
+        diag_logits = self.orthrus(
+            anchor_input,
+            model_mask,
+            use_df=True,
+            s=t,
+            t=t,
+            position_ids=position_ids,
+        ).logits
         endpoint_nll = F.cross_entropy(
             diag_logits[:, 1:].float().transpose(1, 2),
             x1[:, 1:].argmax(-1),
             reduction="none",
         )
-        endpoint_live = live[:, 1:]
+        endpoint_live = live[:, 1:] if endpoint_live is None else endpoint_live
         endpoint = (
             endpoint_nll[endpoint_live].mean()
             if endpoint_live.any()
@@ -273,7 +344,14 @@ class FlowDraft(L.LightningModule):
             tgt = diag_logits.detach().float().softmax(-1)
         else:
             with torch.no_grad():
-                tgt = self.orthrus(x_jump, mask, use_df=True, s=t, t=t).logits.float().softmax(-1)
+                tgt = self.orthrus(
+                    x_jump,
+                    model_mask,
+                    use_df=True,
+                    s=t,
+                    t=t,
+                    position_ids=position_ids,
+                ).logits.float().softmax(-1)
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
         td = self._td_term(
@@ -283,7 +361,12 @@ class FlowDraft(L.LightningModule):
             t,
             live,
             forward_dt=lambda dt: self.orthrus(
-                x_s, mask, use_df=True, s=s, t=t + dt
+                x_s,
+                model_mask,
+                use_df=True,
+                s=s,
+                t=t + dt,
+                position_ids=position_ids,
             ).logits,
         )
 
@@ -735,19 +818,44 @@ class FlowDraft(L.LightningModule):
             # with V≈128k is gigabytes — it must never ship through the
             # DataLoader; batches only need input_ids + attention_mask.
             x1 = self.df_processor.to_simplex(ids, attention_mask=mask)
+        df_attention_mask, ar_attention_mask, position_ids, endpoint_live = (
+            self._packed_document_layout(batch, x1.dtype)
+        )
         teacher_logits = None
         # The frozen teacher is unnecessary for paper-faithful endpoint
         # training. Keep it for validation metrics and optional AR-KL runs.
         if not self.training or self.cfg.train.get("ar_kl_weight", 0.0):
             with torch.no_grad(), self._teacher_eval():
-                teacher_logits = self.orthrus(ids, mask).logits
+                teacher_logits = self.orthrus(
+                    ids,
+                    ar_attention_mask if ar_attention_mask is not None else mask,
+                    position_ids=position_ids,
+                ).logits
         x_s, x_t, s, t = self.sample_trajectory(x1, mask)
-        draft_logits = self.orthrus(x_s, mask, use_df=True, s=s, t=t).logits
-        return teacher_logits, draft_logits, x_s, x_t, x1, s, t
+        draft_logits = self.orthrus(
+            x_s,
+            df_attention_mask if df_attention_mask is not None else mask,
+            use_df=True,
+            s=s,
+            t=t,
+            position_ids=position_ids,
+        ).logits
+        return (
+            teacher_logits,
+            draft_logits,
+            x_s,
+            x_t,
+            x1,
+            s,
+            t,
+            df_attention_mask,
+            position_ids,
+            endpoint_live,
+        )
 
     def training_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
-        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t)
+        shared = self._shared_step(batch)
+        loss = self.compute_loss(batch, *shared)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
@@ -755,13 +863,12 @@ class FlowDraft(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
-            teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
-            loss = self.compute_loss(
-                batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t
-            )
+            shared = self._shared_step(batch)
+            teacher_logits, draft_logits = shared[:2]
+            loss = self.compute_loss(batch, *shared)
             # Cheap acceptance proxy: how often the drafter's argmax already
             # matches the verifier's argmax (shifted: teacher@i predicts i+1).
-            mask = batch["attention_mask"][:, 1:].bool()
+            mask = shared[-1]
             agree = (
                 draft_logits[:, 1:].argmax(-1)
                 == teacher_logits[:, :-1].argmax(-1)
@@ -886,6 +993,21 @@ class FlowDraft(L.LightningModule):
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
 
+    def on_train_start(self):
+        self._campaign_started_at = time.perf_counter()
+
+    def _campaign_metadata(self):
+        elapsed = float(getattr(self, "_campaign_elapsed_before", 0.0))
+        started = getattr(self, "_campaign_started_at", None)
+        if started is not None:
+            elapsed += time.perf_counter() - started
+        world_size = int(getattr(self.trainer, "world_size", 1))
+        return {
+            "elapsed_seconds": elapsed,
+            "device_count": world_size,
+            "device_hours": elapsed * world_size / 3600.0,
+        }
+
     def on_save_checkpoint(self, checkpoint):
         # Keep only the FP32 DF head; build_model restores the much larger
         # frozen backbone from Hugging Face on load.
@@ -893,9 +1015,13 @@ class FlowDraft(L.LightningModule):
         checkpoint["state_dict"] = {
             key: value for key, value in checkpoint["state_dict"].items() if key in trainable
         }
+        checkpoint["campaign_metadata"] = self._campaign_metadata()
 
     def on_load_checkpoint(self, checkpoint):
         """Validate DF-only state and migrate pre-mask-freeze optimizer state."""
+        self._campaign_elapsed_before = float(
+            checkpoint.get("campaign_metadata", {}).get("elapsed_seconds", 0.0)
+        )
         state = checkpoint["state_dict"]
         legacy_mask = "orthrus.mask_embedding"
         if legacy_mask in state and not self.orthrus.mask_embedding.requires_grad:

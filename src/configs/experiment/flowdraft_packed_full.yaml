@@ -1,0 +1,33 @@
+# @package _global_
+# Boundary-aware, packed-2048 full-sequence FlowDraft campaign preset.
+defaults:
+  - override /model: qwen3_1.7b
+
+output_dir: checkpoints/flowdraft-packed-full
+
+train:
+  variant: flowdraft
+  block_size: 8
+  respect_document_boundaries: true
+  lambda_ramp_steps: 2000
+  early_stop_patience: 0
+  monitor: val/loss
+  monitor_mode: min
+  val_decode_prompts: 16
+  checkpoint_every_n_steps: 1000
+  checkpoint_name: flowdraft-packed-full-{step:07d}
+  best_checkpoint_name: best-loss-{step:07d}
+
+data:
+  splits: [chat, math, code]
+  pack_sequences: true
+  pad_to_max_length: true
+  train_size: 600000
+  batch_size: 1
+  max_length: 2048
+
+trainer:
+  max_steps: 10000
+  accumulate_grad_batches: 64
+  val_check_interval: 500
+
