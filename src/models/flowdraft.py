@@ -353,13 +353,32 @@ class FlowDraft(L.LightningModule):
             next_token = expected[:, n_accepted]  # correction: what AR wanted instead
         return n_accepted, next_token
 
+    def _generation_device(self):
+        """Device of the token embedding stage under HF device-map dispatch.
+
+        ``LightningModule.device`` only tracks explicit ``module.to(...)``
+        calls. Evaluation can instead place the wrapped backbone with a
+        Hugging Face device map, leaving ``self.device`` at CPU even though
+        the embedding and generated tensors live on CUDA.
+        """
+        embedding = self.orthrus.model.get_input_embeddings()
+        hook = getattr(embedding, "_hf_hook", None)
+        device = getattr(hook, "execution_device", None)
+        device = torch.device(device) if device is not None else embedding.weight.device
+        if device.type == "meta":
+            raise RuntimeError(
+                "generation cannot target a meta-device embedding; choose an "
+                "evaluation device_map that materializes the input embedding"
+            )
+        return device
+
     def _encode(self, text, input_ids, **tokenizer_kwargs):
         if (text is None) == (input_ids is None):
             raise ValueError("pass exactly one of text / input_ids")
         if text is not None:
             enc = self.df_processor(text, return_simplex=False, **tokenizer_kwargs)
             input_ids = enc["input_ids"]
-        input_ids = input_ids.to(self.device)
+        input_ids = input_ids.to(self._generation_device())
         assert input_ids.dim() == 2 and input_ids.size(0) == 1, "generation is batch-size-1"
         return input_ids
 
@@ -448,14 +467,22 @@ class FlowDraft(L.LightningModule):
         Returns ``(draft_ids [1, K], q [1, K, V])`` for the K FRESH positions.
         """
         vocab = self.df_processor.vocab_size
+        device = self._generation_device()
         x = torch.distributions.Dirichlet(
-            torch.ones(vocab, device=self.device)
+            torch.ones(vocab, device=device)
         ).sample((1, block_size))
         anchor = None
         if anchor_token is not None:
-            anchor = F.one_hot(anchor_token.view(1, 1), vocab).to(x.dtype)
+            anchor = F.one_hot(
+                anchor_token.to(device).view(1, 1), vocab
+            ).to(x.dtype)
             x = torch.cat([anchor, x], dim=1)
-        mask = torch.ones(1, cache.get_seq_length() + x.size(1), dtype=torch.long, device=self.device)
+        mask = torch.ones(
+            1,
+            cache.get_seq_length() + x.size(1),
+            dtype=torch.long,
+            device=x.device,
+        )
         for s_i, t_i in zip(times[:-1], times[1:]):
             x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
             if anchor is not None:
@@ -570,7 +597,12 @@ class FlowDraft(L.LightningModule):
             verify_in = draft_ids if pending is None else torch.cat(
                 [pending.view(1, 1), draft_ids], dim=1
             )
-            mask = torch.ones(1, committed + verify_in.size(1), dtype=torch.long, device=self.device)
+            mask = torch.ones(
+                1,
+                committed + verify_in.size(1),
+                dtype=torch.long,
+                device=verify_in.device,
+            )
             logits = self.orthrus(verify_in, mask, past_key_values=cache).logits
             n_forwards += 1
             if pending is not None:
@@ -649,7 +681,12 @@ class FlowDraft(L.LightningModule):
                 eos_token_id is not None and int(token) == eos_token_id
             ):
                 break
-            mask = torch.ones(1, cache.get_seq_length() + 1, dtype=torch.long, device=self.device)
+            mask = torch.ones(
+                1,
+                cache.get_seq_length() + 1,
+                dtype=torch.long,
+                device=token.device,
+            )
             out = self.orthrus(token.view(1, 1), mask, past_key_values=cache)
             n_forwards += 1
 

@@ -143,7 +143,9 @@ def dataset_prompts(model, cfg):
         ids, mask = batch["input_ids"], batch["attention_mask"]
         for i in range(ids.size(0)):
             live = int(mask[i].sum())
-            prompt = ids[i : i + 1, : min(live, prompt_len)].to(model.device)
+            prompt = ids[i : i + 1, : min(live, prompt_len)].to(
+                model._generation_device()
+            )
             if prompt.size(1) < 2:  # no usable context
                 continue
             if model.tokenizer is not None:
