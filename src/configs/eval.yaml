@@ -1,14 +1,14 @@
 
 defaults:
-  - model: llama3_3b
+  - model: qwen3_1.7b
   - data: math500   # default: a dataset NEVER SEEN in training; data=nemotron -> training distribution
   - _self_
 
 seed: 42
-checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
+checkpoint: null            # path to a FlowDraft/Orthrus .ckpt (DF head only); null = untrained drafter
+checkpoint_config: true     # restore saved model/train config and variant; false = use explicit eval config
 results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
-variant: fixed              # which drafter the checkpoint was trained as:
-                            #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
+variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
 # ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
@@ -27,11 +27,6 @@ decode:
   equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
                             #   on the first prompt (e.g. 500 draws); 0 = off
 
-# Prompt source lives in configs/data/. Two datasets, two questions:
-#   data=math500  (default) — a DIFFERENT dataset the drafter never saw in
-#                 training: the honest generalization number;
-#   data=nemotron            — the training distribution; its val samples were
-#                 excluded from training (train skips the first val_size of
-#                 the same seeded stream) but the texts are of the same kind.
-# Report both: the gap between them shows how much the drafter overfits the
-# training mix.
+# Prompt sources live in configs/data/. The Orthrus-compatible suite is
+# gsm8k, math500, aime24, aime25, humaneval, and mbpp; nemotron measures the
+# training distribution. Compose the paper protocol with +benchmark=orthrus.

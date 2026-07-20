@@ -1,0 +1,15 @@
+# @package _global_
+# ADDITION (beyond the task): the flow-map drafter retrained in the exact
+# inference geometry — clean AR prefix in the KV cache, clean in-block
+# anchor, noisy K-block. Same staged VFM/ECLD training as flowdraft_staged;
+# pair with orthrus_block_wise for a geometry-for-geometry comparison.
+#   uv run python src/train.py +experiment=flowdraft_block_wise
+defaults:
+  - override /model: qwen3_1.7b
+
+output_dir: checkpoints/flowdraft-block-wise
+
+train:
+  variant: flowdraft_block_wise
+  lambda_ramp_steps: 2000
+  checkpoint_name: flowdraft-block-wise-{step:07d}

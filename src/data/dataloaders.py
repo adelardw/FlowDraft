@@ -1,7 +1,44 @@
+import os
 import random
+from itertools import islice
 
+import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset
+
+
+def _rank_and_world() -> tuple[int, int]:
+    """Return the process shard coordinates exposed by Lightning DDP."""
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world_size
+
+
+def _round_robin_rank_shard(stream):
+    """Split a deterministic stream evenly across DDP ranks.
+
+    The incomplete final rank group is dropped so all ranks execute exactly
+    the same number of batches and cannot diverge at a collective.
+    """
+    rank, world_size = _rank_and_world()
+    if world_size == 1:
+        yield from stream
+        return
+    group = []
+    for example in stream:
+        group.append(example)
+        if len(group) == world_size:
+            yield group[rank]
+            group = []
+
+
+def _worker_shard(rank_stream):
+    """Partition one rank's share among DataLoader workers without drops."""
+    info = torch.utils.data.get_worker_info()
+    if info is None or info.num_workers == 1:
+        yield from rank_stream
+        return
+    yield from islice(rank_stream, info.id, None, info.num_workers)
 
 
 class EpochShuffled(IterableDataset):
@@ -15,9 +52,17 @@ class EpochShuffled(IterableDataset):
     ``set_epoch`` so every repetition of the stream yields a new order.
     """
 
-    def __init__(self, ds, seed: int, buffer_size: int, size: int | None = None):
+    def __init__(
+        self,
+        ds,
+        seed: int,
+        buffer_size: int,
+        size: int | None = None,
+        shard_by_rank: bool = True,
+    ):
         self.ds, self.seed, self.buffer_size = ds, seed, buffer_size
         self.size = size
+        self.shard_by_rank = shard_by_rank
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -30,9 +75,12 @@ class EpochShuffled(IterableDataset):
         # max_steps arithmetic.
         if self.size is None:
             raise TypeError("unbounded stream has no length")
-        return self.size
+        if not self.shard_by_rank:
+            return self.size
+        _, world_size = _rank_and_world()
+        return self.size // world_size
 
-    def __iter__(self):
+    def _shuffled(self):
         rng = random.Random(self.seed + self.epoch)
         buffer = []
         for example in self.ds:
@@ -44,6 +92,96 @@ class EpochShuffled(IterableDataset):
             buffer[i] = example
         rng.shuffle(buffer)
         yield from buffer
+
+    def __iter__(self):
+        stream = self._shuffled()
+        if self.shard_by_rank:
+            stream = _round_robin_rank_shard(stream)
+        yield from _worker_shard(stream)
+
+
+class PackedTokenStream(IterableDataset):
+    """Pack rendered examples into fixed-length token sequences.
+
+    Orthrus trains on packed 2048-token instances. Packing after stream
+    shuffling preserves the requested training-mixture order while ensuring
+    every emitted item is a real fixed-size sequence (no padding budget).
+
+    ``document_ids`` travels alongside the packed tokens. It is deliberately
+    not an attention mask: the AR teacher still sees the packed context, but
+    the masked-block trainer can reject anchors whose drafted span would cross
+    an EOS-delimited source-example boundary.
+    """
+
+    def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
+        self.ds, self.tokenize, self.max_length, self.size = ds, tokenize, max_length, size
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.ds, "set_epoch"):
+            self.ds.set_epoch(epoch)
+
+    def __len__(self):
+        if self.size is None:
+            raise TypeError("an unbounded packed stream has no length")
+        # ``size`` is the global packed count. Every rank receives a disjoint,
+        # equal-sized shard so DDP ranks always execute the same number of
+        # batches. The at-most ``world_size - 1`` tail sequences are dropped.
+        _, world_size = _rank_and_world()
+        return self.size // world_size
+
+    def _packed(self):
+        pending, pending_document_ids, emitted, document_id = [], [], 0, 0
+        _, world_size = _rank_and_world()
+        usable = None if self.size is None else self.size - (self.size % world_size)
+        for example in self.ds:
+            token_ids = self.tokenize(example)
+            pending.extend(token_ids)
+            # The EOS appended by ``tokenize_for_pack`` belongs to this
+            # document. An anchor may learn to predict that EOS, but may not
+            # draft any token from the following packed document.
+            pending_document_ids.extend([document_id] * len(token_ids))
+            document_id += 1
+            while len(pending) >= self.max_length:
+                ids, pending = pending[: self.max_length], pending[self.max_length :]
+                document_ids, pending_document_ids = (
+                    pending_document_ids[: self.max_length],
+                    pending_document_ids[self.max_length :],
+                )
+                emitted += 1
+                if usable is not None and emitted > usable:
+                    return
+                yield {
+                    "input_ids": torch.tensor(ids, dtype=torch.long),
+                    "attention_mask": torch.ones(self.max_length, dtype=torch.long),
+                    "document_ids": torch.tensor(document_ids, dtype=torch.long),
+                }
+
+    def __iter__(self):
+        # Shard after packing so tokenization waste cannot make rank-dependent
+        # sequence boundaries. Workers then partition that rank's complete
+        # share without changing its total length.
+        yield from _worker_shard(_round_robin_rank_shard(self._packed()))
+
+
+class RankSharded(IterableDataset):
+    """Fixed-order rank/worker shard for validation streams."""
+
+    def __init__(self, ds, size: int | None = None):
+        self.ds = ds
+        self.size = size
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.ds, "set_epoch"):
+            self.ds.set_epoch(epoch)
+
+    def __len__(self):
+        if self.size is None:
+            raise TypeError("unbounded stream has no length")
+        _, world_size = _rank_and_world()
+        return self.size // world_size
+
+    def __iter__(self):
+        yield from _worker_shard(_round_robin_rank_shard(self.ds))
 
 
 def quiet_download_logs():
@@ -84,9 +222,8 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     Repeating the stream (multi-epoch training): every new Trainer epoch
     re-opens the stream, and ``ReshuffleStreamingData`` (src/train.py) calls
     ``set_epoch`` so the sample ORDER differs between repetitions. The
-    val/train split is taken BEFORE the shuffle on purpose: membership of the
-    validation slice must not depend on the epoch, otherwise reshuffling
-    would leak validation samples into training (see ``EpochShuffled``).
+    Validation is a separate deterministic read, so it does not reduce the
+    fixed raw-example training sample used by the paper recipe.
 
     Batch contract (what the models consume): ``input_ids [B, T]`` +
     ``attention_mask [B, T]``. The ``[B, T, V]`` simplex is built on-device
@@ -95,8 +232,18 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     from datasets import interleave_datasets, load_dataset
 
     d = cfg.data
+    load_kwargs = {"streaming": d.get("streaming", True)}
+    if d.get("revision") is not None:
+        load_kwargs["revision"] = d.revision
+    if d.get("data_files") is not None:
+        from omegaconf import OmegaConf
+
+        load_kwargs["data_files"] = OmegaConf.to_container(
+            d.data_files, resolve=True
+        ) if OmegaConf.is_config(d.data_files) else d.data_files
+    subset = d.get("subset", None)
     streams = [
-        load_dataset(d.dataset, split=split, streaming=d.get("streaming", True))
+        load_dataset(d.dataset, subset, split=split, **load_kwargs)
         for split in d.splits
     ]
     ds = streams[0] if len(streams) == 1 else interleave_datasets(streams)
@@ -115,12 +262,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     def render(example) -> str:
         messages = extract_messages(example)
         if use_template:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False,
+            template_kwargs = {
+                "tokenize": False,
                 # bare-prompt rows: end with the assistant header so the
                 # continuation starts where inference would
-                add_generation_prompt="messages" not in example,
-            )
+                "add_generation_prompt": "messages" not in example,
+            }
+            if d.get("enable_thinking") is not None:
+                template_kwargs["enable_thinking"] = d.enable_thinking
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
         return "\n".join(m["content"] for m in messages)
 
     def collate(examples):
@@ -129,29 +279,69 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
             return_simplex=False,
             truncation=True,
             max_length=d.max_length,
+            # Fixed shapes avoid a new FlexAttention compilation whenever a
+            # one-example validation batch has a different rendered length.
+            padding="max_length" if d.get("pad_to_max_length", False) else True,
             # the chat template already carries BOS & co — adding them again
             # would double <|begin_of_text|> and shift every position
             add_special_tokens=not use_template,
         )
         return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
 
-    def make_loader(split_ds):
+    def make_loader(split_ds, *, packed=False):
         return DataLoader(
             split_ds,
             batch_size=d.batch_size,
-            collate_fn=collate,
+            collate_fn=None if packed else collate,
             num_workers=d.get("num_workers", 0),
         )
 
     val_size = d.get("val_size", 256)
-    train_ds = ds.skip(val_size)
+    # Validation is a separate read of the source stream. It must not consume
+    # rows from the paper-faithful 600K-example training sample.
+    val_ds = RankSharded(ds.take(val_size), size=val_size) if val_size else None
+    train_ds = ds
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
     # whole stream: repetitions then draw fresh samples in a fresh order.
     train_size = d.get("train_size", None)
+    pack_sequences = d.get("pack_sequences", False)
+    if pack_sequences and not train_size:
+        raise ValueError(
+            "packed training needs a finite data.train_size so the packing "
+            "preflight can derive the cosine schedule horizon"
+        )
     if train_size:
         train_ds = train_ds.take(train_size)
-    train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000),
-                             size=train_size)
-    return make_loader(train_ds), make_loader(ds.take(val_size))
+    # Packed mode shards after packing; sharding here as well would leave each
+    # rank with only 1/world_size**2 of the intended stream.
+    train_ds = EpochShuffled(
+        train_ds,
+        seed=cfg.seed,
+        buffer_size=d.get("shuffle_buffer", 1000),
+        size=train_size,
+        shard_by_rank=not pack_sequences,
+    )
+
+    if pack_sequences:
+        def tokenize_for_pack(example):
+            text = render(example)
+            ids = tokenizer(
+                text,
+                add_special_tokens=not use_template,
+                truncation=False,
+            )["input_ids"]
+            # Keep separate conversations from becoming one synthetic turn.
+            if tokenizer.eos_token_id is not None:
+                ids.append(tokenizer.eos_token_id)
+            return ids
+
+        # The finite 600K-source stream controls when an epoch ends. Do not
+        # make a second full streaming/tokenization pass just to count its
+        # packed output; the paper-reported optimizer horizon lives in the
+        # baseline preset instead.
+        train_ds = PackedTokenStream(train_ds, tokenize_for_pack, max_length=d.max_length)
+    return make_loader(train_ds, packed=pack_sequences), (
+        make_loader(val_ds) if val_ds is not None else None
+    )

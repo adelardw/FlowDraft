@@ -1,0 +1,44 @@
+# @package _global_
+# Paper-faithful Orthrus baseline: frozen Qwen3-1.7B AR backbone plus
+# trainable Q/K/V diffusion projections. Each packed 2048-token sequence
+# contributes 256 independently anchored, 32-token masked blocks.
+#   uv run python src/train.py +experiment=orthrus
+defaults:
+  - override /model: qwen3_1.7b
+
+# own dir + filename: runs of different presets never overwrite each other's
+# checkpoints (incl. last.ckpt) or TensorBoard logs
+output_dir: checkpoints/orthrus
+
+train:
+  variant: orthrus
+  block_size: 8
+  anchors_per_sequence: 256
+  # Packed documents remain visible to the AR teacher, but no masked draft
+  # span may cross the EOS boundary into a different source example.
+  respect_document_boundaries: true
+  lr: 2e-4
+  warmup_ratio: 0.05
+  early_stop_patience: 0
+  checkpoint_name: orthrus-{step:07d}
+  # Decode metrics are computed over consecutive validation prompts. 16 is
+  # stable enough for checkpoint selection without making validation dominant.
+  val_decode_prompts: 16
+
+data:
+  splits: [chat, math, code]
+  pack_sequences: true
+  pad_to_max_length: true
+  train_size: 600000
+  batch_size: 1
+  max_length: 2048
+
+trainer:
+  # Paper: 8 devices x local batch 1 x accumulation 16 = global batch 128.
+  # On fewer GPUs, increase accumulation to preserve that product.
+  max_epochs: 2
+  # 471,952 naturally packed sequences over two epochs at global batch 128
+  # yields ceil(471952 / 128) * 2 = 7,376 optimizer updates. This is only the
+  # cosine horizon; the loader itself ends epochs by exhausting 600K raw rows.
+  max_steps: 7376
+  accumulate_grad_batches: 128

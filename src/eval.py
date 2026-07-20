@@ -42,13 +42,15 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
         eos_token_id=eos_token_id, **sampling,
     )
     n_tokens = len(fd["new_tokens"])
-    assert fd["acceptance"], "generation ran zero cycles — check max_new_tokens"
     bitwise_applicable = temperature == 0 or coupled
     return {
         "lossless": fd["new_tokens"] == ar["new_tokens"] if bitwise_applicable else None,
         # HEADLINE metrics — hardware/kernel independent:
         # drafted tokens accepted per cycle (what the whole project optimizes)
-        "acceptance": sum(fd["acceptance"]) / len(fd["acceptance"]),
+        "acceptance": (
+            sum(fd["acceptance"]) / len(fd["acceptance"])
+            if fd["acceptance"] else 0.0
+        ),
         # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
@@ -150,7 +152,7 @@ def dataset_prompts(model, cfg):
                 label = f"sample {taken}"
             yield label, prompt
             taken += 1
-            if taken >= n_prompts:
+            if n_prompts is not None and taken >= n_prompts:
                 return
 
 
@@ -177,10 +179,13 @@ def main(cfg: DictConfig) -> None:
             top_k=dec.get("top_k", None),
             top_p=dec.get("top_p", None),
             coupled=dec.get("coupled", True),
+            eos_token_id=model.tokenizer.eos_token_id,
         )
         logger.info(f"{label!r}: {metrics}")
         results.append(metrics)
 
+    if not results:
+        raise RuntimeError(f"benchmark {cfg.data.dataset!r} produced no usable prompts")
     summary = aggregate(results)
     logger.info(
         f"=== block_size={dec.block_size} jumps={dec.jumps} "
@@ -197,9 +202,9 @@ def main(cfg: DictConfig) -> None:
         from hydra.utils import to_absolute_path
 
         row = {
-            "variant": cfg.get("variant", "fixed"),
+            "variant": cfg.get("variant", "flowdraft"),
             "model": cfg.model.name,
-            "dataset": cfg.data.dataset,
+            "dataset": cfg.data.get("benchmark", cfg.data.dataset),
             "checkpoint": cfg.checkpoint,
             "block_size": dec.block_size,
             "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),

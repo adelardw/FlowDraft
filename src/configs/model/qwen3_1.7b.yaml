@@ -1,0 +1,35 @@
+# Default backbone for both FlowDraft and the Orthrus baseline. Qwen3 exposes
+# the same attention projection names as Qwen2, while its Q/K norms are named
+# ``q_norm`` / ``k_norm``.
+name: Qwen/Qwen3-1.7B
+
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  # Cached AR teacher/verifier calls use PyTorch SDPA, which dispatches its
+  # fused Flash/cuDNN kernel on H100 and supports DynamicCache reliably.
+  # The paper baseline's custom sparse DF mask remains routed through
+  # FlexAttention's FLASH backend, which lowers to FA4.
+  attn_implementation: sdpa
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false
+  # Opt-in: compile only the fixed-shape frozen AR teacher. Generation,
+  # verification and the DF functional_call path remain eager.
+  compile_ar: false
+  compile_mode: default
+  compile_dynamic: false
+
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right
+  trust_remote_code: false
+
+adapter:
+  # Official Orthrus maintains a full separate diffusion attention path:
+  # Q/K/V/O projections plus the per-head Q/K normalization weights.
+  w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]

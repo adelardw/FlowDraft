@@ -2,13 +2,13 @@ import torch
 import torch.nn.functional as F
 from transformers import DynamicCache
 
-from src.models.lit_orthrus import FlowMapOrthrus
+from src.models.flowdraft import FlowDraft
 
 
-class FlowMapOrthrusBlockWise(FlowMapOrthrus):
+class FlowDraftBlockWise(FlowDraft):
     """Block-wise training: the INFERENCE geometry reproduced at train time.
 
-    The fixed variant (``FlowMapOrthrus``) noises the whole sequence and runs
+    The full-sequence variant (``FlowDraft``) noises the whole sequence and runs
     the DF path without a cache — a configuration the drafter never sees at
     decode time. Here every step looks exactly like one decode cycle:
 
@@ -23,7 +23,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
       3. every DF forward of the loss (draft, anchor, EC expert, TD) runs
          WITH the cache AND the clean anchor at in-block position 0 — the
          drafter trains in the exact configuration it decodes in. All
-         ``[B, T, V]`` tensors of the fixed variant shrink to ``[B, K, V]``.
+         ``[B, T, V]`` tensors of the full-sequence variant shrink to ``[B, K, V]``.
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
     ``train.block_size`` (K) and ``train.min_prefix``.
@@ -72,7 +72,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         ctx_mask = mask[:, : p + 1 + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
-        with torch.no_grad():
+        with torch.no_grad(), self._teacher_eval():
             teacher_full = self.orthrus(ids[:, : p + 1 + block], ctx_mask, past_key_values=cache).logits
         # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
         # K/V are NOT in the cache while drafting. The AR logits at
@@ -91,12 +91,12 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
         x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
         draft_logits = self._df_forward(x_s, anchor, ctx_mask, cache, s, t)
-        return teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor
+        return teacher_logits, draft_logits, x_s, x_t, x1, s, t, ctx_mask, block_mask, cache, anchor
 
-    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor):
+    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, x1, s, t, ctx_mask, block_mask, cache, anchor):
         """The parent's three terms in block geometry.
 
-        Differences from the fixed variant: no one-position shift (teacher
+        Differences from the full-sequence variant: no one-position shift (teacher
         is pre-aligned in ``_shared_step``), the live mask is the block's
         own, and every DF forward carries the clean-prefix cache AND the
         clean in-block anchor (via :meth:`_df_forward`).
@@ -116,19 +116,28 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         x_jump = x_s + gamma * (pi - x_s)
         x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
 
-        # --- anchor: p_AR certifies the diagonal (see the parent for the
-        # trajectory-vs-landing discussion; same knob).
-        #   trajectory — KL input: π_{t,t}(x_t),          KL target: sg(p_AR(·|prefix, x1_{<i}))
-        #   landing    — KL input: π_{t,t}(X_{s,t}(x_s)), KL target: sg(p_AR(·|prefix, x1_{<i}))
+        # --- categorical VFM endpoint likelihood on the diagonal. The
+        # trajectory setting is paper-faithful; landing remains experimental.
         anchor_point = self.cfg.train.get("anchor_point", "trajectory")
         anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
         if anchor_input is None:
             raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
         diag_logits = self._df_forward(anchor_input, anchor, ctx_mask, cache, s=t, t=t)
-        anchor_loss = self._masked_kl(
-            F.log_softmax(teacher_logits.float(), -1),
-            F.log_softmax(diag_logits.float(), -1),
-            live,
+        endpoint_nll = F.cross_entropy(
+            diag_logits.float().transpose(1, 2),
+            x1.argmax(-1),
+            reduction="none",
+        )
+        endpoint = endpoint_nll[live].mean()
+        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
+        ar_kl = (
+            self._masked_kl(
+                F.log_softmax(teacher_logits.float(), -1),
+                F.log_softmax(diag_logits.float(), -1),
+                live,
+            )
+            if ar_kl_weight
+            else diag_logits.sum() * 0.0
         )
 
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
@@ -142,35 +151,55 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
                 ).float().softmax(-1)
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
-        # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
-        # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
-        # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
-        dt_val = 0.05
-        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
-        pi_dt = self._df_forward(x_s, anchor, ctx_mask, cache, s=s, t=t + dt).float().softmax(-1)
-        drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
-        td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
+        td = self._td_term(
+            pi,
+            gamma,
+            s,
+            t,
+            live,
+            forward_dt=lambda dt: self._df_forward(
+                x_s, anchor, ctx_mask, cache, s=s, t=t + dt
+            ),
+        )
 
         lam = self._lambda()
-        aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
-        loss = aw * anchor_loss + lam * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td, "loss/lambda": lam})
+        endpoint_weight = self.cfg.train.get(
+            "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
+        )
+        loss = (
+            endpoint_weight * endpoint
+            + ar_kl_weight * ar_kl
+            + lam * (4.0 * ec + 2.0 * td)
+        )
+        self.log_dict(
+            {
+                "loss/endpoint": endpoint,
+                "loss/ar_kl": ar_kl,
+                "loss/ec": ec,
+                "loss/td": td,
+                "loss/lambda": lam,
+            },
+            sync_dist=True,
+        )
         return loss
 
     def training_step(self, batch, batch_idx):
         loss = self.compute_loss(*self._shared_step(batch))
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, *rest = self._shared_step(batch)
-        loss = self.compute_loss(teacher_logits, draft_logits, *rest)
-        block_mask = rest[-3]
-        # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
-        agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[block_mask.bool()]
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/teacher_agreement", agree.float().mean())
-        self._maybe_decode_val(batch, batch_idx)
+        with self._frozen_val_rng(batch_idx):
+            teacher_logits, draft_logits, *rest = self._shared_step(batch)
+            loss = self.compute_loss(teacher_logits, draft_logits, *rest)
+            block_mask = rest[-3]
+            # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
+            agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[
+                block_mask.bool()
+            ]
+            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+            self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+            self._maybe_decode_val(batch, batch_idx)
         return loss

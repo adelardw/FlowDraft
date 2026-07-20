@@ -1,0 +1,14 @@
+# @package _global_
+# Paper-comparable deterministic efficiency protocol. Run once per checkpoint:
+#   ... data=gsm8k,math500,aime24,aime25,humaneval,mbpp
+decode:
+  block_size: 32
+  jumps: 1
+  max_new_tokens: 2048
+  n_prompts: null
+  prompt_len: null
+  temperature: 0.0
+  top_k: null
+  top_p: null
+  coupled: true
+  equiv_samples: 0

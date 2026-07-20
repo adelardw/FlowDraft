@@ -1,27 +1,39 @@
 # Entrypoint config for src/train.py  →  @hydra.main(config_name="train")
 # Compose: `uv run python src/train.py`
-# Override:  `uv run python src/train.py model=llama3_3b seed=0`
+# Override:  `uv run python src/train.py model=qwen2_0.5b seed=0`
 
 defaults:
-  - model: llama3_3b
+  - model: qwen3_1.7b
   - data: nemotron  # training distribution (см. configs/data/)
   - _self_          # keep last so values below override the groups above
 
 seed: 42
 output_dir: checkpoints     # artifacts live at project root, gitignored
+# Lightning resume checkpoint. Unlike evaluation's `checkpoint`, this restores
+# model, AdamW, scheduler, global step, and callback state.
+resume_from_checkpoint: null
 
-# --- training (OrthrusLitModule.configure_optimizers) ---
+# TensorBoard is always written locally. Enable W&B to mirror the same
+# Lightning metrics; authenticate with `uv run wandb login` or WANDB_API_KEY.
+wandb:
+  enabled: false
+  project: flowdraft
+  entity: null              # W&B team/user; null uses the CLI/env default
+  name: null                # run display name; null lets W&B generate one
+  group: null               # optional experiment/ablation group
+  tags: []
+  offline: false            # true writes a local run for a later `wandb sync`
+
+# --- training (FlowDraft.configure_optimizers) ---
 train:
-  variant: fixed            # TASK variants (full-sequence, per the project task):
-                            #   fixed (flow-map drafter, lit_orthrus)
-                            #   | baseline (Orthrus masked drafter)
-                            # ADDITION beyond the task (the inference geometry):
-                            #   block_wise (clean AR prefix in KV + noisy K-block)
-                            #   | baseline_block_wise (masked drafter, block-causal)
+  variant: flowdraft        # Canonical variants:
+                            #   flowdraft | flowdraft_block_wise
+                            #   orthrus | orthrus_block_wise
                             # Presets (see configs/experiment/):
-                            #   task stages — `+experiment=baseline|flowmap_staged|ablate_*`
-                            #   addition     — `+experiment=baseline_block_wise|flowmap_block_wise`
-  block_size: 64            # K — block-wise only
+                            #   `+experiment=flowdraft_staged|orthrus|ablate_*`
+                            #   `+experiment=flowdraft_block_wise|orthrus_block_wise`
+  block_size: 64            # K — block-wise variants; paper baseline overrides to 32
+  anchors_per_sequence: 1   # paper baseline overrides this to 256
   min_prefix: 1             # block-wise only: shortest clean prefix
   lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)
   lr_schedule: cosine       # cosine (linear warmup -> cosine decay to 0, needs a finite
@@ -29,15 +41,19 @@ train:
   warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  time_sampling: triangle   # triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1]) | paper (t~U, s~U[0,t])
-  lambda: 1.0               # weight of the ECLD part: loss = anchor_weight*anchor + lambda*(4*EC + 2*TD)
-  anchor_weight: 1.0        # 0 = ablate the AR-teacher term (consistency-only run)
-  lambda_ramp_steps: 0      # staged dual distillation: ramp lambda 0 -> lambda over N steps
-                            #   (teacher-matching first, consistency second); 0 = static
+  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1])
+  lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
+  endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
+  ar_kl_weight: 0.0         # optional verifier-alignment auxiliary; 0 keeps the CFM objective paper-faithful
+  lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
+                            #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
-  anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
+  anchor_point: trajectory  # where endpoint inference evaluates the diagonal pi_{t,t}:
                             #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
-  checkpoint_every_n_steps: 1000
+  checkpoint_every_n_steps: 1000  # unconditional recovery snapshots; optimizer steps, not batches
+  checkpoint_save_top_k: 2        # number of best validation-metric checkpoints to retain
+  best_checkpoint_name: best-tpf-{step:07d}
+  final_checkpoint_name: last.ckpt  # always overwritten with the true terminal state
   # Target-metric validation: run the real decode loop (single-jump) on a few
   # val prompts each validation -> val/tpf & val/acceptance_decode curves.
   val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy
@@ -50,6 +66,7 @@ train:
 trainer:
   accelerator: auto
   devices: auto
+  strategy: auto             # auto selects DDP when multiple GPU devices are requested
   precision: bf16-mixed
   max_steps: 10000            # -1 = no step bound (then bound by max_epochs)
   max_epochs: null            # repetitions of the stream; see "Повторение потока" in README

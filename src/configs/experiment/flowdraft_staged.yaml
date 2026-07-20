@@ -1,0 +1,16 @@
+# @package _global_
+# Task stages 2-3: the Categorical Flow Map drafter with staged training —
+# diagonal endpoint inference first (lambda ramps from 0), consistency second.
+# Same Qwen3-1.7B backbone and full-sequence geometry as the baseline.
+# The inference-geometry retrain is a separate ADDITION preset:
+# +experiment=flowdraft_block_wise.
+#   uv run python src/train.py +experiment=flowdraft_staged
+defaults:
+  - override /model: qwen3_1.7b
+
+output_dir: checkpoints/flowdraft-staged
+
+train:
+  variant: flowdraft
+  lambda_ramp_steps: 2000
+  checkpoint_name: flowdraft-staged-{step:07d}

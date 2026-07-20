@@ -1,0 +1,12 @@
+# Orthrus quality/efficiency benchmark: Mostly Basic Python Problems.
+benchmark: mbpp
+dataset: google-research-datasets/mbpp
+subset: sanitized
+splits: [test]
+text_field: prompt
+streaming: true
+enable_thinking: false
+val_size: 257
+batch_size: 4
+max_length: 2048
+num_workers: 0
