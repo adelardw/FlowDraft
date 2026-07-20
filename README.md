@@ -414,6 +414,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.variant` | `flowdraft` | which drafter to train: the task — `flowdraft` \| `orthrus` (full-sequence); the addition — `flowdraft_block_wise` \| `orthrus_block_wise` (inference geometry) |
 | `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
+| `train.respect_document_boundaries` | true | packed FlowDraft isolates bidirectional DF attention and prevents blocks/loss transitions from crossing source documents |
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
 | `train.lr_schedule` | `cosine` | `cosine` (linear warmup → cosine decay to 0; needs a finite `trainer.max_steps` or `limit_train_batches`+`max_epochs`) \| `constant` |
 | `train.warmup_ratio` | 0.05 | cosine only: fraction of total steps spent warming up |
@@ -441,10 +442,14 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `checkpoint_config` | true | restore the saved backbone/tokenizer/adapter config, train parameters, and variant |
 | `variant` | null | inferred from checkpoint; without a checkpoint null selects `flowdraft` |
 | `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
+| `per_prompt_file` | `results/eval-prompts.jsonl` | prompt-level metrics and first-divergence diagnostics |
+| `run_id` / `experiment_id` / `split_label` | null | optional result attribution; `experiment_id` can be shared across training seeds |
+| `lossless_policy` | `assert` | canonical eager runs assert; separate SDPA throughput audits use `diagnose` |
 | `data.truncation` | false | evaluate the complete rendered dataset sample; dataset `max_length` limits remain active during training |
 | `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `flowdraft_block_wise` training variant (see the plain-words guide below) |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
 | `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
+| `decode.prompt_offset` | 0 | skip N usable prompts for reproducible disjoint development/test slices |
 | `decode.prompt_len` | null | null = the full rendered prompt; int N = first N tokens only |
 | `decode.temperature` / `top_k` / `top_p` | 0 / null / null | 0 = greedy; >0 = sampling |
 | `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
@@ -472,6 +477,8 @@ overwrite each other:
 | `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
 | `orthrus_block_wise` (addition) | `variant=orthrus_block_wise` | `checkpoints/orthrus-block-wise/orthrus-block-wise-*.ckpt` |
 | `flowdraft_block_wise` (addition) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
+| `flowdraft_packed_full` | boundary-aware packed-2048 full-sequence FlowDraft | `checkpoints/flowdraft-packed-full/` |
+| `flowdraft_packed_blockwise` | boundary-aware packed-2048 inference-geometry FlowDraft | `checkpoints/flowdraft-packed-blockwise/` |
 
 Your own experiment (e.g. the `anchor_point` study) — override name and dir
 so it gets its own shelf too:
@@ -524,7 +531,9 @@ how fast. The verifier has the final word on every token.
 Dataset prompts (complete rendered samples by default; `decode.prompt_len=N`
 for explicit N-token prefixes) are decoded twice — flow-draft vs plain AR —
 and compared. Dataset `max_length` limits apply to training, not standalone
-evaluation. Greedy losslessness is asserted **bitwise**, not assumed.
+evaluation. Canonical evaluation uses eager attention and asserts greedy
+losslessness **bitwise**, not by assumption. SDPA throughput audits should use
+`lossless_policy=diagnose` and separate result files.
 
 When `checkpoint` is set, evaluation resolves the path from the original
 working directory, restores the saved model architecture and variant, and
@@ -544,7 +553,7 @@ Main metrics (mean ± std over `n_prompts`): **acceptance** per cycle and
 **TPF** (tokens per forward; cycle = `jumps+1`). Wall-clock tokens/s and
 speedup vs AR are reported as diagnostics (hardware/kernel dependent). The
 attention kernel is a config switch (`model.backbone.attn_implementation`):
-`sdpa` (default; fused, supports the DF mask — verified against eager) |
+`eager` (canonical evaluation default) | `sdpa` (fused throughput audit) |
 `flex_attention` (compiled block masks, GPU only) | `eager` (reference).
 **Continuation NLL** under the frozen teacher is computed in sampling mode
 only (at greedy the output is bitwise equal to AR, so it measures nothing).

@@ -29,7 +29,7 @@ class FlowDraftBlockWise(FlowDraft):
     ``train.block_size`` (K) and ``train.min_prefix``.
     """
 
-    def _split_point(self, attention_mask, block: int) -> int:
+    def _split_point(self, attention_mask, block: int, document_ids=None) -> int:
         """Sample the split from the TRUE lengths, not the padded width.
 
         With right-padding, sampling from ``ids.size(1)`` can drop the whole
@@ -38,7 +38,36 @@ class FlowDraftBlockWise(FlowDraft):
         too short the split clamps to ``min_prefix`` and the per-position
         live mask (plus the empty-block guard in the loss) absorbs the rest.
         """
-        min_prefix = self.cfg.train.get("min_prefix", 1)
+        min_prefix = int(self.cfg.train.get("min_prefix", 1))
+        respect = bool(self.cfg.train.get("respect_document_boundaries", True))
+        if document_ids is not None and respect:
+            if document_ids.shape != attention_mask.shape:
+                raise ValueError("document_ids must have the same shape as attention_mask")
+            if attention_mask.size(1) < block + 1:
+                raise ValueError("no packed document contains anchor + requested block")
+            live_windows = attention_mask.bool().unfold(1, block + 1, 1).all(-1)
+            doc_windows = document_ids.unfold(1, block + 1, 1)
+            same_document = (doc_windows == doc_windows[..., :1]).all(-1)
+
+            width = attention_mask.size(1)
+            index = torch.arange(width, device=attention_mask.device)[None]
+            boundary = torch.ones_like(attention_mask, dtype=torch.bool)
+            boundary[:, 1:] = document_ids[:, 1:] != document_ids[:, :-1]
+            starts = torch.where(boundary, index, torch.zeros_like(index))
+            document_position = index - starts.cummax(dim=1).values
+            valid = live_windows & same_document & (
+                document_position[:, : live_windows.size(1)] >= min_prefix
+            )
+            candidates = torch.nonzero(valid.all(0), as_tuple=False).flatten()
+            if candidates.numel() == 0:
+                raise ValueError(
+                    "no packed document has the configured min_prefix plus block_size"
+                )
+            choice = torch.randint(
+                candidates.numel(), (1,), device=attention_mask.device
+            )
+            return int(candidates[choice])
+
         true_min = int(attention_mask.sum(dim=1).min())
         # the window is anchor + K fresh tokens: p + 1 + K must fit
         high = max(min_prefix + 1, true_min - block)
@@ -62,23 +91,43 @@ class FlowDraftBlockWise(FlowDraft):
         slices get clipped by the tensor edge to DIFFERENT lengths.
         """
         ids, mask = batch["input_ids"], batch["attention_mask"]
-        block = self.cfg.train.get("block_size", 64)
-        p = self._split_point(mask, block)
+        document_ids = batch.get("document_ids")
+        block = int(self.cfg.train.get("block_size", 64))
+        p = self._split_point(mask, block, document_ids)
         width = ids.size(1)
         if width < 3:
             raise ValueError("cannot train on width<3 batches: prefix + anchor + block needed")
         p = min(p, width - 2)
         block = min(block, width - p - 1)
-        ctx_mask = mask[:, : p + 1 + block]
+        doc_start = 0
+        if document_ids is not None and bool(
+            self.cfg.train.get("respect_document_boundaries", True)
+        ):
+            if ids.size(0) != 1:
+                raise ValueError(
+                    "boundary-aware packed block-wise training requires data.batch_size=1"
+                )
+            anchor_document = document_ids[0, p]
+            starts = torch.nonzero(
+                document_ids[0, : p + 1] != anchor_document, as_tuple=False
+            ).flatten()
+            doc_start = int(starts[-1] + 1) if starts.numel() else 0
+
+        local_p = p - doc_start
+        ctx_mask = mask[:, doc_start : p + 1 + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad(), self._teacher_eval():
-            teacher_full = self.orthrus(ids[:, : p + 1 + block], ctx_mask, past_key_values=cache).logits
+            teacher_full = self.orthrus(
+                ids[:, doc_start : p + 1 + block],
+                ctx_mask,
+                past_key_values=cache,
+            ).logits
         # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
         # K/V are NOT in the cache while drafting. The AR logits at
         # [p : p+K] are the distributions of the fresh tokens p+1..p+K.
-        cache.crop(p)
-        teacher_logits = teacher_full[:, p : p + block]
+        cache.crop(local_p)
+        teacher_logits = teacher_full[:, local_p : local_p + block]
 
         # position p — the clean in-block anchor; p+1..p+K — the drafted block
         anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])

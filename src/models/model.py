@@ -27,9 +27,14 @@ def build_model(cfg: DictConfig):
     compile_ar = backbone_kwargs.pop("compile_ar", False)
     compile_mode = backbone_kwargs.pop("compile_mode", "default")
     compile_dynamic = backbone_kwargs.pop("compile_dynamic", False)
+    gradient_checkpointing = backbone_kwargs.pop("gradient_checkpointing", False)
     tokenizer_kwargs = OmegaConf.to_container(cfg.tokenizer, resolve=True)
 
     backbone = AutoModelForCausalLM.from_pretrained(**backbone_kwargs)
+    if gradient_checkpointing:
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     tokenizer = AutoTokenizer.from_pretrained(**tokenizer_kwargs)
     if tokenizer.pad_token is None:
         # Llama-family tokenizers ship without a pad token, while

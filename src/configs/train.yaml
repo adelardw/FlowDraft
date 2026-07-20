@@ -35,6 +35,7 @@ train:
   block_size: 64            # K — block-wise variants; paper baseline overrides to 32
   anchors_per_sequence: 1   # paper baseline overrides this to 256
   min_prefix: 1             # block-wise only: shortest clean prefix
+  respect_document_boundaries: true  # packed training: isolate DF documents / reject crossing blocks
   lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)
   lr_schedule: cosine       # cosine (linear warmup -> cosine decay to 0, needs a finite
                             #   trainer.max_steps or limit_train_batches+max_epochs) | constant
