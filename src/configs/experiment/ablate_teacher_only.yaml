@@ -3,7 +3,7 @@
 # Expectation: the diagonal learns, jumps get no training signal.
 #   uv run python src/train.py +experiment=ablate_teacher_only
 defaults:
-  - override /model: qwen2_0.5b
+  - override /model: qwen3_1.7b
 
 output_dir: checkpoints/ablate-endpoint
 

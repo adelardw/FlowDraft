@@ -21,7 +21,7 @@ def generate(
     max_new_tokens: int = typer.Option(64),
     model_cfg: str = typer.Option(
         None, "--model",
-        help="Model config name (llama3_3b | qwen2_0.5b) or an HF id with '/'.",
+        help="Model config name (qwen3_1.7b | qwen2_0.5b | llama3_3b) or an HF id with '/'.",
     ),
     variant: str = typer.Option(
         "flowdraft",
@@ -43,7 +43,7 @@ def generate(
     if checkpoint:
         overrides.append(f"checkpoint={checkpoint}")
     if model_cfg:
-        # config-group name (qwen2_0.5b) or a raw HF id (org/name)
+        # Config-group name (qwen3_1.7b) or a raw HF id (org/name).
         overrides.append(f"model.name={model_cfg}" if "/" in model_cfg else f"model={model_cfg}")
     with hydra.initialize(version_base="1.3", config_path="src/configs"):
         cfg = hydra.compose(config_name="eval", overrides=overrides)

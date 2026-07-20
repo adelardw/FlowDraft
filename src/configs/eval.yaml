@@ -1,6 +1,6 @@
 
 defaults:
-  - model: llama3_3b
+  - model: qwen3_1.7b
   - data: math500   # default: a dataset NEVER SEEN in training; data=nemotron -> training distribution
   - _self_
 

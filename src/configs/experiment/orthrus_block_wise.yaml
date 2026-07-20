@@ -6,7 +6,7 @@
 # a geometry-for-geometry comparison.
 #   uv run python src/train.py +experiment=orthrus_block_wise
 defaults:
-  - override /model: qwen2_0.5b
+  - override /model: qwen3_1.7b
 
 output_dir: checkpoints/orthrus-block-wise
 

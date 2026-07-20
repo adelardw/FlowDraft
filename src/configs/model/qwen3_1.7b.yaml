@@ -1,5 +1,6 @@
-# Orthrus paper backbone scale.  Qwen3 exposes the same attention projection
-# names as Qwen2, while its Q/K norms are named ``q_norm`` / ``k_norm``.
+# Default backbone for both FlowDraft and the Orthrus baseline. Qwen3 exposes
+# the same attention projection names as Qwen2, while its Q/K norms are named
+# ``q_norm`` / ``k_norm``.
 name: Qwen/Qwen3-1.7B
 
 backbone:

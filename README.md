@@ -143,8 +143,8 @@ The command summary:
 ./hf-auth.sh uv run python src/train.py +experiment=flowdraft_staged
 
 # Stage 4 — lossless at sampling: coupled = bitwise; uncoupled = null-calibrated TV test
-./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8
-./hf-auth.sh uv run python src/eval.py model=qwen2_0.5b checkpoint=<ckpt> decode.temperature=0.8 \
+./hf-auth.sh uv run python src/eval.py model=qwen3_1.7b checkpoint=<ckpt> decode.temperature=0.8
+./hf-auth.sh uv run python src/eval.py model=qwen3_1.7b checkpoint=<ckpt> decode.temperature=0.8 \
     decode.coupled=false decode.equiv_samples=500
 
 # Stage 5 (ablations) — the contribution of each distillation term
@@ -157,7 +157,7 @@ The command summary:
 #           NOTE: decode.block_size = K, the number of tokens drafted per cycle at
 #           INFERENCE — a knob of EVERY variant; it is unrelated to the
 #           flowdraft_block_wise TRAINING-geometry variant despite the similar name
-./hf-auth.sh uv run python src/eval.py -m model=qwen2_0.5b variant=flowdraft checkpoint=<ckpt> \
+./hf-auth.sh uv run python src/eval.py -m model=qwen3_1.7b variant=flowdraft checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
 uv run python src/plots.py
 
@@ -278,7 +278,7 @@ FlowDraft/
     ├── configs/                   # hydra configs
     │   ├── train.yaml             # training entrypoint config
     │   ├── eval.yaml              # evaluation entrypoint config
-    │   ├── model/                 # llama3_3b (default) | qwen2_0.5b (the task's 0.5B)
+    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | llama3_3b
     │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
     │   └── experiment/            # one preset per task stage + additions:
     │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
@@ -385,7 +385,7 @@ accumulation steps:
 
 All configs live in `src/configs/` (hydra). Any key can be overridden from the
 command line (`train.lr=3e-4`), config groups are swapped whole
-(`model=qwen2_0.5b data=nemotron`), presets are added with `+experiment=...`.
+(`model=qwen3_1.7b data=nemotron`), presets are added with `+experiment=...`.
 
 **`train.yaml` — training (`src/train.py`)**
 
@@ -431,7 +431,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
 | `decode.equiv_samples` | 0 | uncoupled only: N draws for the TV law-equivalence test; 0 = off |
 
-**`model/*` — backbone** (`llama3_3b` default, `qwen2_0.5b` — the 0.5B scale the task asks for):
+**`model/*` — backbone** (`qwen3_1.7b` default; `qwen2_0.5b` and `llama3_3b` remain available):
 `name` (HF id), `backbone.dtype`, `backbone.device_map`,
 `backbone.attn_implementation` (`sdpa` default \| `flex_attention` GPU-only \| `eager`).
 

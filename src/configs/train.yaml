@@ -1,9 +1,9 @@
 # Entrypoint config for src/train.py  →  @hydra.main(config_name="train")
 # Compose: `uv run python src/train.py`
-# Override:  `uv run python src/train.py model=llama3_3b seed=0`
+# Override:  `uv run python src/train.py model=qwen2_0.5b seed=0`
 
 defaults:
-  - model: llama3_3b
+  - model: qwen3_1.7b
   - data: nemotron  # training distribution (см. configs/data/)
   - _self_          # keep last so values below override the groups above
 
