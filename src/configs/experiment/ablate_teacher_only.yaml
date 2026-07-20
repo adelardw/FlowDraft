@@ -8,6 +8,6 @@ defaults:
 output_dir: checkpoints/ablate-endpoint
 
 train:
-  variant: fixed
+  variant: flowdraft
   lambda: 0.0
   checkpoint_name: ablate-endpoint-{step:07d}

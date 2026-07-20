@@ -5,10 +5,9 @@ defaults:
   - _self_
 
 seed: 42
-checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
+checkpoint: null            # path to a FlowDraft/Orthrus .ckpt (DF head only); null = untrained drafter
 results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
-variant: fixed              # which drafter the checkpoint was trained as:
-                            #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
+variant: flowdraft          # flowdraft | flowdraft_block_wise | orthrus | orthrus_block_wise
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
 # ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`

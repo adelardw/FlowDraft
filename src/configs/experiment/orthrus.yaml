@@ -2,16 +2,16 @@
 # Paper-faithful Orthrus baseline: frozen Qwen3-1.7B AR backbone plus
 # trainable Q/K/V diffusion projections. Each packed 2048-token sequence
 # contributes 256 independently anchored, 32-token masked blocks.
-#   uv run python src/train.py +experiment=baseline
+#   uv run python src/train.py +experiment=orthrus
 defaults:
   - override /model: qwen3_1.7b
 
 # own dir + filename: runs of different presets never overwrite each other's
 # checkpoints (incl. last.ckpt) or TensorBoard logs
-output_dir: checkpoints/baseline
+output_dir: checkpoints/orthrus
 
 train:
-  variant: baseline
+  variant: orthrus
   block_size: 8
   anchors_per_sequence: 256
   # Packed documents remain visible to the AR teacher, but no masked draft
@@ -20,7 +20,7 @@ train:
   lr: 2e-4
   warmup_ratio: 0.05
   early_stop_patience: 0
-  checkpoint_name: baseline-{step:07d}
+  checkpoint_name: orthrus-{step:07d}
   # Decode metrics are computed over consecutive validation prompts. 16 is
   # stable enough for checkpoint selection without making validation dominant.
   val_decode_prompts: 16

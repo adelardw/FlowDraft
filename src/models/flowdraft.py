@@ -10,8 +10,8 @@ from src.models.model import build_model
 from src.preprocessor import DiffusionProcessor
 from transformers import AutoTokenizer
 
-class FlowMapOrthrus(L.LightningModule):
-    """Training policy around :class:`OrthrusAttentionAdapter` (the mechanism).
+class FlowDraft(L.LightningModule):
+    """Training policy around :class:`FlowDraftAttentionAdapter` (the mechanism).
 
     This module owns everything the adapter deliberately does not:
 

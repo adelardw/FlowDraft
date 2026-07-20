@@ -3,10 +3,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import DynamicCache
 
-from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
+from src.models.flowdraft_block_wise import FlowDraftBlockWise
 
 
-class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
+class Orthrus(FlowDraftBlockWise):
     """Paper-faithful Orthrus masked-block baseline.
 
     A frozen AR pass builds the clean cache.  The diffusion pass then contains
@@ -138,7 +138,7 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
             kl = (log_teacher.exp() * (log_teacher - log_draft)).sum(-1)
             return (kl * live_chunk).sum()
 
-        chunk = int(self.cfg.train.get("kl_chunk", 4096)) 
+        chunk = int(self.cfg.train.get("kl_chunk", 4096))
         total = draft_flat.new_zeros((), dtype=torch.float32)
         for start in range(0, draft_flat.size(0), chunk):
             stop = start + chunk

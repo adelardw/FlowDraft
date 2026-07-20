@@ -9,6 +9,6 @@ defaults:
 output_dir: checkpoints/ablate-consistency
 
 train:
-  variant: fixed
+  variant: flowdraft
   endpoint_weight: 0.0
   checkpoint_name: ablate-consistency-{step:07d}

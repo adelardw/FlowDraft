@@ -1,7 +1,7 @@
 """FlowDraft playground: generate from YOUR prompts with lossless drafting.
 
     uv run python main.py -p "Once upon a time" -p "def main():"
-    uv run python main.py -p "..." --variant baseline --checkpoint path.ckpt
+    uv run python main.py -p "..." --variant orthrus --checkpoint path.ckpt
 
 Dataset evaluation with metrics lives in src/eval.py; this CLI is for
 eyeballing generations.
@@ -23,7 +23,10 @@ def generate(
         None, "--model",
         help="Model config name (llama3_3b | qwen2_0.5b) or an HF id with '/'.",
     ),
-    variant: str = typer.Option("fixed", help="fixed | block_wise | baseline | baseline_block_wise"),
+    variant: str = typer.Option(
+        "flowdraft",
+        help="flowdraft | flowdraft_block_wise | orthrus | orthrus_block_wise",
+    ),
     checkpoint: str = typer.Option(None, help="Trained DF-head .ckpt; omit for the raw drafter."),
     temperature: float = typer.Option(0.0, help="0 = greedy; >0 = sampling (coupled: bitwise lossless)."),
     top_k: int = typer.Option(None, help="Sampling only."),

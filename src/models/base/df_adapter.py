@@ -116,7 +116,7 @@ def _install_qwen3_flex_df_attention(module):
     module._flowdraft_flex_df_installed = True
 
 
-class OrthrusAttentionAdapter(nn.Module):
+class FlowDraftAttentionAdapter(nn.Module):
     """Wrap ANY HF causal LM with a frozen AR path + a trainable DF path.
 
     Orthrus weight init: every ``nn.Linear`` whose attribute name matches

@@ -24,17 +24,14 @@ wandb:
   tags: []
   offline: false            # true writes a local run for a later `wandb sync`
 
-# --- training (OrthrusLitModule.configure_optimizers) ---
+# --- training (FlowDraft.configure_optimizers) ---
 train:
-  variant: fixed            # TASK variants (full-sequence, per the project task):
-                            #   fixed (flow-map drafter, lit_orthrus)
-                            #   | baseline (Orthrus masked drafter)
-                            # ADDITION beyond the task (the inference geometry):
-                            #   block_wise (clean AR prefix in KV + noisy K-block)
-                            #   | baseline_block_wise (masked drafter, block-causal)
+  variant: flowdraft        # Canonical variants:
+                            #   flowdraft | flowdraft_block_wise
+                            #   orthrus | orthrus_block_wise
                             # Presets (see configs/experiment/):
-                            #   task stages — `+experiment=baseline|flowmap_staged|ablate_*`
-                            #   addition     — `+experiment=baseline_block_wise|flowmap_block_wise`
+                            #   `+experiment=flowdraft_staged|orthrus|ablate_*`
+                            #   `+experiment=flowdraft_block_wise|orthrus_block_wise`
   block_size: 64            # K — block-wise variants; paper baseline overrides to 32
   anchors_per_sequence: 1   # paper baseline overrides this to 256
   min_prefix: 1             # block-wise only: shortest clean prefix

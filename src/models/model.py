@@ -1,12 +1,12 @@
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.models.base.df_adapter import OrthrusAttentionAdapter
+from src.models.base.df_adapter import FlowDraftAttentionAdapter
 from src.preprocessor.df_processor import DiffusionProcessor
 
 
 def build_model(cfg: DictConfig):
-    """Build the Orthrus model: frozen AR backbone + trainable diffusion head.
+    """Build the shared FlowDraft/Orthrus backbone and diffusion head.
 
     Args:
         cfg: the `model` config node (see ``configs/model/*.yaml``) with
@@ -14,7 +14,7 @@ def build_model(cfg: DictConfig):
 
     Returns:
         ``(model, tokenizer, processor)`` where
-          - ``model`` is the backbone wrapped in :class:`OrthrusAttentionAdapter`
+          - ``model`` is the backbone wrapped in :class:`FlowDraftAttentionAdapter`
             (frozen AR path + trainable df path, routed by ``forward(use_df=...)``),
           - ``tokenizer`` is the HF tokenizer (AR path inputs),
           - ``processor`` builds the simplex/one-hot endpoints for the df path.
@@ -42,14 +42,14 @@ def build_model(cfg: DictConfig):
     backbone.eval()
 
     df_processor = DiffusionProcessor.from_model(tokenizer, backbone)
-    model = OrthrusAttentionAdapter(backbone, w_names=list(cfg.adapter.w_names))
+    model = FlowDraftAttentionAdapter(backbone, w_names=list(cfg.adapter.w_names))
     if compile_ar:
         model.enable_ar_compile(mode=compile_mode, dynamic=compile_dynamic)
 
     n_total = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
-        f"Orthrus '{cfg.name}': {n_total / 1e9:.2f}B total, "
+        f"FlowDraft '{cfg.name}': {n_total / 1e9:.2f}B total, "
         f"{n_train / 1e6:.1f}M trainable (df head over {model.n_dual} projections)"
     )
     return model, tokenizer, df_processor

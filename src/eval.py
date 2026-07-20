@@ -199,7 +199,7 @@ def main(cfg: DictConfig) -> None:
         from hydra.utils import to_absolute_path
 
         row = {
-            "variant": cfg.get("variant", "fixed"),
+            "variant": cfg.get("variant", "flowdraft"),
             "model": cfg.model.name,
             "dataset": cfg.data.dataset,
             "checkpoint": cfg.checkpoint,

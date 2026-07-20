@@ -2,14 +2,14 @@
 # ADDITION (beyond the task): the Orthrus masked baseline retrained in the
 # inference geometry — causal to the cached context, bidirectional within
 # the block, clean in-block anchor. Removes the train/decode geometry
-# mismatch of the full-sequence baseline; pair with flowmap_block_wise for
+# mismatch of the full-sequence baseline; pair with flowdraft_block_wise for
 # a geometry-for-geometry comparison.
-#   uv run python src/train.py +experiment=baseline_block_wise
+#   uv run python src/train.py +experiment=orthrus_block_wise
 defaults:
   - override /model: qwen2_0.5b
 
-output_dir: checkpoints/baseline-block-wise
+output_dir: checkpoints/orthrus-block-wise
 
 train:
-  variant: baseline_block_wise
-  checkpoint_name: baseline-block-wise-{step:07d}
+  variant: orthrus_block_wise
+  checkpoint_name: orthrus-block-wise-{step:07d}

@@ -111,7 +111,7 @@ def main(cfg: DictConfig) -> None:
     quiet_download_logs()
     L.seed_everything(cfg.seed, workers=True)
     configure_training_device_placement(cfg)
-    model = build_lit(cfg, variant=cfg.train.get("variant", "fixed"))
+    model = build_lit(cfg, variant=cfg.train.get("variant", "flowdraft"))
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
     # Checkpoint selection: val/tpf (the target metric; needs val_decode_prompts>0)

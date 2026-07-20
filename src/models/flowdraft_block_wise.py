@@ -2,13 +2,13 @@ import torch
 import torch.nn.functional as F
 from transformers import DynamicCache
 
-from src.models.lit_orthrus import FlowMapOrthrus
+from src.models.flowdraft import FlowDraft
 
 
-class FlowMapOrthrusBlockWise(FlowMapOrthrus):
+class FlowDraftBlockWise(FlowDraft):
     """Block-wise training: the INFERENCE geometry reproduced at train time.
 
-    The fixed variant (``FlowMapOrthrus``) noises the whole sequence and runs
+    The full-sequence variant (``FlowDraft``) noises the whole sequence and runs
     the DF path without a cache — a configuration the drafter never sees at
     decode time. Here every step looks exactly like one decode cycle:
 
@@ -23,7 +23,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
       3. every DF forward of the loss (draft, anchor, EC expert, TD) runs
          WITH the cache AND the clean anchor at in-block position 0 — the
          drafter trains in the exact configuration it decodes in. All
-         ``[B, T, V]`` tensors of the fixed variant shrink to ``[B, K, V]``.
+         ``[B, T, V]`` tensors of the full-sequence variant shrink to ``[B, K, V]``.
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
     ``train.block_size`` (K) and ``train.min_prefix``.
@@ -96,7 +96,7 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
     def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, x1, s, t, ctx_mask, block_mask, cache, anchor):
         """The parent's three terms in block geometry.
 
-        Differences from the fixed variant: no one-position shift (teacher
+        Differences from the full-sequence variant: no one-position shift (teacher
         is pre-aligned in ``_shared_step``), the live mask is the block's
         own, and every DF forward carries the clean-prefix cache AND the
         clean in-block anchor (via :meth:`_df_forward`).

@@ -1,10 +1,10 @@
 import torch
 import torch.nn.functional as F
 
-from src.models.lit_orthrus_block_wise import FlowMapOrthrusBlockWise
+from src.models.flowdraft_block_wise import FlowDraftBlockWise
 
 
-class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
+class OrthrusBlockWise(FlowDraftBlockWise):
     """The Orthrus baseline in the brief's BLOCK-CAUSAL geometry.
 
     Causal to the cached context, bidirectional within the block, ONE DF
@@ -70,7 +70,7 @@ class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
 
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Single-step barycenter draft — same step as the full-sequence
-        baseline (`lit_orthrus_baseline`), kept in sync by the shared tests."""
+        baseline (``orthrus``), kept in sync by the shared tests."""
         if len(times) != 2:
             raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
         vocab = self.df_processor.vocab_size
