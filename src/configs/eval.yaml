@@ -10,6 +10,13 @@ checkpoint_config: true     # restore saved model/train config and variant; fals
 results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
 variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
 
+# Evaluate the complete rendered dataset sample. Individual data configs keep
+# max_length for bounded training/validation batches, but that limit must not
+# silently shorten standalone benchmark prompts. decode.prompt_len remains the
+# explicit opt-in control for prefix-only evaluation.
+data:
+  truncation: false
+
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
 # ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
 decode:

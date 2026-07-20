@@ -274,11 +274,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         return "\n".join(m["content"] for m in messages)
 
     def collate(examples):
+        truncation = d.get("truncation", True)
         enc = df_processor(
             [render(e) for e in examples],
             return_simplex=False,
-            truncation=True,
-            max_length=d.max_length,
+            # Training keeps bounded sequence lengths. Evaluation overrides
+            # this to false so dataset prompts are not silently shortened
+            # before decode.prompt_len is applied.
+            truncation=truncation,
+            max_length=d.get("max_length") if truncation else None,
             # Fixed shapes avoid a new FlexAttention compilation whenever a
             # one-example validation batch has a different rendered length.
             padding="max_length" if d.get("pad_to_max_length", False) else True,
