@@ -332,12 +332,25 @@ Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`l
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
 curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
 `trainer.*`. Checkpoints store the DF head + its Adam moments (~5 GB for 3B;
-the frozen backbone is never written). The Russian
-section carries the full per-experiment guide.
+the frozen backbone is never written).
 
-**Resume after interruption.** `last.ckpt` is updated every 1,000 optimizer
-steps by default. Resume the full Lightning state—DF weights, AdamW, cosine
-schedule, global step, and callbacks—with:
+Checkpointing has three independent outputs:
+
+- `<train.checkpoint_name>.ckpt` is an unconditional recovery snapshot every
+  `checkpoint_every_n_steps` optimizer steps. These snapshots are all retained.
+- `best-tpf-*.ckpt` contains the best validation states selected by fresh
+  `val/tpf`; `checkpoint_save_top_k` controls how many are retained.
+- `last.ckpt` is explicitly written at normal training completion (and
+  best-effort on an exception), so it contains the terminal step even when that
+  step is not a periodic checkpoint boundary.
+
+An uncatchable process kill or a full filesystem cannot produce a final file.
+The Russian guide is maintained separately in `README.ru.md`.
+
+**Resume after interruption.** Use the newest periodic checkpoint after a hard
+interruption, or `last.ckpt` after a normal/handled termination. Resume the full
+Lightning state—DF weights, AdamW, cosine schedule, global step, and
+callbacks—with:
 
 ```bash
 ./hf-auth.sh uv run python src/train.py +experiment=orthrus \
@@ -410,7 +423,10 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
 | `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
 | `train.checkpoint_name` | `flowdraft-{step:07d}` | checkpoint filename pattern — set your own per experiment (quote on CLI: `'train.checkpoint_name="my-run-{step:07d}"'`) |
-| `train.checkpoint_every_n_steps` | 1000 | how often to checkpoint |
+| `train.checkpoint_every_n_steps` | 1000 | unconditional recovery snapshot interval in optimizer steps; all periodic snapshots are retained |
+| `train.checkpoint_save_top_k` | 2 | how many best validation-metric checkpoints to retain |
+| `train.best_checkpoint_name` | `best-tpf-{step:07d}` | filename pattern for metric-selected checkpoints |
+| `train.final_checkpoint_name` | `last.ckpt` | terminal checkpoint, written independently of the periodic interval |
 | `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | run the real decode loop on N val prompts each validation → `val/tpf`, `val/acceptance_decode`; 0 = off |
 | `train.monitor` / `monitor_mode` | `val/tpf` / `max` | which curve selects the best checkpoint |
 | `train.early_stop_patience` | 5 | stop after N validations without `val/loss` improvement; 0 = off |

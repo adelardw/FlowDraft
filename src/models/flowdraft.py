@@ -683,9 +683,49 @@ class FlowDraft(L.LightningModule):
         # validation batches. ``data.batch_size=1`` is required by the paper
         # recipe, so restricting decoding to batch zero would otherwise turn
         # any requested sample count into a single prompt.
-        self._val_decode_remaining = self.cfg.train.get("val_decode_prompts", 0)
+        self._val_decode_remaining = (
+            0 if self.trainer.sanity_checking
+            else self.cfg.train.get("val_decode_prompts", 0)
+        )
         self._val_decode_accs = []
         self._val_decode_tpfs = []
+
+    def on_validation_epoch_end(self):
+        requested = self.cfg.train.get("val_decode_prompts", 0)
+        if self.trainer.sanity_checking or requested <= 0:
+            return
+
+        # Reduce sums and counts instead of averaging rank-local means. This
+        # remains correct when the final validation shard is uneven, and all
+        # ranks participate even if one rank had no usable prompt.
+        stats = torch.tensor(
+            [
+                sum(self._val_decode_tpfs),
+                len(self._val_decode_tpfs),
+                sum(self._val_decode_accs),
+                len(self._val_decode_accs),
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        stats = self.trainer.strategy.reduce(stats, reduce_op="sum")
+        if stats[1].item() == 0:
+            raise RuntimeError(
+                "val/tpf selection requested, but validation decoded no usable "
+                "prompts; increase the validation data/limit or inspect prompt lengths"
+            )
+        if stats[3].item() > 0:
+            self.log(
+                "val/acceptance_decode",
+                stats[2] / stats[3],
+                sync_dist=False,
+            )
+        self.log(
+            "val/tpf",
+            stats[0] / stats[1],
+            prog_bar=True,
+            sync_dist=False,
+        )
 
     @torch.no_grad()
     def _maybe_decode_val(self, batch, batch_idx):
@@ -718,14 +758,6 @@ class FlowDraft(L.LightningModule):
         self._val_decode_remaining -= decoded
         self._val_decode_accs.extend(accs)
         self._val_decode_tpfs.extend(tpfs)
-        if self._val_decode_remaining == 0 and self._val_decode_tpfs:
-            if self._val_decode_accs:
-                self.log(
-                    "val/acceptance_decode",
-                    sum(self._val_decode_accs) / len(self._val_decode_accs),
-                    sync_dist=True,
-                )
-            self.log("val/tpf", sum(self._val_decode_tpfs) / len(self._val_decode_tpfs), sync_dist=True)
 
     def configure_optimizers(self):
         cfg = self.cfg.train

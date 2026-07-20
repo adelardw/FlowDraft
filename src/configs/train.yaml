@@ -50,7 +50,10 @@ train:
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
   anchor_point: trajectory  # where endpoint inference evaluates the diagonal pi_{t,t}:
                             #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
-  checkpoint_every_n_steps: 1000
+  checkpoint_every_n_steps: 1000  # unconditional recovery snapshots; optimizer steps, not batches
+  checkpoint_save_top_k: 2        # number of best validation-metric checkpoints to retain
+  best_checkpoint_name: best-tpf-{step:07d}
+  final_checkpoint_name: last.ckpt  # always overwritten with the true terminal state
   # Target-metric validation: run the real decode loop (single-jump) on a few
   # val prompts each validation -> val/tpf & val/acceptance_decode curves.
   val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy

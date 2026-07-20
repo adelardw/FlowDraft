@@ -1,12 +1,15 @@
+from pathlib import Path
+
 import hydra
 import lightning as L
 import torch
+from hydra.utils import to_absolute_path
 from loguru import logger
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
-from torch.nn.parallel import DistributedDataParallel
 from omegaconf import DictConfig, OmegaConf
+from torch.nn.parallel import DistributedDataParallel
 
 from src.data import build_dataloaders, quiet_download_logs
 from src.models.factory import build_lit
@@ -79,6 +82,86 @@ class ReshuffleStreamingData(L.Callback):
             ds.set_epoch(trainer.current_epoch)
 
 
+class FinalCheckpoint(L.Callback):
+    """Always persist the terminal training state to one predictable path.
+
+    Lightning's ``ModelCheckpoint(save_last=True)`` can leave ``last.ckpt`` at
+    an earlier periodic step. This callback explicitly saves after the final
+    optimizer step and also makes a best effort when training raises.
+    """
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.path = path
+        self._saved = False
+
+    def _save(self, trainer, *, reason: str):
+        if self._saved or trainer.fast_dev_run:
+            return
+        try:
+            trainer.save_checkpoint(self.path)
+        except Exception:
+            logger.exception(f"failed to save {reason} checkpoint to {self.path}")
+            if reason == "final":
+                raise
+        else:
+            self._saved = True
+            if trainer.is_global_zero:
+                logger.info(f"{reason} checkpoint saved -> {self.path}")
+
+    def on_train_end(self, trainer, pl_module):
+        self._save(trainer, reason="final")
+
+    def on_exception(self, trainer, pl_module, exception):
+        self._save(trainer, reason="exception")
+
+
+def build_checkpoint_callbacks(cfg: DictConfig, *, has_validation: bool):
+    """Independent recovery, model-selection, and terminal checkpoints."""
+    output_dir = Path(to_absolute_path(str(cfg.output_dir)))
+    periodic_steps = int(cfg.train.get("checkpoint_every_n_steps", 0))
+    callbacks = []
+    if periodic_steps > 0:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=output_dir,
+                filename=cfg.train.get("checkpoint_name", "flowdraft-{step:07d}"),
+                monitor=None,
+                save_top_k=-1,
+                save_last=False,
+                every_n_train_steps=periodic_steps,
+                every_n_epochs=0,
+                save_on_train_epoch_end=False,
+                auto_insert_metric_name=False,
+            )
+        )
+
+    if has_validation:
+        monitor = cfg.train.get("monitor", "val/tpf")
+        mode = cfg.train.get("monitor_mode", "max")
+        monitor_slug = str(monitor).replace("/", "-")
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=output_dir,
+                filename=cfg.train.get(
+                    "best_checkpoint_name", f"best-{monitor_slug}-{{step:07d}}"
+                ),
+                monitor=monitor,
+                mode=mode,
+                save_top_k=int(cfg.train.get("checkpoint_save_top_k", 2)),
+                save_last=False,
+                every_n_train_steps=0,
+                every_n_epochs=1,
+                save_on_train_epoch_end=False,
+                auto_insert_metric_name=False,
+            )
+        )
+
+    final_name = cfg.train.get("final_checkpoint_name", "last.ckpt")
+    callbacks.append(FinalCheckpoint(str(output_dir / final_name)))
+    return callbacks
+
+
 def build_loggers(cfg: DictConfig):
     """Keep local TensorBoard logs and optionally mirror every metric to W&B."""
     loggers = [TensorBoardLogger(save_dir=cfg.output_dir)]
@@ -114,27 +197,16 @@ def main(cfg: DictConfig) -> None:
     model = build_lit(cfg, variant=cfg.train.get("variant", "flowdraft"))
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
-    # Checkpoint selection: val/tpf (the target metric; needs val_decode_prompts>0)
-    # or val/loss; falls back to train/loss when there is no val loader.
-    if val_loader is None:
-        monitor, mode = "train/loss", "min"
-    elif cfg.train.get("val_decode_prompts", 0) > 0:
-        monitor = cfg.train.get("monitor", "val/tpf")
-        mode = cfg.train.get("monitor_mode", "max")
-    else:
-        monitor, mode = "val/loss", "min"
+    if (
+        val_loader is not None
+        and cfg.train.get("monitor", "val/tpf") == "val/tpf"
+        and cfg.train.get("val_decode_prompts", 0) <= 0
+    ):
+        raise ValueError(
+            "train.monitor=val/tpf requires train.val_decode_prompts > 0"
+        )
     callbacks = [
-        # on_save_checkpoint strips the frozen backbone; the file still
-        # carries the DF head + its Adam moments. Keep the best and the last.
-        ModelCheckpoint(
-            dirpath=cfg.output_dir,
-            filename=cfg.train.get("checkpoint_name", "flowdraft-{step:07d}"),
-            monitor=monitor,
-            mode=mode,
-            save_top_k=2,
-            save_last=True,
-            every_n_train_steps=cfg.train.get("checkpoint_every_n_steps", 1000),
-        ),
+        *build_checkpoint_callbacks(cfg, has_validation=val_loader is not None),
         LearningRateMonitor(logging_interval="step"),
         ReshuffleStreamingData(),
     ]

@@ -411,6 +411,15 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется
 никогда). Полный построчный справочник — ниже.
 
+Чекпоинты разделены по назначению: `<train.checkpoint_name>.ckpt` —
+безусловные recovery-снимки каждые `checkpoint_every_n_steps` шагов
+оптимизатора (все сохраняются); `best-tpf-*.ckpt` — лучшие состояния по
+свежему validation `val/tpf` (хранится `checkpoint_save_top_k` файлов);
+`last.ckpt` явно записывается после последнего шага и, по возможности, при
+исключении. `SIGKILL` или переполненная файловая система не позволяют записать
+финальный файл; после такого прерывания используйте самый свежий периодический
+чекпоинт.
+
 **Повторение потока (эпохи).** Датасет стриминговый, поэтому «эпоху»
 определяете вы. Каждая новая эпоха Trainer открывает поток заново в НОВОМ
 порядке (перемешивание пересеивается по эпохам; валидационный срез
@@ -476,7 +485,10 @@ cosine 2e-4 с 5% разогревом):
 | `train.lambda_ramp_steps` | 0 | staged-дистилляция: lambda 0 → `lambda` за N шагов; 0 = статично |
 | `train.anchor_point` | `trajectory` | где якорь берёт диагональ: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
 | `train.checkpoint_name` | `flowdraft-{step:07d}` | шаблон имени чекпоинта — задавайте свой на каждый эксперимент (в CLI брать в кавычки: `'train.checkpoint_name="my-run-{step:07d}"'`) |
-| `train.checkpoint_every_n_steps` | 1000 | как часто сохранять |
+| `train.checkpoint_every_n_steps` | 1000 | интервал безусловных recovery-чекпоинтов в optimizer steps; все периодические файлы сохраняются |
+| `train.checkpoint_save_top_k` | 2 | сколько лучших по validation-метрике чекпоинтов хранить |
+| `train.best_checkpoint_name` | `best-tpf-{step:07d}` | шаблон имени чекпоинтов, выбранных по метрике |
+| `train.final_checkpoint_name` | `last.ckpt` | терминальный чекпоинт, сохраняемый независимо от периодического интервала |
 | `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | настоящая петля декодирования на N val-промптах каждую валидацию → `val/tpf`, `val/acceptance_decode`; 0 = выкл |
 | `train.monitor` / `monitor_mode` | `val/tpf` / `max` | по какой кривой выбирается лучший чекпоинт |
 | `train.early_stop_patience` | 5 | стоп после N валидаций без улучшения `val/loss`; 0 = выкл |
