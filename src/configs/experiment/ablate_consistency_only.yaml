@@ -1,7 +1,7 @@
 # @package _global_
-# Task stage 5 ablation: the consistency term ALONE (teacher off).
+# Task stage 5 ablation: the consistency term ALONE (endpoint anchor off).
 # Expectation: self-consistent but unanchored — the diagonal never learns
-# what the verifier accepts, acceptance should collapse.
+# categorical endpoints, so generation quality should collapse.
 #   uv run python src/train.py +experiment=ablate_consistency_only
 defaults:
   - override /model: qwen2_0.5b
@@ -10,5 +10,5 @@ output_dir: checkpoints/ablate-consistency
 
 train:
   variant: fixed
-  anchor_weight: 0.0
+  endpoint_weight: 0.0
   checkpoint_name: ablate-consistency-{step:07d}

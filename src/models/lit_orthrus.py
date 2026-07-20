@@ -15,17 +15,18 @@ class FlowMapOrthrus(L.LightningModule):
 
     This module owns everything the adapter deliberately does not:
 
-    * the frozen AR-teacher forward (stop-gradient by ``torch.no_grad``),
+    * the optional frozen AR-teacher forward (stop-gradient by ``torch.no_grad``),
     * sampling the CFM trajectory point ``(x_s, s, t)`` for the drafter,
     * the optimizer over ``df_parameters()`` (DF twins + time embedding),
     * checkpoints that store ONLY the trainable DF head — the 3B frozen
       backbone is restored from HF by ``build_model``, never written to disk.
 
-    The dual-distillation objective lives in :meth:`compute_loss`:
-    ``anchor + lambda * (4*EC + 2*TD)`` — the AR teacher anchors the diagonal
-    ``π_{t,t}``, endpoint consistency propagates it to the jumps, temporal
-    drift keeps the family smooth in ``t``. Knobs: ``train.lambda``,
-    ``train.anchor_point``, ``train.time_sampling``.
+    The categorical flow-map objective lives in :meth:`compute_loss`:
+    ``endpoint + lambda * (4*EC + 2*TD)`` — categorical VFM anchors the
+    diagonal ``π_{t,t}``, endpoint consistency propagates it to the jumps,
+    and temporal drift keeps the family smooth in ``t``. An optional,
+    separately weighted AR KL auxiliary can align the diagonal with the
+    verifier for experimental runs.
 
     Expected batch — a dict with:
         ``input_ids [B, T]`` (long) · ``attention_mask [B, T]`` (long, 1=live)
@@ -98,7 +99,7 @@ class FlowMapOrthrus(L.LightningModule):
         uses; they are masked out of attention and must not enter the loss.
         """
         batch = simplex.size(0)
-        mode = self.cfg.train.get("time_sampling", "triangle")
+        mode = self.cfg.train.get("time_sampling", "paper")
         sampler = getattr(self, f"sample_times_{mode}", None)
         if sampler is None:
             raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle | paper)")
@@ -120,7 +121,7 @@ class FlowMapOrthrus(L.LightningModule):
     # --- the loss is yours ----------------------------------------------------
 
     def _lambda(self):
-        """ECLD weight with optional staging: teacher-matching FIRST, then
+        """ECLD weight with optional staging: endpoint inference FIRST, then
         consistency. With ``train.lambda_ramp_steps = N > 0`` the weight ramps
         linearly ``0 -> train.lambda`` over the first N optimizer steps, so
         early training is anchor-only (the diagonal must be trustworthy
@@ -144,20 +145,22 @@ class FlowMapOrthrus(L.LightningModule):
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
         return kl[live].mean()
 
-    def compute_loss(self, batch, teacher_logits, draft_logits, x_s, x_t, s, t):
-        """Dual distillation with the DIAGONAL as the AR anchor.
+    def compute_loss(self, batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t):
+        """Categorical flow-map training plus optional AR distillation.
 
-        Content and skill enter through different doors (this is the "dual"):
+        The paper's diagonal VFM objective and off-diagonal ECLD objective are
+        kept distinct:
 
-        * anchor — ``KL(sg(p_AR) || π^θ_{t,t}(·))``: the AR teacher anchors
-          only the diagonal (soft target — we distill the verifier's
-          distribution; the hard variant would target the actual tokens
-          ``x1``, see the anchor-target design knob). Jumps get NO direct AR
-          loss — such a target is constant in the noise seed at s=0,
-          collapsing the transport to one point.
+        * endpoint — ``CE(x1, π^θ_{t,t}(x_t))``: the categorical VFM endpoint
+          likelihood that makes the diagonal the denoiser associated with the
+          sampled interpolation. This is the anchor required by CFM theory.
+        * AR KL (optional) — ``KL(sg(p_AR) || π^θ_{t,t})``: a separately
+          weighted verifier-alignment auxiliary. It defaults off because it
+          is not part of the CFM objective and can conflict with the sampled
+          endpoint at a given training trajectory.
         * EC — ``CE(sg(π^θ_{t,t}(X_{s,t}(x_s))), π^θ_{s,t}(x_s))``: the jump
           must agree with the diagonal asked at the jump's own landing point.
-          Truth flows ``p_AR -> π_{t,t} -> π_{s,t}``; at convergence landing
+          Truth flows ``x1 -> π_{t,t} -> π_{s,t}``; at convergence landing
           points are distributed like ``x_t``, so the two diagonals coincide.
         * TD — temporal drift ``||∂_t π^θ_{s,t}||²``, finite difference in
           the time INPUT.
@@ -179,23 +182,37 @@ class FlowMapOrthrus(L.LightningModule):
         x_jump = x_s + gamma * (pi - x_s)
         x_jump = (x_jump * mask[..., None].to(x_jump.dtype)).detach()  # pads stay zero
 
-        # --- anchor: p_AR certifies the diagonal. WHERE the diagonal is
-        # evaluated is an experimental knob (cfg.train.anchor_point):
-        #   trajectory — KL input: π_{t,t}(x_t),          KL target: sg(p_AR(·|x1_{<i}))
-        #   landing    — KL input: π_{t,t}(X_{s,t}(x_s)), KL target: sg(p_AR(·|x1_{<i}))
-        # The target is identical in all modes: at position i — the frozen AR
-        # path's distribution of token i given the CLEAN prefix x1_{<i}
-        # (teacher_logits[:, i-1], hence the one-position shift below).
+        # --- diagonal endpoint inference. The paper-faithful setting is
+        # ``trajectory``: π_{t,t}(x_t) is supervised with the categorical
+        # endpoint x1 used to construct that same interpolant. ``landing`` is
+        # retained only as an explicitly experimental off-trajectory option.
         anchor_point = self.cfg.train.get("anchor_point", "trajectory")
         anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
         if anchor_input is None:
             raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
         diag_logits = self.orthrus(anchor_input, mask, use_df=True, s=t, t=t).logits
-        anchor = self._masked_kl(
-            F.log_softmax(teacher_logits[:, :-1].float(), -1),
-            F.log_softmax(diag_logits[:, 1:].float(), -1),
-            live[:, 1:],
+        endpoint_nll = F.cross_entropy(
+            diag_logits[:, 1:].float().transpose(1, 2),
+            x1[:, 1:].argmax(-1),
+            reduction="none",
         )
+        endpoint_live = live[:, 1:]
+        endpoint = (
+            endpoint_nll[endpoint_live].mean()
+            if endpoint_live.any()
+            else diag_logits.sum() * 0.0
+        )
+        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
+        if ar_kl_weight:
+            if teacher_logits is None:
+                raise ValueError("teacher logits are required when train.ar_kl_weight > 0")
+            ar_kl = self._masked_kl(
+                F.log_softmax(teacher_logits[:, :-1].float(), -1),
+                F.log_softmax(diag_logits[:, 1:].float(), -1),
+                live[:, 1:],
+            )
+        else:
+            ar_kl = diag_logits.sum() * 0.0
 
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
         # the jump must agree with the (stop-grad) expert
@@ -221,9 +238,24 @@ class FlowMapOrthrus(L.LightningModule):
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
 
         lam = self._lambda()
-        aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
-        loss = aw * anchor + lam * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor, "loss/ec": ec, "loss/td": td, "loss/lambda": lam}, sync_dist=True)
+        endpoint_weight = self.cfg.train.get(
+            "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
+        )
+        loss = (
+            endpoint_weight * endpoint
+            + ar_kl_weight * ar_kl
+            + lam * (4.0 * ec + 2.0 * td)
+        )
+        self.log_dict(
+            {
+                "loss/endpoint": endpoint,
+                "loss/ar_kl": ar_kl,
+                "loss/ec": ec,
+                "loss/td": td,
+                "loss/lambda": lam,
+            },
+            sync_dist=True,
+        )
         return loss
 
     # --- generation: the model generates, start to finish ----------------------
@@ -442,6 +474,30 @@ class FlowMapOrthrus(L.LightningModule):
         # first fresh position's target in one go — the cycle is jumps+1.
         pending = None
 
+        # Materialise the first token directly from the already-computed
+        # prefill distribution. It becomes the clean, uncommitted anchor for
+        # the first draft cycle, matching block-wise training and the Orthrus
+        # inference geometry without costing another forward pass.
+        if max_new_tokens > 0:
+            first_probs = self._target_probs(last_logits, temperature, top_k, top_p)
+            if temperature > 0 and coupled:
+                first_gumbel = self._gumbel(
+                    sampling_seed, 0, first_probs.size(-1), first_probs.device
+                )
+                pending = (
+                    first_probs[0].clamp_min(1e-30).log() + first_gumbel
+                ).argmax().view(1)
+            elif temperature > 0:
+                pending = torch.multinomial(first_probs[0], 1)
+            else:
+                pending = first_probs.argmax(-1)
+            emitted.append(int(pending))
+            if eos_token_id is not None and int(pending) == eos_token_id:
+                return self._finalize(
+                    input_ids, emitted, max_new_tokens, eos_token_id, start,
+                    n_forwards, acceptance=acceptance,
+                )
+
         while len(emitted) < max_new_tokens:
             draft_ids, q = self._draft_block(
                 cache, block_size, times,
@@ -592,23 +648,27 @@ class FlowMapOrthrus(L.LightningModule):
             # with V≈128k is gigabytes — it must never ship through the
             # DataLoader; batches only need input_ids + attention_mask.
             x1 = self.df_processor.to_simplex(ids, attention_mask=mask)
-        with torch.no_grad():
-            teacher_logits = self.orthrus(ids, mask).logits
+        teacher_logits = None
+        # The frozen teacher is unnecessary for paper-faithful endpoint
+        # training. Keep it for validation metrics and optional AR-KL runs.
+        if not self.training or self.cfg.train.get("ar_kl_weight", 0.0):
+            with torch.no_grad():
+                teacher_logits = self.orthrus(ids, mask).logits
         x_s, x_t, s, t = self.sample_trajectory(x1, mask)
         draft_logits = self.orthrus(x_s, mask, use_df=True, s=s, t=t).logits
-        return teacher_logits, draft_logits, x_s, x_t, s, t
+        return teacher_logits, draft_logits, x_s, x_t, x1, s, t
 
     def training_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, x_s, x_t, s, t = self._shared_step(batch)
-        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, s, t)
+        teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
+        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, x_s, x_t, s, t = self._shared_step(batch)
-        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, s, t)
+        teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
+        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t)
         # Cheap acceptance proxy: how often the drafter's argmax already
         # matches the verifier's argmax (shifted: teacher@i predicts i+1).
         mask = batch["attention_mask"][:, 1:].bool()
@@ -651,18 +711,20 @@ class FlowMapOrthrus(L.LightningModule):
                 input_ids=batch["input_ids"][i : i + 1, :plen],
                 block_size=block, jumps=1, max_new_tokens=max_new,
             )
-            accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
+            if out["acceptance"]:
+                accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
             tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
             decoded += 1
         self._val_decode_remaining -= decoded
         self._val_decode_accs.extend(accs)
         self._val_decode_tpfs.extend(tpfs)
         if self._val_decode_remaining == 0 and self._val_decode_tpfs:
-            self.log(
-                "val/acceptance_decode",
-                sum(self._val_decode_accs) / len(self._val_decode_accs),
-                sync_dist=True,
-            )
+            if self._val_decode_accs:
+                self.log(
+                    "val/acceptance_decode",
+                    sum(self._val_decode_accs) / len(self._val_decode_accs),
+                    sync_dist=True,
+                )
             self.log("val/tpf", sum(self._val_decode_tpfs) / len(self._val_decode_tpfs), sync_dist=True)
 
     def configure_optimizers(self):

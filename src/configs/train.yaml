@@ -44,13 +44,14 @@ train:
   warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  time_sampling: triangle   # triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1]) | paper (t~U, s~U[0,t])
-  lambda: 1.0               # weight of the ECLD part: loss = anchor_weight*anchor + lambda*(4*EC + 2*TD)
-  anchor_weight: 1.0        # 0 = ablate the AR-teacher term (consistency-only run)
-  lambda_ramp_steps: 0      # staged dual distillation: ramp lambda 0 -> lambda over N steps
-                            #   (teacher-matching first, consistency second); 0 = static
+  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1])
+  lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
+  endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
+  ar_kl_weight: 0.0         # optional verifier-alignment auxiliary; 0 keeps the CFM objective paper-faithful
+  lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
+                            #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
-  anchor_point: trajectory  # where the AR anchor evaluates the diagonal pi_{t,t}:
+  anchor_point: trajectory  # where endpoint inference evaluates the diagonal pi_{t,t}:
                             #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
   checkpoint_every_n_steps: 1000
   # Target-metric validation: run the real decode loop (single-jump) on a few

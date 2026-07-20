@@ -91,9 +91,9 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
         x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
         draft_logits = self._df_forward(x_s, anchor, ctx_mask, cache, s, t)
-        return teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor
+        return teacher_logits, draft_logits, x_s, x_t, x1, s, t, ctx_mask, block_mask, cache, anchor
 
-    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, s, t, ctx_mask, block_mask, cache, anchor):
+    def compute_loss(self, teacher_logits, draft_logits, x_s, x_t, x1, s, t, ctx_mask, block_mask, cache, anchor):
         """The parent's three terms in block geometry.
 
         Differences from the fixed variant: no one-position shift (teacher
@@ -116,19 +116,28 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         x_jump = x_s + gamma * (pi - x_s)
         x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
 
-        # --- anchor: p_AR certifies the diagonal (see the parent for the
-        # trajectory-vs-landing discussion; same knob).
-        #   trajectory — KL input: π_{t,t}(x_t),          KL target: sg(p_AR(·|prefix, x1_{<i}))
-        #   landing    — KL input: π_{t,t}(X_{s,t}(x_s)), KL target: sg(p_AR(·|prefix, x1_{<i}))
+        # --- categorical VFM endpoint likelihood on the diagonal. The
+        # trajectory setting is paper-faithful; landing remains experimental.
         anchor_point = self.cfg.train.get("anchor_point", "trajectory")
         anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
         if anchor_input is None:
             raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
         diag_logits = self._df_forward(anchor_input, anchor, ctx_mask, cache, s=t, t=t)
-        anchor_loss = self._masked_kl(
-            F.log_softmax(teacher_logits.float(), -1),
-            F.log_softmax(diag_logits.float(), -1),
-            live,
+        endpoint_nll = F.cross_entropy(
+            diag_logits.float().transpose(1, 2),
+            x1.argmax(-1),
+            reduction="none",
+        )
+        endpoint = endpoint_nll[live].mean()
+        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
+        ar_kl = (
+            self._masked_kl(
+                F.log_softmax(teacher_logits.float(), -1),
+                F.log_softmax(diag_logits.float(), -1),
+                live,
+            )
+            if ar_kl_weight
+            else diag_logits.sum() * 0.0
         )
 
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
@@ -152,9 +161,24 @@ class FlowMapOrthrusBlockWise(FlowMapOrthrus):
         td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
 
         lam = self._lambda()
-        aw = self.cfg.train.get("anchor_weight", 1.0)  # 0 = ablate the teacher term
-        loss = aw * anchor_loss + lam * (4.0 * ec + 2.0 * td)
-        self.log_dict({"loss/anchor": anchor_loss, "loss/ec": ec, "loss/td": td, "loss/lambda": lam}, sync_dist=True)
+        endpoint_weight = self.cfg.train.get(
+            "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
+        )
+        loss = (
+            endpoint_weight * endpoint
+            + ar_kl_weight * ar_kl
+            + lam * (4.0 * ec + 2.0 * td)
+        )
+        self.log_dict(
+            {
+                "loss/endpoint": endpoint,
+                "loss/ar_kl": ar_kl,
+                "loss/ec": ec,
+                "loss/td": td,
+                "loss/lambda": lam,
+            },
+            sync_dist=True,
+        )
         return loss
 
     def training_step(self, batch, batch_idx):

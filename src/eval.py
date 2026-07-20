@@ -42,13 +42,15 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
         eos_token_id=eos_token_id, **sampling,
     )
     n_tokens = len(fd["new_tokens"])
-    assert fd["acceptance"], "generation ran zero cycles — check max_new_tokens"
     bitwise_applicable = temperature == 0 or coupled
     return {
         "lossless": fd["new_tokens"] == ar["new_tokens"] if bitwise_applicable else None,
         # HEADLINE metrics — hardware/kernel independent:
         # drafted tokens accepted per cycle (what the whole project optimizes)
-        "acceptance": sum(fd["acceptance"]) / len(fd["acceptance"]),
+        "acceptance": (
+            sum(fd["acceptance"]) / len(fd["acceptance"])
+            if fd["acceptance"] else 0.0
+        ),
         # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
