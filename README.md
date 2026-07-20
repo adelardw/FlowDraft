@@ -68,7 +68,7 @@ echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
 ./hf-auth.sh uv run python src/train.py \
     trainer.max_steps=10000 data.batch_size=8
 #    watch: loss/endpoint ↓, loss/ec ↓, loss/td sane, val/teacher_agreement ↑
-#    checkpoints (DF head + Adam moments, ~5 GB for 3B) land in checkpoints/
+#    checkpoints (FP32 DF head + Adam moments; no frozen backbone) land in checkpoints/
 #    our ADDITION beyond the task — training in the exact inference geometry:
 #    append train.variant=flowdraft_block_wise
 #    epochs on top of streaming (nothing is downloaded ahead): a fixed pool of
@@ -84,7 +84,7 @@ For multi-GPU training, let Lightning run DDP and specify the GPU count:
     data.batch_size=8 trainer.max_steps=10000
 ```
 
-Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
+Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. Streaming train and validation datasets are split into disjoint, equal rank shards (and then partitioned among DataLoader workers). The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
 
 ## H100 sparse-attention setup
 
@@ -331,8 +331,9 @@ Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`l
 (VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
 curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
-`trainer.*`. Checkpoints store the DF head + its Adam moments (~5 GB for 3B;
-the frozen backbone is never written).
+`trainer.*`. Checkpoints store the FP32 DF head + its Adam moments; the frozen
+backbone is never written. FP32 masters prevent late cosine-schedule updates
+from disappearing through BF16 parameter rounding.
 
 Checkpointing has three independent outputs:
 

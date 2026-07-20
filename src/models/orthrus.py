@@ -21,6 +21,9 @@ class Orthrus(FlowDraftBlockWise):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.orthrus.time_embed.requires_grad_(False)
+        # Masked Orthrus consumes and trains the mask embedding that the
+        # FlowDraft parent freezes as unused.
+        self.orthrus.mask_embedding.requires_grad_(True)
 
     def _sample_anchors(self, attention_mask, block: int, count: int, document_ids=None):
         """Uniform anchor positions shared across the micro-batch.
@@ -29,6 +32,8 @@ class Orthrus(FlowDraftBlockWise):
         larger local batch compatible with one cache and one sparse mask.
         """
         min_prefix = int(self.cfg.train.get("min_prefix", 1))
+        if attention_mask.size(1) < block:
+            return None
         # ``block`` includes the visible anchor. A valid window contains the
         # anchor plus its K-1 drafted positions, all of which must be live.
         # With packed data, it must also be entirely within one source
@@ -51,12 +56,8 @@ class Orthrus(FlowDraftBlockWise):
         candidates = torch.nonzero(shared, as_tuple=False).flatten()
         candidates = candidates[candidates >= min_prefix]
         if candidates.numel() == 0:
-            raise ValueError(
-                f"no shared within-document anchor can fit a block of size {block}; "
-                f"min_prefix={min_prefix}"
-            )
+            return None
         return candidates[torch.randint(candidates.numel(), (count,), device=attention_mask.device)]
-
 
     def _masked_step(self, batch):
         ids, attention_mask = batch["input_ids"], batch["attention_mask"]
@@ -65,11 +66,24 @@ class Orthrus(FlowDraftBlockWise):
         anchors = self._sample_anchors(
             attention_mask, block, count, batch.get("document_ids")
         )
+        if anchors is None:
+            # Some packed batches contain no document long enough for one
+            # complete block. Keep every trainable parameter connected so a
+            # rank taking this path can still participate in DDP reduction.
+            zero = sum(parameter.sum() for parameter in self.orthrus.df_parameters()) * 0.0
+            drafted = max(block - 1, 0)
+            empty_logits = ids.new_zeros(
+                (ids.size(0), 0, drafted, 1), dtype=torch.float32
+            )
+            empty_live = torch.zeros(
+                (ids.size(0), 0, drafted), dtype=torch.bool, device=ids.device
+            )
+            return zero, empty_logits, empty_logits, empty_live
 
         # One clean AR pass supplies both exact teacher rows and the shared
         # AR-only KV cache.  The DF forward below never appends to it.
         cache = DynamicCache(config=self.orthrus.model.config)
-        with torch.no_grad():
+        with torch.no_grad(), self._teacher_eval():
             # The paper baseline packs every training/validation item to a
             # fixed 2048-token shape. This is the sole AR call routed through
             # the optional compiled wrapper; generation has variable cache
@@ -190,30 +204,68 @@ class Orthrus(FlowDraftBlockWise):
         return accuracy, acceptance, mean_accepted
 
     def validation_step(self, batch, batch_idx):
-        loss, df_logits, teacher_logits, live = self._masked_step(batch)
-        agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
-        accuracy, acceptance, mean_accepted = self._position_metrics(
-            df_logits, teacher_logits, live
-        )
-        # Position 01 is the first fresh token after the clean anchor. Keep
-        # fixed-width names so W&B/TensorBoard plots sort in generation order.
-        self.log_dict(
-            {
-                **{
-                    f"val/accuracy_pos_{position + 1:02d}": value
-                    for position, value in enumerate(accuracy)
-                },
-                **{
-                    f"val/acceptance_pos_{position + 1:02d}": value
-                    for position, value in enumerate(acceptance)
-                },
-                "val/accepted_tokens_per_block": mean_accepted,
-            },
-            sync_dist=True,
-        )
-        self._maybe_decode_val(batch, batch_idx)
+        with self._frozen_val_rng(batch_idx):
+            loss, df_logits, teacher_logits, live = self._masked_step(batch)
+            live_count = live.sum().to(dtype=torch.float64)
+            loss_stats = torch.stack(
+                [loss.detach().to(torch.float64) * live_count, live_count]
+            )
+            loss_stats = self.trainer.strategy.reduce(loss_stats, reduce_op="sum")
+            if loss_stats[1].item() > 0:
+                # Already reduced across ranks. A skipped local batch carries
+                # zero weight instead of looking like a perfect zero-loss batch.
+                self.log(
+                    "val/loss",
+                    loss_stats[0] / loss_stats[1],
+                    prog_bar=True,
+                    sync_dist=False,
+                )
+
+                matches = df_logits.argmax(-1).eq(teacher_logits.argmax(-1)) & live
+                prefix_live = live.to(torch.int32).cumprod(dim=-1).bool()
+                prefix_matches = matches.to(torch.int32).cumprod(dim=-1).bool()
+                dims = (0, 1)
+                full_blocks = prefix_live[..., -1]
+                metric_parts = [
+                    matches.sum(dim=dims),
+                    live.sum(dim=dims),
+                    prefix_matches.sum(dim=dims),
+                    prefix_live.sum(dim=dims),
+                    prefix_matches.sum(dim=-1)[full_blocks].sum(),
+                    full_blocks.sum(),
+                ]
+                metric_stats = torch.cat(
+                    [part.reshape(-1).to(torch.float64) for part in metric_parts]
+                )
+                metric_stats = self.trainer.strategy.reduce(
+                    metric_stats, reduce_op="sum"
+                )
+                drafted = live.size(-1)
+                accuracy_num = metric_stats[:drafted]
+                accuracy_den = metric_stats[drafted : 2 * drafted].clamp_min(1)
+                acceptance_num = metric_stats[2 * drafted : 3 * drafted]
+                acceptance_den = metric_stats[3 * drafted : 4 * drafted].clamp_min(1)
+                accepted_sum, full_count = metric_stats[-2:]
+                accuracy = accuracy_num / accuracy_den
+                acceptance = acceptance_num / acceptance_den
+                self.log_dict(
+                    {
+                        "val/teacher_agreement": accuracy_num.sum()
+                        / metric_stats[drafted : 2 * drafted].sum().clamp_min(1),
+                        **{
+                            f"val/accuracy_pos_{position + 1:02d}": value
+                            for position, value in enumerate(accuracy)
+                        },
+                        **{
+                            f"val/acceptance_pos_{position + 1:02d}": value
+                            for position, value in enumerate(acceptance)
+                        },
+                        "val/accepted_tokens_per_block": accepted_sum
+                        / full_count.clamp_min(1),
+                    },
+                    sync_dist=False,
+                )
+            self._maybe_decode_val(batch, batch_idx)
         return loss
 
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
@@ -226,7 +278,9 @@ class Orthrus(FlowDraftBlockWise):
         drafted = block_size - 1
         if drafted <= 0:
             raise ValueError("baseline block_size must be at least 2 (anchor + one mask)")
-        masks = self.orthrus.mask_embedding.to(self.device).expand(1, drafted, -1)
+        masks = self.orthrus.mask_embedding.to(
+            device=self.device, dtype=embed.weight.dtype
+        ).expand(1, drafted, -1)
         if anchor_token is not None:
             anchor = embed(anchor_token.view(1, 1))
             x_in = torch.cat([anchor, masks], dim=1)

@@ -53,7 +53,7 @@ echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
 ./hf-auth.sh uv run python src/train.py \
     trainer.max_steps=10000 data.batch_size=8
 #    смотреть: loss/endpoint ↓, loss/ec ↓, loss/td без пиков, val/teacher_agreement ↑
-#    чекпоинты (DF-голова + Adam-моменты, ~5 ГБ для 3B) падают в checkpoints/
+#    чекпоинты (FP32 DF-голова + Adam-моменты; без бэкбона) падают в checkpoints/
 #    наше ДОПОЛНЕНИЕ сверх задания — обучение в точной инференсной геометрии:
 #    добавьте train.variant=flowdraft_block_wise
 #    эпохи поверх стриминга (ничего не скачивается заранее): фиксированный пул
@@ -69,7 +69,7 @@ echo "HF_TOKEN=hf_..." > .env        # доступ к gated meta-llama
     data.batch_size=8 trainer.max_steps=10000
 ```
 
-Во время обучения `model.backbone.device_map` всегда отключается: device map Hugging Face нужен для inference-шардинга, а DDP требует полную реплику модели на каждом GPU. `data.batch_size` в команде задан на один GPU; для большего эффективного глобального batch используйте `trainer.accumulate_grad_batches`.
+Во время обучения `model.backbone.device_map` всегда отключается: device map Hugging Face нужен для inference-шардинга, а DDP требует полную реплику модели на каждом GPU. Стриминговые train/validation-данные делятся на непересекающиеся равные шарды рангов, а затем между worker'ами DataLoader. `data.batch_size` в команде задан на один GPU; для большего эффективного глобального batch используйте `trainer.accumulate_grad_batches`.
 
 # 4. Замер acceptance / TPF против AR-бейзлайна (lossless утверждается побитово)
 ./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
@@ -408,8 +408,9 @@ echo "HF_TOKEN=hf_..." > .env     # доступ к gated meta-llama
 `block_size`/`min_prefix` (block-wise варианты), `val_decode_prompts`
 (decode-петля на валидации → кривые `val/tpf` + монитор чекпоинтов),
 `early_stop_patience`, оптимизатор, Lightning `trainer.*`. Чекпоинты хранят
-DF-голову + её Adam-моменты (~5 ГБ для 3B; замороженный бэкбон не пишется
-никогда). Полный построчный справочник — ниже.
+FP32 DF-голову + её Adam-моменты; замороженный бэкбон не пишется никогда.
+FP32 master-параметры не дают поздним шагам cosine schedule исчезнуть из-за
+округления BF16. Полный построчный справочник — ниже.
 
 Чекпоинты разделены по назначению: `<train.checkpoint_name>.ckpt` —
 безусловные recovery-снимки каждые `checkpoint_every_n_steps` шагов

@@ -1,9 +1,44 @@
 import os
 import random
+from itertools import islice
 
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, IterableDataset
+
+
+def _rank_and_world() -> tuple[int, int]:
+    """Return the process shard coordinates exposed by Lightning DDP."""
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world_size
+
+
+def _round_robin_rank_shard(stream):
+    """Split a deterministic stream evenly across DDP ranks.
+
+    The incomplete final rank group is dropped so all ranks execute exactly
+    the same number of batches and cannot diverge at a collective.
+    """
+    rank, world_size = _rank_and_world()
+    if world_size == 1:
+        yield from stream
+        return
+    group = []
+    for example in stream:
+        group.append(example)
+        if len(group) == world_size:
+            yield group[rank]
+            group = []
+
+
+def _worker_shard(rank_stream):
+    """Partition one rank's share among DataLoader workers without drops."""
+    info = torch.utils.data.get_worker_info()
+    if info is None or info.num_workers == 1:
+        yield from rank_stream
+        return
+    yield from islice(rank_stream, info.id, None, info.num_workers)
 
 
 class EpochShuffled(IterableDataset):
@@ -17,9 +52,17 @@ class EpochShuffled(IterableDataset):
     ``set_epoch`` so every repetition of the stream yields a new order.
     """
 
-    def __init__(self, ds, seed: int, buffer_size: int, size: int | None = None):
+    def __init__(
+        self,
+        ds,
+        seed: int,
+        buffer_size: int,
+        size: int | None = None,
+        shard_by_rank: bool = True,
+    ):
         self.ds, self.seed, self.buffer_size = ds, seed, buffer_size
         self.size = size
+        self.shard_by_rank = shard_by_rank
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -32,9 +75,12 @@ class EpochShuffled(IterableDataset):
         # max_steps arithmetic.
         if self.size is None:
             raise TypeError("unbounded stream has no length")
-        return self.size
+        if not self.shard_by_rank:
+            return self.size
+        _, world_size = _rank_and_world()
+        return self.size // world_size
 
-    def __iter__(self):
+    def _shuffled(self):
         rng = random.Random(self.seed + self.epoch)
         buffer = []
         for example in self.ds:
@@ -46,6 +92,12 @@ class EpochShuffled(IterableDataset):
             buffer[i] = example
         rng.shuffle(buffer)
         yield from buffer
+
+    def __iter__(self):
+        stream = self._shuffled()
+        if self.shard_by_rank:
+            stream = _round_robin_rank_shard(stream)
+        yield from _worker_shard(stream)
 
 
 class PackedTokenStream(IterableDataset):
@@ -64,13 +116,6 @@ class PackedTokenStream(IterableDataset):
     def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
         self.ds, self.tokenize, self.max_length, self.size = ds, tokenize, max_length, size
 
-    @staticmethod
-    def _rank_and_world() -> tuple[int, int]:
-        """DDP ranks share one global packed corpus, not duplicate it."""
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        return rank, world_size
-
     def set_epoch(self, epoch: int):
         if hasattr(self.ds, "set_epoch"):
             self.ds.set_epoch(epoch)
@@ -81,12 +126,12 @@ class PackedTokenStream(IterableDataset):
         # ``size`` is the global packed count. Every rank receives a disjoint,
         # equal-sized shard so DDP ranks always execute the same number of
         # batches. The at-most ``world_size - 1`` tail sequences are dropped.
-        _, world_size = self._rank_and_world()
+        _, world_size = _rank_and_world()
         return self.size // world_size
 
-    def __iter__(self):
+    def _packed(self):
         pending, pending_document_ids, emitted, document_id = [], [], 0, 0
-        rank, world_size = self._rank_and_world()
+        _, world_size = _rank_and_world()
         usable = None if self.size is None else self.size - (self.size % world_size)
         for example in self.ds:
             token_ids = self.tokenize(example)
@@ -105,15 +150,40 @@ class PackedTokenStream(IterableDataset):
                 emitted += 1
                 if usable is not None and emitted > usable:
                     return
-                # All ranks reproduce the deterministic packing pass, then
-                # take a disjoint round-robin shard of its output. Sharding
-                # before packing would create rank-dependent packing waste.
-                if (emitted - 1) % world_size == rank:
-                    yield {
-                        "input_ids": torch.tensor(ids, dtype=torch.long),
-                        "attention_mask": torch.ones(self.max_length, dtype=torch.long),
-                        "document_ids": torch.tensor(document_ids, dtype=torch.long),
-                    }
+                yield {
+                    "input_ids": torch.tensor(ids, dtype=torch.long),
+                    "attention_mask": torch.ones(self.max_length, dtype=torch.long),
+                    "document_ids": torch.tensor(document_ids, dtype=torch.long),
+                }
+
+    def __iter__(self):
+        # Shard after packing so tokenization waste cannot make rank-dependent
+        # sequence boundaries. Workers then partition that rank's complete
+        # share without changing its total length.
+        yield from _worker_shard(_round_robin_rank_shard(self._packed()))
+
+
+class RankSharded(IterableDataset):
+    """Fixed-order rank/worker shard for validation streams."""
+
+    def __init__(self, ds, size: int | None = None):
+        self.ds = ds
+        self.size = size
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.ds, "set_epoch"):
+            self.ds.set_epoch(epoch)
+
+    def __len__(self):
+        if self.size is None:
+            raise TypeError("unbounded stream has no length")
+        _, world_size = _rank_and_world()
+        return self.size // world_size
+
+    def __iter__(self):
+        yield from _worker_shard(_round_robin_rank_shard(self.ds))
+
+
 def quiet_download_logs():
     """Keep ALL transfer chatter out of the training/eval console.
 
@@ -229,7 +299,7 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     val_size = d.get("val_size", 256)
     # Validation is a separate read of the source stream. It must not consume
     # rows from the paper-faithful 600K-example training sample.
-    val_ds = ds.take(val_size) if val_size else None
+    val_ds = RankSharded(ds.take(val_size), size=val_size) if val_size else None
     train_ds = ds
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
@@ -244,8 +314,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         )
     if train_size:
         train_ds = train_ds.take(train_size)
-    train_ds = EpochShuffled(train_ds, seed=cfg.seed, buffer_size=d.get("shuffle_buffer", 1000),
-                             size=train_size)
+    # Packed mode shards after packing; sharding here as well would leave each
+    # rank with only 1/world_size**2 of the intended stream.
+    train_ds = EpochShuffled(
+        train_ds,
+        seed=cfg.seed,
+        buffer_size=d.get("shuffle_buffer", 1000),
+        size=train_size,
+        shard_by_rank=not pack_sequences,
+    )
 
     if pack_sequences:
         def tokenize_for_pack(example):

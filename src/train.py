@@ -194,7 +194,13 @@ def main(cfg: DictConfig) -> None:
     quiet_download_logs()
     L.seed_everything(cfg.seed, workers=True)
     configure_training_device_placement(cfg)
-    model = build_lit(cfg, variant=cfg.train.get("variant", "flowdraft"))
+    model = build_lit(
+        cfg,
+        variant=cfg.train.get("variant", "flowdraft"),
+        # A weights-only warm start must keep this run's optimizer, monitor,
+        # checkpoint names, and CLI overrides.
+        restore_train_config=False,
+    )
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
     if (

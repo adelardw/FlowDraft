@@ -72,7 +72,7 @@ class FlowDraftBlockWise(FlowDraft):
         ctx_mask = mask[:, : p + 1 + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
-        with torch.no_grad():
+        with torch.no_grad(), self._teacher_eval():
             teacher_full = self.orthrus(ids[:, : p + 1 + block], ctx_mask, past_key_values=cache).logits
         # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
         # K/V are NOT in the cache while drafting. The AR logits at
@@ -151,14 +151,16 @@ class FlowDraftBlockWise(FlowDraft):
                 ).float().softmax(-1)
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
-        # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
-        # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
-        # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
-        dt_val = 0.05
-        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
-        pi_dt = self._df_forward(x_s, anchor, ctx_mask, cache, s=s, t=t + dt).float().softmax(-1)
-        drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
-        td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
+        td = self._td_term(
+            pi,
+            gamma,
+            s,
+            t,
+            live,
+            forward_dt=lambda dt: self._df_forward(
+                x_s, anchor, ctx_mask, cache, s=s, t=t + dt
+            ),
+        )
 
         lam = self._lambda()
         endpoint_weight = self.cfg.train.get(
@@ -189,12 +191,15 @@ class FlowDraftBlockWise(FlowDraft):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, *rest = self._shared_step(batch)
-        loss = self.compute_loss(teacher_logits, draft_logits, *rest)
-        block_mask = rest[-3]
-        # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
-        agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[block_mask.bool()]
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
-        self._maybe_decode_val(batch, batch_idx)
+        with self._frozen_val_rng(batch_idx):
+            teacher_logits, draft_logits, *rest = self._shared_step(batch)
+            loss = self.compute_loss(teacher_logits, draft_logits, *rest)
+            block_mask = rest[-3]
+            # Acceptance proxy in block geometry: no shift, teacher pre-aligned.
+            agree = (draft_logits.argmax(-1) == teacher_logits.argmax(-1))[
+                block_mask.bool()
+            ]
+            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+            self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+            self._maybe_decode_val(batch, batch_idx)
         return loss

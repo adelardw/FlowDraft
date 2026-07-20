@@ -60,7 +60,9 @@ def _load_checkpoint(path: str) -> tuple[dict, Path]:
     return checkpoint, resolved
 
 
-def _restore_checkpoint_config(cfg: DictConfig, checkpoint: Mapping) -> None:
+def _restore_checkpoint_config(
+    cfg: DictConfig, checkpoint: Mapping, *, restore_train: bool = True
+) -> None:
     """Restore architecture/training metadata without changing eval placement.
 
     Training under DDP records ``device_map=null``. Evaluation must retain its
@@ -83,13 +85,12 @@ def _restore_checkpoint_config(cfg: DictConfig, checkpoint: Mapping) -> None:
                 for key, value in runtime_backbone.items():
                     restored_model.backbone[key] = value
             cfg.model = restored_model
-        if isinstance(saved_train, Mapping):
+        if restore_train and isinstance(saved_train, Mapping):
             cfg.train = OmegaConf.create(saved_train)
 
 
-def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
-    """Strictly restore every trainable DF tensor and no frozen backbone."""
-    state = checkpoint["state_dict"]
+def validate_df_state(model, state: Mapping, source: str) -> None:
+    """Require every trainable DF tensor with its expected shape."""
     model_state = model.state_dict()
     required = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
     present = set(state)
@@ -108,9 +109,14 @@ def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
             details.append(f"unknown tensors={sorted(unknown)}")
         if mismatched:
             details.append(f"shape mismatches={mismatched}")
-        raise RuntimeError(
-            f"incompatible DF checkpoint {checkpoint_path}: " + "; ".join(details)
-        )
+        raise RuntimeError(f"incompatible DF checkpoint {source}: " + "; ".join(details))
+
+
+def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
+    """Strictly restore every trainable DF tensor and no frozen backbone."""
+    state = checkpoint["state_dict"]
+    validate_df_state(model, state, str(checkpoint_path))
+    required = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
 
     # Older/full Lightning files may include valid frozen-backbone tensors.
     # Deliberately ignore them: the frozen verifier must come from the model
@@ -126,7 +132,12 @@ def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
     )
 
 
-def build_lit(cfg: DictConfig, variant: str | None = None):
+def build_lit(
+    cfg: DictConfig,
+    variant: str | None = None,
+    *,
+    restore_train_config: bool = True,
+):
     """Build FlowDraft/Orthrus and restore a checkpoint when configured.
 
     Evaluation checkpoints restore their saved model architecture, training
@@ -157,7 +168,9 @@ def build_lit(cfg: DictConfig, variant: str | None = None):
                         f"requested variant={requested_variant!r}, but checkpoint "
                         f"was trained as {saved_variant!r}"
                     )
-            _restore_checkpoint_config(cfg, checkpoint)
+            _restore_checkpoint_config(
+                cfg, checkpoint, restore_train=restore_train_config
+            )
             requested_variant = saved_variant or requested_variant
 
     canonical_variant = _canonical_variant(requested_variant)

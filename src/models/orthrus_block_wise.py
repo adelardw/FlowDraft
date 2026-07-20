@@ -60,12 +60,13 @@ class OrthrusBlockWise(FlowDraftBlockWise):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, df_logits, teacher_logits, block_mask = self._masked_step(batch)
-        live = block_mask.bool()
-        agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
-        self._maybe_decode_val(batch, batch_idx)
+        with self._frozen_val_rng(batch_idx):
+            loss, df_logits, teacher_logits, block_mask = self._masked_step(batch)
+            live = block_mask.bool()
+            agree = (df_logits.argmax(-1) == teacher_logits.argmax(-1))[live]
+            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+            self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+            self._maybe_decode_val(batch, batch_idx)
         return loss
 
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):

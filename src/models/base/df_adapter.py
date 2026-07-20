@@ -28,8 +28,39 @@ def _make_dual_pass_block_mask(batch, heads, q_len, ar_len, block_size, causal_l
         return allow_ar | allow_block
 
     return create_block_mask(
-        mask_fn, B=batch, H=heads, Q_LEN=q_len, KV_LEN=ar_len + q_len, BLOCK_SIZE=128
+        mask_fn,
+        B=batch,
+        H=heads,
+        Q_LEN=q_len,
+        KV_LEN=ar_len + q_len,
+        BLOCK_SIZE=128,
+        device=causal_limit.device,
     )
+
+
+def _dense_dual_pass_mask(
+    batch, q_len, ar_len, block_size, causal_limit, dtype, device
+):
+    """Materialize the Orthrus sparse relation as an additive SDPA mask.
+
+    FlexAttention has no CPU backward implementation. This equivalent dense
+    path keeps small CPU development and regression runs functional while the
+    production CUDA path remains sparse.
+    """
+    q_idx = torch.arange(q_len, device=device)
+    kv_idx = torch.arange(ar_len + q_len, device=device)
+    is_ar = kv_idx < ar_len
+    allow_ar = is_ar[None, None, :] & (
+        kv_idx[None, None, :] <= causal_limit[:, :, None]
+    )
+    same_block = (q_idx[:, None] // block_size) == (
+        (kv_idx[None, :] - ar_len) // block_size
+    )
+    allow = allow_ar | ((~is_ar) & same_block)[None]
+    mask = torch.zeros(
+        batch, 1, q_len, ar_len + q_len, dtype=dtype, device=device
+    )
+    return mask.masked_fill(~allow[:, None], torch.finfo(dtype).min)
 
 
 def _install_qwen3_flex_df_attention(module):
@@ -98,13 +129,16 @@ def _install_qwen3_flex_df_attention(module):
         # FA4's CuTeDSL FLASH backend is Hopper/Blackwell-only. Keep the
         # same sparse block semantics on older CUDA GPUs through FlexAttention
         # Triton, which is slower but avoids falling back to dense SDPA.
-        is_hopper_or_newer = q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 9
         q_bs, kv_bs = flex_block_mask.BLOCK_SIZE
-        kernel_options = (
-            {"BACKEND": "FLASH", "sparse_block_size": (int(q_bs), int(kv_bs))}
-            if is_hopper_or_newer
-            else {"BACKEND": "TRITON"}
-        )
+        if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 9:
+            kernel_options = {
+                "BACKEND": "FLASH",
+                "sparse_block_size": (int(q_bs), int(kv_bs)),
+            }
+        elif q.is_cuda:
+            kernel_options = {"BACKEND": "TRITON"}
+        else:
+            kernel_options = None
         out = compiled(
             q, k, v, block_mask=flex_block_mask, enable_gqa=True,
             kernel_options=kernel_options,
@@ -169,9 +203,14 @@ class FlowDraftAttentionAdapter(nn.Module):
         # must not mutate the frozen token embedding table, so keep it beside
         # the DF projections.  Initializing at the vocabulary mean is a
         # neutral starting point while allowing distillation to specialize it.
-        self.mask_embedding = nn.Parameter(embed_weight.detach().mean(0, keepdim=True))
+        # Keep optimizer-owned parameters in fp32. Mixed precision autocasts
+        # computation, but it does not create an fp32 master copy for an
+        # nn.Parameter that was registered as bf16.
+        self.mask_embedding = nn.Parameter(
+            embed_weight.detach().float().mean(0, keepdim=True)
+        )
         self.time_embed = FlowTimeEmbedding(self.model.config.hidden_size).to(
-            device=embed_weight.device, dtype=embed_weight.dtype
+            device=embed_weight.device
         )
         # The paper's training kernel is Qwen3-specific. Patch only Qwen3
         # attention modules; other model families retain the portable SDPA DF
@@ -226,7 +265,10 @@ class FlowDraftAttentionAdapter(nn.Module):
         for module_name, module in matched:
             for param_name, param in module.named_parameters():
                 names.append(f"{module_name}.{param_name}")
-                twins.append(nn.Parameter(param.detach().clone()))
+                # AdamW updates these fp32 master copies. The functional
+                # forward below casts them to the backbone compute dtype while
+                # retaining a differentiable path back to these parameters.
+                twins.append(nn.Parameter(param.detach().clone().float()))
         return tuple(names), nn.ParameterList(twins), len(matched)
 
     def df_parameters(self):
@@ -327,10 +369,31 @@ class FlowDraftAttentionAdapter(nn.Module):
                     raise ValueError("diffusion_block_size is required with causal_limit")
                 if past_key_values is None:
                     raise ValueError("paper FlexAttention DF path requires an AR cache")
-                flex_block_mask = _make_dual_pass_block_mask(
-                    batch, self.model.config.num_attention_heads, q_len, committed_len,
-                    int(diffusion_block_size), causal_limit,
-                )
+                if self.model.config.model_type != "qwen3":
+                    raise ValueError(
+                        "the paper sparse DF path (causal_limit) requires the "
+                        "patched Qwen3 attention; this backbone is "
+                        f"'{self.model.config.model_type}'"
+                    )
+                if inputs_embeds.is_cuda:
+                    flex_block_mask = _make_dual_pass_block_mask(
+                        batch,
+                        self.model.config.num_attention_heads,
+                        q_len,
+                        committed_len,
+                        int(diffusion_block_size),
+                        causal_limit,
+                    )
+                else:
+                    attention_mask = _dense_dual_pass_mask(
+                        batch,
+                        q_len,
+                        committed_len,
+                        int(diffusion_block_size),
+                        causal_limit,
+                        inputs_embeds.dtype,
+                        inputs_embeds.device,
+                    )
             # Qwen normally materializes a causal 4-D mask before calling
             # each attention layer. The patched DF attention ignores that
             # mask and consumes ``flex_block_mask`` instead, so pass an
@@ -345,7 +408,12 @@ class FlowDraftAttentionAdapter(nn.Module):
             )
             out = functional_call(
                 self.model,
-                dict(zip(self._df_names, self.df_weights)),
+                {
+                    name: weight.to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    )
+                    for name, weight in zip(self._df_names, self.df_weights)
+                },
                 kwargs=dict(
                     inputs_embeds=inputs_embeds,
                     attention_mask=model_attention_mask,

@@ -1,9 +1,11 @@
 import math
 import time
+from contextlib import contextmanager
 
 import lightning as L
 import torch
 import torch.nn.functional as F
+from loguru import logger
 from omegaconf import OmegaConf
 from transformers import DynamicCache
 from src.models.model import build_model
@@ -43,10 +45,37 @@ class FlowDraft(L.LightningModule):
         self.orthrus = orthrus
         self.tokenizer = tokenizer
         self.df_processor = df_processor
+        # FlowDraft uses Dirichlet simplex noise, not the masked baseline's
+        # learned mask token. Leaving this parameter trainable makes it unused
+        # in the backward graph and breaks DDP with find_unused_parameters=False.
+        self.orthrus.mask_embedding.requires_grad_(False)
         # Checkpoints hold only the DF head (see on_save_checkpoint), so the
         # frozen backbone keys are legitimately absent on load.
         self.strict_loading = False
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))
+
+    @contextmanager
+    def _teacher_eval(self):
+        """Temporarily evaluate the shared backbone for an AR teacher call.
+
+        The DF path functionally substitutes weights into this same module, so
+        keeping the backbone globally in eval mode would also disable any
+        training-mode behavior used by the drafter.
+        """
+        was_training = self.orthrus.model.training
+        self.orthrus.model.eval()
+        try:
+            yield
+        finally:
+            self.orthrus.model.train(was_training)
+
+    @contextmanager
+    def _frozen_val_rng(self, batch_idx: int):
+        """Make stochastic validation inputs repeatable without perturbing training."""
+        devices = None if self.device.type == "cpu" else [self.device]
+        with torch.random.fork_rng(devices=devices, device_type=self.device.type):
+            torch.manual_seed(int(self.cfg.seed) * 1_000_003 + batch_idx)
+            yield
 
     # --- mechanism passthrough ------------------------------------------------
 
@@ -145,6 +174,25 @@ class FlowDraft(L.LightningModule):
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
         return kl[live].mean()
 
+    def _td_term(self, pi, gamma, s, t, live, forward_dt):
+        """Finite-difference temporal drift inside ``s <= t' <= 1``.
+
+        A fixed backward probe near ``t=1`` can cross below ``s``. Select the
+        direction with usable room, shorten the probe at a boundary, and give
+        degenerate samples no TD weight.
+        """
+        dt_val = 0.05
+        prefer_forward = (t + dt_val <= 1.0) | (1.0 - t >= t - s)
+        room = torch.where(prefer_forward, 1.0 - t, t - s)
+        td_live = room >= 1e-3
+        step = room.clamp(max=dt_val).clamp(min=1e-3)
+        dt = torch.where(prefer_forward, step, -step)
+        pi_dt = forward_dt(dt).float().softmax(-1)
+        drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
+        drift = drift * td_live[:, None]
+        weighted = gamma.squeeze(-1).pow(2) * drift
+        return weighted[live].mean() if live.any() else pi.sum() * 0.0
+
     def compute_loss(self, batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t):
         """Categorical flow-map training plus optional AR distillation.
 
@@ -228,14 +276,16 @@ class FlowDraft(L.LightningModule):
                 tgt = self.orthrus(x_jump, mask, use_df=True, s=t, t=t).logits.float().softmax(-1)
         ec = -(tgt * log_draft).sum(-1)[live].mean()
 
-        # --- L_TD — eq. (16) in "Categorical Flow Maps" (Roos et al.):
-        # ||∂_t π^θ_{s,t}(x_s)||², finite difference in t
-        # (∂_t is a derivative w.r.t. the time INPUT — autograd .grad is not it).
-        dt_val = 0.05
-        dt = torch.where(t + dt_val <= 1.0, dt_val, -dt_val)
-        pi_dt = self.orthrus(x_s, mask, use_df=True, s=s, t=t + dt).logits.float().softmax(-1)
-        drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)  # [B, T]
-        td = (gamma.squeeze(-1) ** 2 * drift)[live].mean()
+        td = self._td_term(
+            pi,
+            gamma,
+            s,
+            t,
+            live,
+            forward_dt=lambda dt: self.orthrus(
+                x_s, mask, use_df=True, s=s, t=t + dt
+            ).logits,
+        )
 
         lam = self._lambda()
         endpoint_weight = self.cfg.train.get(
@@ -652,7 +702,7 @@ class FlowDraft(L.LightningModule):
         # The frozen teacher is unnecessary for paper-faithful endpoint
         # training. Keep it for validation metrics and optional AR-KL runs.
         if not self.training or self.cfg.train.get("ar_kl_weight", 0.0):
-            with torch.no_grad():
+            with torch.no_grad(), self._teacher_eval():
                 teacher_logits = self.orthrus(ids, mask).logits
         x_s, x_t, s, t = self.sample_trajectory(x1, mask)
         draft_logits = self.orthrus(x_s, mask, use_df=True, s=s, t=t).logits
@@ -667,15 +717,21 @@ class FlowDraft(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
-        loss = self.compute_loss(batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t)
-        # Cheap acceptance proxy: how often the drafter's argmax already
-        # matches the verifier's argmax (shifted: teacher@i predicts i+1).
-        mask = batch["attention_mask"][:, 1:].bool()
-        agree = (draft_logits[:, 1:].argmax(-1) == teacher_logits[:, :-1].argmax(-1))[mask]
-        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-        self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
-        self._maybe_decode_val(batch, batch_idx)
+        with self._frozen_val_rng(batch_idx):
+            teacher_logits, draft_logits, x_s, x_t, x1, s, t = self._shared_step(batch)
+            loss = self.compute_loss(
+                batch, teacher_logits, draft_logits, x_s, x_t, x1, s, t
+            )
+            # Cheap acceptance proxy: how often the drafter's argmax already
+            # matches the verifier's argmax (shifted: teacher@i predicts i+1).
+            mask = batch["attention_mask"][:, 1:].bool()
+            agree = (
+                draft_logits[:, 1:].argmax(-1)
+                == teacher_logits[:, :-1].argmax(-1)
+            )[mask]
+            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+            self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+            self._maybe_decode_val(batch, batch_idx)
         return loss
 
     def on_validation_epoch_start(self):
@@ -794,9 +850,40 @@ class FlowDraft(L.LightningModule):
         }
 
     def on_save_checkpoint(self, checkpoint):
-        # Keep only the DF head (~1.7 GB for 3B instead of ~14 GB with the
-        # frozen backbone); build_model restores the backbone from HF on load.
+        # Keep only the FP32 DF head; build_model restores the much larger
+        # frozen backbone from Hugging Face on load.
         trainable = {name for name, p in self.named_parameters() if p.requires_grad}
         checkpoint["state_dict"] = {
             key: value for key, value in checkpoint["state_dict"].items() if key in trainable
         }
+
+    def on_load_checkpoint(self, checkpoint):
+        """Validate DF-only state and migrate pre-mask-freeze optimizer state."""
+        state = checkpoint["state_dict"]
+        legacy_mask = "orthrus.mask_embedding"
+        if legacy_mask in state and not self.orthrus.mask_embedding.requires_grad:
+            # vcstk checkpoints optimized an unused FlowDraft mask parameter.
+            # Remove that tensor and its Adam slot while preserving every
+            # other parameter, scheduler value, and global step.
+            state.pop(legacy_mask)
+            current_count = len(list(self.orthrus.df_parameters()))
+            mask_position = len(self.orthrus.df_weights)
+            for optimizer_state in checkpoint.get("optimizer_states", []):
+                groups = optimizer_state.get("param_groups", [])
+                if len(groups) != 1 or len(groups[0].get("params", [])) != current_count + 1:
+                    raise RuntimeError(
+                        "cannot migrate legacy FlowDraft optimizer state: expected "
+                        "one parameter group containing exactly one obsolete mask parameter; "
+                        "use the checkpoint as a weights-only warm start instead"
+                    )
+                parameter_ids = groups[0]["params"]
+                removed_id = parameter_ids.pop(mask_position)
+                optimizer_state.get("state", {}).pop(removed_id, None)
+            logger.warning(
+                "migrated legacy FlowDraft checkpoint by removing the unused mask "
+                "parameter from model and optimizer state"
+            )
+
+        from src.models.factory import validate_df_state
+
+        validate_df_state(self, state, "resume checkpoint")
