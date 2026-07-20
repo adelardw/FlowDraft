@@ -24,6 +24,20 @@ class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
         # Block-wise baseline also never supplies flow-map times.
         self.orthrus.time_embed.requires_grad_(False)
 
+    def _df_forward(self, x_block, anchor, ctx_mask, cache, s=None, t=None):
+        """Masked Orthrus output alignment in block-wise geometry.
+
+        Unlike a flow-map endpoint predictor, a causal-LM diffusion head uses
+        the output at the clean anchor to predict the first fresh token.  For
+        ``[anchor, mask_1, ..., mask_K]``, rows ``[:-1]`` therefore align with
+        the K teacher distributions and the final mask row is unused.
+        """
+        x_in = torch.cat([anchor, x_block], dim=1)
+        logits = self.orthrus(
+            x_in, ctx_mask, use_df=True, past_key_values=cache
+        ).logits
+        return logits[:, :-1]
+
     def _masked_step(self, batch):
         teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor = self._prepare_block(batch)
         vocab = self.df_processor.vocab_size
@@ -66,6 +80,6 @@ class FlowMapOrthrusBaselineBlockWise(FlowMapOrthrusBlockWise):
             x_in = torch.cat([anchor, x_in], dim=1)
         mask = torch.ones(1, cache.get_seq_length() + x_in.size(1), dtype=torch.long, device=self.device)
         logits = self.orthrus(x_in, mask, use_df=True, past_key_values=cache).logits
-        q = (logits[:, 1:] if anchor_token is not None else logits).float().softmax(-1)
+        q = (logits[:, :-1] if anchor_token is not None else logits).float().softmax(-1)
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q

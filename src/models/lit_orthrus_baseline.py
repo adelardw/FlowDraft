@@ -96,7 +96,14 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         # The official FlexAttention mask uses one causal limit per synthetic
         # query. It represents this sparse relation directly, instead of a
         # dense [8192, 10240] SDPA mask.
-        causal_limit = anchors.repeat_interleave(width)[None].expand(ids.size(0), -1)
+        # The clean anchor rides inside the diffusion block.  Its AR K/V must
+        # therefore stay OUT of the historical cache view, exactly as at
+        # inference where the pending anchor has not been committed yet.
+        # ``_make_dual_pass_block_mask`` uses ``kv_idx <= causal_limit``, so
+        # the final visible AR key is the token immediately before the anchor.
+        causal_limit = (anchors - 1).repeat_interleave(width)[None].expand(
+            ids.size(0), -1
+        )
         df_all = self.orthrus(
             inputs_embeds=x_in,
             use_df=True,
@@ -105,7 +112,11 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
             causal_limit=causal_limit,
             diffusion_block_size=width,
         ).logits.view(ids.size(0), count, width, -1)
-        df_logits = df_all[:, :, 1:]
+        # Causal-LM row j predicts the token after input row j.  Orthrus feeds
+        # [anchor, mask, ..., mask], so the anchor through penultimate rows
+        # predict the K-1 fresh tokens; the final mask row has no target in
+        # this block.  This is also the convention used by official inference.
+        df_logits = df_all[:, :, :-1]
 
         # AR row p predicts token p+1, exactly the first drafted position.
         gather = anchors[:, None] + torch.arange(drafted, device=ids.device)
@@ -225,6 +236,8 @@ class FlowMapOrthrusBaseline(FlowMapOrthrusBlockWise):
         logits = self.orthrus(
             attention_mask=mask, inputs_embeds=x_in, use_df=True, past_key_values=cache
         ).logits
-        q = (logits[:, 1:] if anchor_token is not None else logits).float().softmax(-1)
+        # With a pending anchor, its output row predicts the first fresh token
+        # and the final mask row is unused (the standard causal-LM shift).
+        q = (logits[:, :-1] if anchor_token is not None else logits).float().softmax(-1)
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q
