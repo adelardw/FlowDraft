@@ -441,6 +441,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `checkpoint_config` | true | restore the saved backbone/tokenizer/adapter config, train parameters, and variant |
 | `variant` | null | inferred from checkpoint; without a checkpoint null selects `flowdraft` |
 | `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
+| `data.truncation` | false | evaluate the complete rendered dataset sample; dataset `max_length` limits remain active during training |
 | `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `flowdraft_block_wise` training variant (see the plain-words guide below) |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
 | `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
@@ -520,8 +521,10 @@ how fast. The verifier has the final word on every token.
 
 ## Evaluation
 
-Dataset prompts (full rendered prompts by default; `decode.prompt_len=N` for
-N-token prefixes) are decoded twice — flow-draft vs plain AR — and compared. Greedy losslessness is asserted **bitwise**, not assumed.
+Dataset prompts (complete rendered samples by default; `decode.prompt_len=N`
+for explicit N-token prefixes) are decoded twice — flow-draft vs plain AR —
+and compared. Dataset `max_length` limits apply to training, not standalone
+evaluation. Greedy losslessness is asserted **bitwise**, not assumed.
 
 When `checkpoint` is set, evaluation resolves the path from the original
 working directory, restores the saved model architecture and variant, and
