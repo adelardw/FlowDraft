@@ -152,7 +152,7 @@ def dataset_prompts(model, cfg):
                 label = f"sample {taken}"
             yield label, prompt
             taken += 1
-            if taken >= n_prompts:
+            if n_prompts is not None and taken >= n_prompts:
                 return
 
 
@@ -179,10 +179,13 @@ def main(cfg: DictConfig) -> None:
             top_k=dec.get("top_k", None),
             top_p=dec.get("top_p", None),
             coupled=dec.get("coupled", True),
+            eos_token_id=model.tokenizer.eos_token_id,
         )
         logger.info(f"{label!r}: {metrics}")
         results.append(metrics)
 
+    if not results:
+        raise RuntimeError(f"benchmark {cfg.data.dataset!r} produced no usable prompts")
     summary = aggregate(results)
     logger.info(
         f"=== block_size={dec.block_size} jumps={dec.jumps} "
@@ -201,7 +204,7 @@ def main(cfg: DictConfig) -> None:
         row = {
             "variant": cfg.get("variant", "flowdraft"),
             "model": cfg.model.name,
-            "dataset": cfg.data.dataset,
+            "dataset": cfg.data.get("benchmark", cfg.data.dataset),
             "checkpoint": cfg.checkpoint,
             "block_size": dec.block_size,
             "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),

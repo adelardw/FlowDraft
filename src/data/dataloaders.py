@@ -165,7 +165,17 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     load_kwargs = {"streaming": d.get("streaming", True)}
     if d.get("revision") is not None:
         load_kwargs["revision"] = d.revision
-    streams = [load_dataset(d.dataset, split=split, **load_kwargs) for split in d.splits]
+    if d.get("data_files") is not None:
+        from omegaconf import OmegaConf
+
+        load_kwargs["data_files"] = OmegaConf.to_container(
+            d.data_files, resolve=True
+        ) if OmegaConf.is_config(d.data_files) else d.data_files
+    subset = d.get("subset", None)
+    streams = [
+        load_dataset(d.dataset, subset, split=split, **load_kwargs)
+        for split in d.splits
+    ]
     ds = streams[0] if len(streams) == 1 else interleave_datasets(streams)
 
     use_template = getattr(tokenizer, "chat_template", None) is not None
@@ -182,12 +192,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     def render(example) -> str:
         messages = extract_messages(example)
         if use_template:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False,
+            template_kwargs = {
+                "tokenize": False,
                 # bare-prompt rows: end with the assistant header so the
                 # continuation starts where inference would
-                add_generation_prompt="messages" not in example,
-            )
+                "add_generation_prompt": "messages" not in example,
+            }
+            if d.get("enable_thinking") is not None:
+                template_kwargs["enable_thinking"] = d.enable_thinking
+            return tokenizer.apply_chat_template(messages, **template_kwargs)
         return "\n".join(m["content"] for m in messages)
 
     def collate(examples):

@@ -23,9 +23,9 @@ def generate(
         None, "--model",
         help="Model config name (qwen3_1.7b | qwen2_0.5b | llama3_3b) or an HF id with '/'.",
     ),
-    variant: str = typer.Option(
-        "flowdraft",
-        help="flowdraft | flowdraft_block_wise | orthrus | orthrus_block_wise",
+    variant: str | None = typer.Option(
+        None,
+        help="Override checkpoint variant: flowdraft | flowdraft_block_wise | orthrus | orthrus_block_wise",
     ),
     checkpoint: str = typer.Option(None, help="Trained DF-head .ckpt; omit for the raw drafter."),
     temperature: float = typer.Option(0.0, help="0 = greedy; >0 = sampling (coupled: bitwise lossless)."),
@@ -39,7 +39,9 @@ def generate(
 
     from src.models.factory import build_lit
 
-    overrides = [f"variant={variant}"]
+    overrides = []
+    if variant:
+        overrides.append(f"variant={variant}")
     if checkpoint:
         overrides.append(f"checkpoint={checkpoint}")
     if model_cfg:

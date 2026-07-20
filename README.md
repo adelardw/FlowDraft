@@ -421,7 +421,8 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | Key | Default | What it does |
 | --- | --- | --- |
 | `checkpoint` | null | trained DF-head `.ckpt`; null = untrained drafter |
-| `variant` | `flowdraft` | must match how the checkpoint was trained |
+| `checkpoint_config` | true | restore the saved backbone/tokenizer/adapter config, train parameters, and variant |
+| `variant` | null | inferred from checkpoint; without a checkpoint null selects `flowdraft` |
 | `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
 | `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `flowdraft_block_wise` training variant (see the plain-words guide below) |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
@@ -505,6 +506,14 @@ how fast. The verifier has the final word on every token.
 Dataset prompts (full rendered prompts by default; `decode.prompt_len=N` for
 N-token prefixes) are decoded twice — flow-draft vs plain AR — and compared. Greedy losslessness is asserted **bitwise**, not assumed.
 
+When `checkpoint` is set, evaluation resolves the path from the original
+working directory, restores the saved model architecture and variant, and
+strictly loads every trainable DF tensor. Missing, unknown, or shape-mismatched
+parameters fail before evaluation instead of being silently ignored. Runtime
+device, dtype, attention-kernel, and compile settings remain controlled by the
+evaluation config. Use `checkpoint_config=false` only for a legacy checkpoint
+without metadata, together with explicit matching `model=... variant=...`.
+
 ```bash
 ./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # variant=flowdraft is the default
 # block-size / jump-count ablation grid (hydra multirun):
@@ -520,14 +529,33 @@ attention kernel is a config switch (`model.backbone.attn_implementation`):
 **Continuation NLL** under the frozen teacher is computed in sampling mode
 only (at greedy the output is bitwise equal to AR, so it measures nothing).
 
-Two evaluation datasets (`configs/data/`): the **default is MATH-500**
-(`data=math500`) — a dataset the drafter never saw during training, so its
-acceptance/TPF is the honest generalization number; `data=nemotron` evaluates
-on the training distribution (its validation slice is excluded from training,
-but the texts are of the same kind). Report both: the gap between them shows
-how much the drafter overfits the training mix.
+The Orthrus quality table covers five benchmark families: **GSM8K**,
+**MATH-500**, **AIME**, **HumanEval**, and **MBPP**. AIME is represented by
+separate 2024 and 2025 sets, so the runnable suite has six dataset configs:
+`gsm8k`, `math500`, `aime24`, `aime25`, `humaneval`, and `mbpp`. The broader
+Orthrus efficiency table additionally reports Pseudo2Code and
+LiveCodeBench-v5. `data=nemotron` remains available for measuring the gap to
+the training distribution.
+
+Run the paper-style greedy, K=32 protocol once for FlowDraft and once for the
+Orthrus baseline (use the checkpoint belonging to each variant):
+
+```bash
+./hf-auth.sh uv run python src/eval.py -m +benchmark=orthrus \
+    data=gsm8k,math500,aime24,aime25,humaneval,mbpp \
+    variant=flowdraft checkpoint=/absolute/path/flowdraft.ckpt
+./hf-auth.sh uv run python src/eval.py -m +benchmark=orthrus \
+    data=gsm8k,math500,aime24,aime25,humaneval,mbpp \
+    variant=orthrus checkpoint=/absolute/path/orthrus.ckpt
+```
+
+Every prompt is decoded by the selected drafter and by plain AR; bitwise
+identity is asserted before acceptance, TPF, and throughput are reported.
+Consequently benchmark quality is inherited exactly from the frozen AR model;
+HumanEval/MBPP functional pass rates still require their official sandboxed
+code-execution harnesses.
 Bench problems are wrapped with the verifier's chat template (user turn +
-generation prompt) and decoded from the **full prompt**
+generation prompt, with Qwen3 thinking disabled as in Orthrus) and decoded from the **full prompt**
 (`decode.prompt_len=null`); set an int for prefix-continuation mode.
 
 ## Results
