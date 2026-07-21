@@ -49,19 +49,12 @@ class FlowDraftBlockWise(FlowDraft):
             doc_windows = document_ids.unfold(1, block + 1, 1)
             same_document = (doc_windows == doc_windows[..., :1]).all(-1)
 
-            width = attention_mask.size(1)
-            index = torch.arange(width, device=attention_mask.device)[None]
-            boundary = torch.ones_like(attention_mask, dtype=torch.bool)
-            boundary[:, 1:] = document_ids[:, 1:] != document_ids[:, :-1]
-            starts = torch.where(boundary, index, torch.zeros_like(index))
-            document_position = index - starts.cummax(dim=1).values
-            valid = live_windows & same_document & (
-                document_position[:, : live_windows.size(1)] >= min_prefix
-            )
+            valid = live_windows & same_document
             candidates = torch.nonzero(valid.all(0), as_tuple=False).flatten()
+            candidates = candidates[candidates >= min_prefix]
             if candidates.numel() == 0:
                 raise ValueError(
-                    "no packed document has the configured min_prefix plus block_size"
+                    "no packed document contains anchor + requested block"
                 )
             choice = torch.randint(
                 candidates.numel(), (1,), device=attention_mask.device
@@ -99,35 +92,25 @@ class FlowDraftBlockWise(FlowDraft):
             raise ValueError("cannot train on width<3 batches: prefix + anchor + block needed")
         p = min(p, width - 2)
         block = min(block, width - p - 1)
-        doc_start = 0
-        if document_ids is not None and bool(
-            self.cfg.train.get("respect_document_boundaries", True)
-        ):
-            if ids.size(0) != 1:
-                raise ValueError(
-                    "boundary-aware packed block-wise training requires data.batch_size=1"
-                )
-            anchor_document = document_ids[0, p]
-            starts = torch.nonzero(
-                document_ids[0, : p + 1] != anchor_document, as_tuple=False
-            ).flatten()
-            doc_start = int(starts[-1] + 1) if starts.numel() else 0
-
-        local_p = p - doc_start
-        ctx_mask = mask[:, doc_start : p + 1 + block]
+        # Match Orthrus packing semantics: the AR teacher and clean cache see
+        # the complete causal packed prefix. Document IDs constrain only the
+        # anchor + drafted window, so no proposal crosses an EOS boundary.
+        # Keeping a common prefix length lets local batches larger than one
+        # share a rectangular KV cache even when their document starts differ.
+        ctx_mask = mask[:, : p + 1 + block]
 
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad(), self._teacher_eval():
             teacher_full = self.orthrus(
-                ids[:, doc_start : p + 1 + block],
+                ids[:, : p + 1 + block],
                 ctx_mask,
                 past_key_values=cache,
             ).logits
         # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
         # K/V are NOT in the cache while drafting. The AR logits at
         # [p : p+K] are the distributions of the fresh tokens p+1..p+K.
-        cache.crop(local_p)
-        teacher_logits = teacher_full[:, local_p : local_p + block]
+        cache.crop(p)
+        teacher_logits = teacher_full[:, p : p + block]
 
         # position p — the clean in-block anchor; p+1..p+K — the drafted block
         anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])
