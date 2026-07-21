@@ -414,7 +414,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.variant` | `flowdraft` | which drafter to train: the task — `flowdraft` \| `orthrus` (full-sequence); the addition — `flowdraft_block_wise` \| `orthrus_block_wise` (inference geometry) |
 | `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
-| `train.respect_document_boundaries` | true | packed FlowDraft isolates bidirectional DF attention and prevents blocks/loss transitions from crossing source documents |
+| `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
 | `train.lr_schedule` | `cosine` | `cosine` (linear warmup → cosine decay to 0; needs a finite `trainer.max_steps` or `limit_train_batches`+`max_epochs`) \| `constant` |
 | `train.warmup_ratio` | 0.05 | cosine only: fraction of total steps spent warming up |

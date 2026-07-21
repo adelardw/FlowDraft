@@ -24,11 +24,10 @@ data:
   pack_sequences: true
   pad_to_max_length: true
   train_size: 600000
-  batch_size: 1
+  batch_size: 2
   max_length: 2048
 
 trainer:
   max_steps: 10000
-  accumulate_grad_batches: 64
+  accumulate_grad_batches: 32
   val_check_interval: 500
-
