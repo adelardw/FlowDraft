@@ -15,6 +15,13 @@ split_label: null
 lossless_policy: assert       # assert (canonical) | diagnose (throughput audit) | ignore
 variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
 
+# Validation 2x2 provenance (scripts/run_validation.sh). ``weights_source``
+# labels WHOSE diffusion head is being measured, independently of whose decode
+# loop runs it, so one JSONL can hold all four cells:
+#   authors|ours x codebase ours (src/eval.py) | reference (src/eval_reference.py)
+weights_source: null        # authors | ours
+reference_path: null        # src/eval_reference.py only: an Orthrus release directory
+
 # Eager is the canonical bitwise-correctness backend. SDPA throughput audits
 # override this explicitly and use lossless_policy=diagnose.
 model:

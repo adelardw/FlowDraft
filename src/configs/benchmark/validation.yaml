@@ -1,0 +1,22 @@
+# @package _global_
+# Validation 2x2, single-GPU profile (PROFILE=quick in scripts/run_validation.sh).
+#
+# Sized so the full grid — 4 cells x 2 block sizes x the benchmark list — fits in
+# one night on a 12 GB card. 30 prompts is also the entire AIME-24/25 split, so
+# those two benchmarks are complete rather than subsampled here.
+#
+# Only the decode protocol lives here. dtype, attention kernel and
+# lossless_policy are hardware/policy knobs and are set by the runner, so the
+# same protocol can be replayed on different machines.
+decode:
+  block_size: 8            # overridden per run: 8 (ours) and 32 (theirs)
+  jumps: 1                 # the masked drafter reconstructs a block in one step
+  max_new_tokens: 512
+  n_prompts: 30
+  prompt_offset: 0
+  prompt_len: null         # the full rendered prompt — the honest bench setting
+  temperature: 0.0         # greedy: acceptance and losslessness are both well-defined
+  top_k: null
+  top_p: null
+  coupled: true
+  equiv_samples: 0

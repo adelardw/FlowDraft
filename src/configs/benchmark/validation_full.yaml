@@ -1,0 +1,19 @@
+# @package _global_
+# Validation 2x2, paper-scale profile (PROFILE=full in scripts/run_validation.sh).
+#
+# Same protocol as benchmark/validation.yaml but over the complete validation
+# split of each benchmark at the paper's 2048-token generation budget. This is
+# the configuration to run on a multi-GPU server; on a single 12 GB card it is a
+# multi-week job, which is why `quick` exists.
+decode:
+  block_size: 8            # overridden per run: 8 (ours) and 32 (theirs)
+  jumps: 1
+  max_new_tokens: 2048
+  n_prompts: null          # the whole val slice of each benchmark
+  prompt_offset: 0
+  prompt_len: null
+  temperature: 0.0
+  top_k: null
+  top_p: null
+  coupled: true
+  equiv_samples: 0

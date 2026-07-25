@@ -189,3 +189,6 @@ AGENTS.md
 
 outputs
 checkpoints
+
+# Local model artifacts (multi-GB): our baseline ckpt + the authors Orthrus release
+weights

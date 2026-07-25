@@ -274,6 +274,10 @@ def main(cfg: DictConfig) -> None:
         "run_id": cfg.get("run_id", None),
         "experiment_id": cfg.get("experiment_id", None),
         "split_label": cfg.get("split_label", None),
+        # Which decode loop ran, and whose DF head it ran — the two axes of the
+        # validation 2x2 (see scripts/run_validation.sh).
+        "codebase": "ours",
+        "weights_source": cfg.get("weights_source", None),
         "eval_seed": cfg.seed,
         "training_seed": getattr(model, "checkpoint_seed", None),
         "training_run_name": getattr(model, "checkpoint_run_name", None),

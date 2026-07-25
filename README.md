@@ -595,6 +595,81 @@ Bench problems are wrapped with the verifier's chat template (user turn +
 generation prompt, with Qwen3 thinking disabled as in Orthrus) and decoded from the **full prompt**
 (`decode.prompt_len=null`); set an int for prefix-continuation mode.
 
+## Validating against the official Orthrus release
+
+Our Orthrus baseline can be wrong in two independent ways: the decode loop can be
+buggy, or the training can be bad. Benchmarking our checkpoint alone cannot tell
+those apart. So we swap **weights** and **code** independently and measure all
+four combinations against the authors' release ([`chiennv/Orthrus-Qwen3-1.7B`](https://huggingface.co/chiennv/Orthrus-Qwen3-1.7B), CC-BY-4.0):
+
+| cell | diffusion weights | decode loop | entry point |
+| --- | --- | --- | --- |
+| A | authors | authors | `src/eval_reference.py` on the release |
+| B | authors | ours | `src/eval.py` on the converted checkpoint |
+| C | ours | ours | `src/eval.py` on our trained baseline |
+| D | ours | authors | `src/eval_reference.py` on the reverse-converted repo |
+
+Cell A vs B isolates our implementation; A vs C isolates our training.
+
+```bash
+./scripts/run_validation.sh                 # single-GPU profile
+PROFILE=full ./scripts/run_validation.sh    # paper protocol: whole splits, 2048 new tokens
+DRY_RUN=1 ./scripts/run_validation.sh       # print the run plan and exit
+```
+
+One command covers everything: it downloads the release if absent, converts
+weights in both directions, runs the equivalence gate, sweeps the grid, audits
+losslessness, and writes [results/validation.md](results/validation.md). Nothing
+is machine-specific; override `PROFILE`, `BENCHMARKS`, `BLOCK_SIZES`, `DTYPE`,
+`ATTN` or `PYTHON` to move it to another box.
+
+**Resuming.** Every stage is resume-safe at **whole-run granularity**. Before each
+leg the runner looks for a row with the same `(run_id, codebase, weights_source,
+dataset, block_size)` in the results file and skips it; results are appended
+under `fcntl.flock`, and a line truncated by a kill is ignored rather than
+crashing the scan. So an interrupted sweep continues where it stopped and a
+finished one re-runs as a no-op — but the run in flight when the process died is
+redone from its first prompt, since per-prompt rows are written in one batch at
+the end of a run. Under `PROFILE=quick` that costs about three minutes; under
+`PROFILE=full`, where one leg is a whole split at 2048 tokens, it can cost hours.
+
+`run_id` is the profile, and each profile writes its own
+`results/validation-$PROFILE.jsonl`. Both are deliberate: `quick` and `full`
+differ only in `n_prompts`/`max_new_tokens`, so without them a quick sweep would
+be mistaken for a finished paper-scale one and skipped, and the two would land in
+a single table as if their rows were comparable.
+
+    DRY_RUN=1 ./scripts/run_validation.sh   # what is already done vs still pending
+
+**Why the conversion is faithful.** The release keeps its diffusion path as dense
+per-layer twins (`...self_attn.{q,k,v,o}_proj_diff.weight`, `{q,k}_norm_diff.weight`)
+— exactly the modules our `adapter.w_names` selects, 6 per layer × 28 layers = 168
+tensors of identical shape (352.3M parameters either way). `src/tools/convert_orthrus.py`
+reads the index off `adapter._df_names` rather than reconstructing it, and its
+`verify` subcommand round-trips the release through our layout and back, requiring
+all 169 tensors to come out bitwise identical. The `r`/`lora_alpha` fields in their
+`config.json` are vestigial; no LoRA tensors exist in the release. Their frozen
+backbone is bitwise equal to stock `Qwen/Qwen3-1.7B`, so both cells verify with the
+same model. The single structural difference is the `[MASK]` input — theirs is a
+vocabulary token (`mask_token_id`), ours a free `mask_embedding` parameter — and
+the converter moves that vector across in either direction.
+
+**The gate.** `src/tools/equivalence_gate.py` loads the authors' weights into both
+codebases, gives both an identical prefix cache and an identical
+`[anchor, MASK × (K-1)]` block, and compares one diffusion forward in float32/eager.
+The runner treats failure as fatal: if the two disagree, the grid measures a bug
+rather than a drafter.
+
+**Reading the numbers.** `acceptance` (drafted tokens accepted per cycle; the
+clean anchor is not counted, so K=32 admits at most 31) and `TPF` are properties
+of the method and compare **across** codebases. `tokens_per_s` and `speedup`
+also carry each harness's Python overhead — the reference AR baseline is HF
+`GenerationMixin.generate`, ours is a hand-rolled loop — so they compare only
+**within** one codebase, against its own AR baseline. The throughput grid runs
+bf16 with fused kernels, where bitwise equality with AR fails for numerical
+reasons alone; losslessness is therefore certified in a separate float32/eager
+audit rather than asserted mid-grid.
+
 ## Results
 
 > 🚧 **TODO.** Fill in once experiments are done. All rows must be verified lossless.
