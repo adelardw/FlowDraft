@@ -163,6 +163,11 @@ def main(cfg: DictConfig) -> None:
     quiet_download_logs()
     torch.manual_seed(cfg.seed)
     model = build_lit(cfg)
+    # build_lit never calls .to() (unlike src/train.py, where the Lightning
+    # Trainer does this automatically) — the backbone lands on cuda via
+    # device_map=auto, but LightningModule.device stays 'cpu' until moved
+    # explicitly, and generate()/_encode() trust that attribute.
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     dec = cfg.decode
     results = []

@@ -6,8 +6,8 @@ import torch
 from hydra.utils import to_absolute_path
 from loguru import logger
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel
 
@@ -224,9 +224,9 @@ def main(cfg: DictConfig) -> None:
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
     configure_ddp_strategy(trainer_kwargs)
     trainer = L.Trainer(
+        logger=build_loggers(cfg),
         callbacks=callbacks,
         default_root_dir=cfg.output_dir,
-        logger=build_loggers(cfg),
         **trainer_kwargs,
     )
     trainer.fit(
