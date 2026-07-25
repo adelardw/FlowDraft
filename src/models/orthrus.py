@@ -99,7 +99,9 @@ class Orthrus(FlowDraftBlockWise):
         anchor_ids = ids[:, anchors]  # [B, A]
         embed = self.orthrus.model.get_input_embeddings()
         anchor_embeds = embed(anchor_ids).unsqueeze(2)
-        mask_embed = self.orthrus.mask_embedding.to(anchor_embeds.dtype)[None, None]
+        mask_embed = self.orthrus.mask_embedding.to(
+            device=anchor_embeds.device, dtype=anchor_embeds.dtype
+        )[None, None]
         masked_embeds = mask_embed.expand(ids.size(0), count, drafted, -1)
         x_in = torch.cat([anchor_embeds, masked_embeds], dim=2).flatten(1, 2)
 
@@ -278,15 +280,23 @@ class Orthrus(FlowDraftBlockWise):
         drafted = block_size - 1
         if drafted <= 0:
             raise ValueError("baseline block_size must be at least 2 (anchor + one mask)")
-        masks = self.orthrus.mask_embedding.to(
-            device=self.device, dtype=embed.weight.dtype
-        ).expand(1, drafted, -1)
         if anchor_token is not None:
-            anchor = embed(anchor_token.view(1, 1))
+            anchor = embed(anchor_token.to(self._generation_device()).view(1, 1))
+            masks = self.orthrus.mask_embedding.to(
+                device=anchor.device, dtype=anchor.dtype
+            ).expand(1, drafted, -1)
             x_in = torch.cat([anchor, masks], dim=1)
         else:
+            masks = self.orthrus.mask_embedding.to(
+                device=self._generation_device(), dtype=embed.weight.dtype
+            ).expand(1, drafted, -1)
             x_in = masks
-        mask = torch.ones(1, cache.get_seq_length() + x_in.size(1), dtype=torch.long, device=self.device)
+        mask = torch.ones(
+            1,
+            cache.get_seq_length() + x_in.size(1),
+            dtype=torch.long,
+            device=x_in.device,
+        )
         logits = self.orthrus(
             attention_mask=mask, inputs_embeds=x_in, use_df=True, past_key_values=cache
         ).logits

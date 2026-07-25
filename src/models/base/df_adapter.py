@@ -87,7 +87,15 @@ def _install_qwen3_flex_df_attention(module):
         return
 
     compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
-    original_forward = module.forward
+    # Accelerate installs its device-dispatch wrapper in ``module.forward``
+    # and keeps the model's implementation in ``module._old_forward``. Patch
+    # that implementation when present: replacing ``module.forward`` would
+    # discard the pre-forward move to this layer's device under device_map.
+    has_accelerate_hook = (
+        getattr(module, "_hf_hook", None) is not None
+        and hasattr(module, "_old_forward")
+    )
+    original_forward = module._old_forward if has_accelerate_hook else module.forward
 
     def forward(hidden_states, position_embeddings, attention_mask, past_key_values=None,
                 use_df=False, ar_seq_len=None, flex_block_mask=None, **kwargs):
@@ -146,7 +154,10 @@ def _install_qwen3_flex_df_attention(module):
         out = out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         return module.o_proj(out), None
 
-    module.forward = forward
+    if has_accelerate_hook:
+        module._old_forward = forward
+    else:
+        module.forward = forward
     module._flowdraft_flex_df_installed = True
 
 
@@ -406,11 +417,17 @@ class FlowDraftAttentionAdapter(nn.Module):
                     inputs_embeds.dtype, inputs_embeds.device,
                 )
             )
+            # With a sharded HF ``device_map``, the embedding and decoder
+            # layers do not necessarily live on the same GPU. Each DF master
+            # weight must follow the corresponding backbone parameter rather
+            # than ``inputs_embeds`` (which starts on the embedding device).
+            backbone_parameters = dict(self.model.named_parameters())
             out = functional_call(
                 self.model,
                 {
                     name: weight.to(
-                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                        device=backbone_parameters[name].device,
+                        dtype=backbone_parameters[name].dtype,
                     )
                     for name, weight in zip(self._df_names, self.df_weights)
                 },
