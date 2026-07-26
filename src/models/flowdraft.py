@@ -921,13 +921,17 @@ class FlowDraft(L.LightningModule):
             self.log(
                 "val/acceptance_decode",
                 stats[2] / stats[3],
-                sync_dist=False,
+                # ``stats`` is already an all-rank sum, so every rank logs
+                # the same global ratio. Lightning's mean synchronization is
+                # idempotent here and keeps distributed checkpoint monitors
+                # warning-free.
+                sync_dist=True,
             )
         self.log(
             "val/tpf",
             stats[0] / stats[1],
             prog_bar=True,
-            sync_dist=False,
+            sync_dist=True,
         )
 
     @torch.no_grad()
