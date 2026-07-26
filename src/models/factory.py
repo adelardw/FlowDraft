@@ -11,7 +11,6 @@ _VARIANT_ALIASES = {
     "fixed": "flowdraft",
     "block_wise": "flowdraft_block_wise",
     "baseline": "orthrus",
-    "baseline_block_wise": "orthrus_block_wise",
 }
 _RUNTIME_BACKBONE_KEYS = {
     "attn_implementation",
@@ -183,8 +182,6 @@ def build_lit(
 
     if canonical_variant == "orthrus":
         from src.models.orthrus import Orthrus as Module
-    elif canonical_variant == "orthrus_block_wise":
-        from src.models.orthrus_block_wise import OrthrusBlockWise as Module
     elif canonical_variant == "flowdraft_block_wise":
         from src.models.flowdraft_block_wise import FlowDraftBlockWise as Module
     elif canonical_variant == "flowdraft":
@@ -192,7 +189,7 @@ def build_lit(
     else:
         raise ValueError(
             f"unknown variant='{requested_variant}' (flowdraft | flowdraft_block_wise | "
-            "orthrus | orthrus_block_wise)"
+            "orthrus)"
         )
 
     model = Module(cfg)
