@@ -63,7 +63,36 @@ def _dense_dual_pass_mask(
     return mask.masked_fill(~allow[:, None], torch.finfo(dtype).min)
 
 
-def _install_qwen3_flex_df_attention(module):
+def _flex_kernel_options(q, block_mask, backend):
+    """Choose the sparse CUDA kernel without silently opting into FA4.
+
+    FlexAttention's FLASH backend is newer and has produced illegal memory
+    accesses for valid-but-irregular block masks. Keep the mature Triton path
+    as the default; FLASH remains available as an explicit performance opt-in.
+    """
+    backend = str(backend).upper()
+    if backend not in {"AUTO", "TRITON", "FLASH"}:
+        raise ValueError(
+            "flex_attention_backend must be auto, triton, or flash; "
+            f"got {backend!r}"
+        )
+    if not q.is_cuda:
+        return None
+    if backend == "FLASH":
+        if torch.cuda.get_device_capability(q.device)[0] < 9:
+            raise ValueError(
+                "FlexAttention FLASH requires a Hopper-or-newer CUDA GPU; "
+                "use model.adapter.flex_attention_backend=triton"
+            )
+        q_bs, kv_bs = block_mask.BLOCK_SIZE
+        return {
+            "BACKEND": "FLASH",
+            "sparse_block_size": (int(q_bs), int(kv_bs)),
+        }
+    return {"BACKEND": backend}
+
+
+def _install_qwen3_flex_df_attention(module, *, backend="triton"):
     """Patch Qwen3 attention with Orthrus's sparse diffusion-only path.
 
     The ordinary AR path remains the upstream HF implementation. During a DF
@@ -134,19 +163,16 @@ def _install_qwen3_flex_df_attention(module):
             return module.o_proj(out), weights
         if past_key_values is None or ar_seq_len is None:
             raise ValueError("sparse DF FlexAttention requires an AR cache and ar_seq_len")
-        # FA4's CuTeDSL FLASH backend is Hopper/Blackwell-only. Keep the
-        # same sparse block semantics on older CUDA GPUs through FlexAttention
-        # Triton, which is slower but avoids falling back to dense SDPA.
-        q_bs, kv_bs = flex_block_mask.BLOCK_SIZE
-        if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 9:
-            kernel_options = {
-                "BACKEND": "FLASH",
-                "sparse_block_size": (int(q_bs), int(kv_bs)),
-            }
-        elif q.is_cuda:
-            kernel_options = {"BACKEND": "TRITON"}
-        else:
-            kernel_options = None
+        expected_shape = (q.size(2), k.size(2))
+        mask_shape = tuple(flex_block_mask.seq_lengths)
+        if mask_shape != expected_shape:
+            # A mismatched BlockMask can produce an out-of-bounds FlexAttention
+            # kernel access instead of a clean shape error.
+            raise ValueError(
+                "FlexAttention BlockMask/input mismatch: "
+                f"mask Q/KV={mask_shape}, tensors Q/KV={expected_shape}"
+            )
+        kernel_options = _flex_kernel_options(q, flex_block_mask, backend)
         out = compiled(
             q, k, v, block_mask=flex_block_mask, enable_gqa=True,
             kernel_options=kernel_options,
@@ -199,7 +225,12 @@ class FlowDraftAttentionAdapter(nn.Module):
     needs no changes if you unfreeze it.
     """
 
-    def __init__(self, model, w_names=("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")):
+    def __init__(
+        self,
+        model,
+        w_names=("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
+        flex_attention_backend="triton",
+    ):
         super().__init__()
         self.model = model
         # Kept outside ``nn.Module`` registration. A compiled wrapper holds a
@@ -228,7 +259,10 @@ class FlowDraftAttentionAdapter(nn.Module):
         # implementation below.
         if self.model.config.model_type == "qwen3":
             for layer in self.model.model.layers:
-                _install_qwen3_flex_df_attention(layer.self_attn)
+                _install_qwen3_flex_df_attention(
+                    layer.self_attn,
+                    backend=flex_attention_backend,
+                )
 
     def enable_ar_compile(self, *, mode: str = "default", dynamic: bool = False) -> None:
         """Compile the fixed-shape frozen AR teacher forward.

@@ -37,3 +37,7 @@ adapter:
   # Official Orthrus maintains a full separate diffusion attention path:
   # Q/K/V/O projections plus the per-head Q/K normalization weights.
   w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]
+  # Triton is the stable sparse FlexAttention training kernel. FLASH/FA4 has
+  # higher peak throughput on H100/H200 but remains an explicit opt-in because
+  # irregular block masks can trigger fatal CUDA illegal-memory-access errors.
+  flex_attention_backend: triton

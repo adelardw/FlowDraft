@@ -47,7 +47,13 @@ def build_model(cfg: DictConfig):
     backbone.eval()
 
     df_processor = DiffusionProcessor.from_model(tokenizer, backbone)
-    model = FlowDraftAttentionAdapter(backbone, w_names=list(cfg.adapter.w_names))
+    model = FlowDraftAttentionAdapter(
+        backbone,
+        w_names=list(cfg.adapter.w_names),
+        flex_attention_backend=cfg.adapter.get(
+            "flex_attention_backend", "triton"
+        ),
+    )
     if compile_ar:
         model.enable_ar_compile(mode=compile_mode, dynamic=compile_dynamic)
 
