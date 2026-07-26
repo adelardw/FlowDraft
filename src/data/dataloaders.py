@@ -304,7 +304,9 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # Validation is a separate read of the source stream. It must not consume
     # rows from the paper-faithful 600K-example training sample.
     val_ds = RankSharded(ds.take(val_size), size=val_size) if val_size else None
-    train_ds = ds
+    # Keep validation genuinely held out while preserving exactly
+    # ``train_size`` training rows after it.
+    train_ds = ds.skip(val_size) if val_size else ds
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
