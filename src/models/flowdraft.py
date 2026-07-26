@@ -26,9 +26,9 @@ class FlowDraft(L.LightningModule):
     The categorical flow-map objective lives in :meth:`compute_loss`:
     ``endpoint + lambda * (4*EC + 2*TD)`` — categorical VFM anchors the
     diagonal ``π_{t,t}``, endpoint consistency propagates it to the jumps,
-    and temporal drift keeps the family smooth in ``t``. An optional,
-    separately weighted AR KL auxiliary can align the diagonal with the
-    verifier for experimental runs.
+    and temporal drift keeps the family smooth in ``t``. Optional verifier
+    auxiliaries align either the diagonal or, in block-wise training, the
+    exact one-jump inference map ``π_{0,1}`` with the frozen AR distribution.
 
     Expected batch — a dict with:
         ``input_ids [B, T]`` (long) · ``attention_mask [B, T]`` (long, 1=live)
@@ -133,19 +133,22 @@ class FlowDraft(L.LightningModule):
         if sampler is None:
             raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle | paper)")
         s, t = sampler(batch, simplex.device)
-        x0 = torch.distributions.Dirichlet(
-            torch.ones(simplex.size(-1), device=simplex.device)
-        ).sample(simplex.shape[:2])
+        x0 = self.sample_prior(simplex, attention_mask)
         x_s = (1.0 - s[:, None, None]) * x0 + s[:, None, None] * simplex
         # Same trajectory at time t — the anchor input. Built from DATA, so it
         # is correct from step one (a landing-point anchor would bootstrap on
         # the untrained jump's garbage and chase a θ-dependent distribution).
         x_t = (1.0 - t[:, None, None]) * x0 + t[:, None, None] * simplex
-        if attention_mask is not None:
-            pad = attention_mask[..., None].to(x_s.dtype)
-            x_s = x_s * pad
-            x_t = x_t * pad
         return x_s, x_t, s, t
+
+    def sample_prior(self, simplex, attention_mask=None):
+        """Sample the exact prior consumed by one-jump training and decoding."""
+        x0 = torch.distributions.Dirichlet(
+            torch.ones(simplex.size(-1), device=simplex.device)
+        ).sample(simplex.shape[:2])
+        if attention_mask is not None:
+            x0 = x0 * attention_mask[..., None].to(x0.dtype)
+        return x0
 
     # --- the loss is yours ----------------------------------------------------
 

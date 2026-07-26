@@ -284,6 +284,8 @@ def main(cfg: DictConfig) -> None:
         "train_time_sampling": train_cfg.get("time_sampling", None),
         "train_lambda": train_cfg.get("lambda", None),
         "train_ar_kl_weight": train_cfg.get("ar_kl_weight", None),
+        "train_verify_kl_weight": train_cfg.get("verify_kl_weight", None),
+        "train_anchors_per_sequence": train_cfg.get("anchors_per_sequence", None),
         "train_anchor_point": train_cfg.get("anchor_point", None),
         "block_size": dec.block_size,
         "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),
