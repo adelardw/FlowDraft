@@ -10,7 +10,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: core implementation landed and smoke-verified** — adapter, four training variants (`flowdraft`, `flowdraft_block_wise`, `orthrus`, and `orthrus_block_wise`; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
+> 🚧 **Status: core implementation landed and smoke-verified** — adapter, three training variants (`flowdraft`, `flowdraft_block_wise`, and `orthrus`; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -155,18 +155,17 @@ The command summary:
 # Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
 #           (data=nemotron evaluates on the training distribution);
 #           block-size x jumps grid -> results/eval.jsonl -> report figures.
-#           NOTE: decode.block_size = K, the number of tokens drafted per cycle at
-#           INFERENCE — a knob of EVERY variant; it is unrelated to the
+#           NOTE: decode.block_size = total width K: one clean anchor + K-1
+#           drafted tokens per cycle — a knob of EVERY variant; it is unrelated to the
 #           flowdraft_block_wise TRAINING-geometry variant despite the similar name
 ./hf-auth.sh uv run python src/eval.py -m model=qwen3_1.7b variant=flowdraft checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
 uv run python src/plots.py
 
-# ADDITION (beyond the task) — both drafters retrained in the exact inference
-# geometry (block-causal): the geometry-for-geometry comparison
-./hf-auth.sh uv run python src/train.py +experiment=orthrus_block_wise
+# ADDITION (beyond the task) — FlowDraft retrained in the exact inference
+# geometry (block-causal), directly comparable with Orthrus
 ./hf-auth.sh uv run python src/train.py +experiment=flowdraft_block_wise
-#   eval: same stage-5 commands with variant=orthrus_block_wise / flowdraft_block_wise
+#   eval: same stage-5 commands with variant=orthrus / flowdraft_block_wise
 ```
 
 Training curves land in TensorBoard (`uv run tensorboard --logdir checkpoints`);
@@ -254,8 +253,8 @@ One frozen backbone, two attention paths (the Orthrus host), and a Categorical F
   - **EC** — eq. (18) of *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — jumps learn from the diagonal at their own landing point; truth flows `x1 → π_{t,t} → π_{s,t}`.
   - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
   - Time pairs `(s, t)` per sample (`train.time_sampling`): `paper` (default: t~U, s~U[0,t]) | `triangle` | `sequential`.
-- **Training geometries** (`train.variant`): the task's variants are full-sequence — `flowdraft` (noise the whole sequence) and `orthrus` (Orthrus' own single-step masked-diffusion drafter: no time conditioning, barycenter as the simplex-native `[MASK]`). Our **addition beyond the task**: `flowdraft_block_wise` / `orthrus_block_wise` — the same two drafters retrained in the exact inference geometry. Packed block-wise FlowDraft can flatten several isolated anchor+K blocks into one DF pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
-- **Decoding** (`FlowDraft.generate`): draft K fresh tokens in 1–few jumps → ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as a clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
+- **Training geometries** (`train.variant`): `flowdraft` noises the full sequence; `flowdraft_block_wise` trains FlowDraft in the exact inference geometry; and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
+- **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ## Repository structure
 
@@ -272,8 +271,7 @@ FlowDraft/
     │   ├── factory.py             # build_lit: variant selection + checkpoint loading
     │   ├── flowdraft.py           # FlowDraft: loss, training, lossless generate
     │   ├── flowdraft_block_wise.py        # FlowDraft in the inference geometry
-    │   ├── orthrus.py             # Orthrus masked drafter (full-sequence)
-    │   └── orthrus_block_wise.py          # Orthrus masked drafter, block-causal
+    │   └── orthrus.py             # Orthrus masked drafter, block-causal
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
     ├── data/dataloaders.py        # streaming Dataset / collate / DataLoader;
     │                              #   EpochShuffled: repetitions in a new order (epochs)
@@ -284,8 +282,7 @@ FlowDraft/
     │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
     │   └── experiment/            # one preset per task stage + additions:
     │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
-    │                              #   ablate_consistency_only | orthrus_block_wise |
-    │                              #   flowdraft_block_wise
+    │                              #   ablate_consistency_only | flowdraft_block_wise
     ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
@@ -325,10 +322,10 @@ on-device, never in the batch.
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
-Variants: `flowdraft` is the project flow-map objective; `orthrus` is the
-paper-style Orthrus recipe (frozen AR cache plus 256 isolated anchored masked
-blocks); `flowdraft_block_wise` and `orthrus_block_wise` are the project’s single-block
-inference-geometry variants.
+Variants: `flowdraft` is the full-sequence flow-map objective; `orthrus` is the
+paper-style block-causal Orthrus recipe (frozen AR cache plus independently
+anchored masked blocks); and `flowdraft_block_wise` trains the flow-map
+drafter in that inference geometry.
 Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`lambda_ramp_steps`
 (VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
@@ -413,8 +410,8 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `wandb.project` / `entity` / `name` | `flowdraft` / null / null | W&B destination and optional run name; null uses W&B defaults |
 | `wandb.group` / `tags` | null / [] | optional W&B organization metadata |
 | `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
-| `train.variant` | `flowdraft` | which drafter to train: the task — `flowdraft` \| `orthrus` (full-sequence); the addition — `flowdraft_block_wise` \| `orthrus_block_wise` (inference geometry) |
-| `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
+| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `flowdraft_block_wise` (inference-geometry CFM) \| `orthrus` (block-causal masked drafter) |
+| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
 | `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; packed block-wise FlowDraft defaults to 4 |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
 | `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
@@ -450,7 +447,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `run_id` / `experiment_id` / `split_label` | null | optional result attribution; `experiment_id` can be shared across training seeds |
 | `lossless_policy` | `assert` | canonical eager runs assert; separate SDPA throughput audits use `diagnose` |
 | `data.truncation` | false | evaluate the complete rendered dataset sample; dataset `max_length` limits remain active during training |
-| `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `flowdraft_block_wise` training variant (see the plain-words guide below) |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | inference total width K (one anchor + 7 drafts at K=8) and refinement passes — knobs of EVERY variant |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
 | `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
 | `decode.prompt_offset` | 0 | skip N usable prompts for reproducible disjoint development/test slices |
@@ -479,7 +476,6 @@ overwrite each other:
 | `flowdraft_staged` | `variant=flowdraft`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-staged/flowdraft-staged-*.ckpt` |
 | `ablate_teacher_only` | `variant=flowdraft`, `lambda=0` (endpoint-only; legacy preset name) | `checkpoints/ablate-endpoint/ablate-endpoint-*.ckpt` |
 | `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
-| `orthrus_block_wise` (addition) | `variant=orthrus_block_wise` | `checkpoints/orthrus-block-wise/orthrus-block-wise-*.ckpt` |
 | `flowdraft_block_wise` (addition) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
 | `flowdraft_packed_full` | boundary-aware packed-2048 full-sequence FlowDraft | `checkpoints/flowdraft-packed-full/` |
 | `flowdraft_packed_blockwise` | boundary-aware packed-2048 inference-geometry FlowDraft | `checkpoints/flowdraft-packed-blockwise/` |

@@ -29,7 +29,8 @@ data:
   truncation: false
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
-# ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
+# K is total width (one anchor + K-1 drafts). Grid example:
+# `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
 decode:
   block_size: 8
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
