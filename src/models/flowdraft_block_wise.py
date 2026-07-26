@@ -292,6 +292,10 @@ class FlowDraftBlockWise(FlowDraft):
         cache,
         anchor,
         df_kwargs,
+        *,
+        metric_prefix="loss",
+        log_on_step=True,
+        log_on_epoch=False,
     ):
         """The parent's three terms in block geometry.
 
@@ -387,13 +391,15 @@ class FlowDraftBlockWise(FlowDraft):
         )
         self.log_dict(
             {
-                "loss/endpoint": endpoint,
-                "loss/verify_kl": verify_kl,
-                "loss/ar_kl": ar_kl,
-                "loss/ec": ec,
-                "loss/td": td,
-                "loss/lambda": lam,
+                f"{metric_prefix}/endpoint": endpoint,
+                f"{metric_prefix}/verify_kl": verify_kl,
+                f"{metric_prefix}/ar_kl": ar_kl,
+                f"{metric_prefix}/ec": ec,
+                f"{metric_prefix}/td": td,
+                f"{metric_prefix}/lambda": lam,
             },
+            on_step=log_on_step,
+            on_epoch=log_on_epoch,
             sync_dist=True,
         )
         return loss
@@ -402,14 +408,27 @@ class FlowDraftBlockWise(FlowDraft):
         loss = self.compute_loss(*self._shared_step(batch))
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
             teacher_logits, draft_logits, verify_logits, *rest = self._shared_step(batch)
             loss = self.compute_loss(
-                teacher_logits, draft_logits, verify_logits, *rest
+                teacher_logits,
+                draft_logits,
+                verify_logits,
+                *rest,
+                metric_prefix="val/loss",
+                log_on_step=False,
+                log_on_epoch=True,
             )
             block_mask = rest[-4]
             # Exact one-jump training pair, rather than a random off-diagonal pair.
@@ -427,21 +446,35 @@ class FlowDraftBlockWise(FlowDraft):
             acceptance = prefix_matches.sum((0, 1)) / prefix_live.sum(
                 (0, 1)
             ).clamp_min(1)
-            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+            self.log(
+                "val/loss",
+                loss,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
             self.log_dict(
                 {
                     **{
-                        f"val/acceptance_01_pos_{position + 1:02d}": value
+                        # Same cross-model meaning as Orthrus: probability
+                        # that the entire greedy prefix through this position
+                        # agrees with the AR teacher in one drafter forward.
+                        f"val/acceptance_pos_{position + 1:02d}": value
                         for position, value in enumerate(acceptance)
                     },
                 },
                 prog_bar=False,
+                on_step=False,
+                on_epoch=True,
                 sync_dist=True,
             )
             self.log(
-                "val/teacher_agreement_01",
+                "val/teacher_agreement",
                 agree.float().mean(),
                 prog_bar=True,
+                on_step=False,
+                on_epoch=True,
                 sync_dist=True,
             )
             self._maybe_decode_val(batch, batch_idx)
