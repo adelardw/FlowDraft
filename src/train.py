@@ -99,7 +99,11 @@ class FinalCheckpoint(L.Callback):
         if self._saved or trainer.fast_dev_run:
             return
         try:
-            trainer.save_checkpoint(self.path)
+            # This is a resumable training checkpoint, not merely model
+            # weights: retain optimizer, scheduler, loop and callback state.
+            # Passing the value explicitly also avoids Lightning's ambiguous
+            # ``weights_only`` default warning.
+            trainer.save_checkpoint(self.path, weights_only=False)
         except Exception:
             logger.exception(f"failed to save {reason} checkpoint to {self.path}")
             if reason == "final":
