@@ -259,6 +259,10 @@ class FlowDraft(L.LightningModule):
         df_attention_mask=None,
         position_ids=None,
         endpoint_live=None,
+        *,
+        metric_prefix="loss",
+        log_on_step=True,
+        log_on_epoch=False,
     ):
         """Categorical flow-map training plus optional AR distillation.
 
@@ -384,12 +388,14 @@ class FlowDraft(L.LightningModule):
         )
         self.log_dict(
             {
-                "loss/endpoint": endpoint,
-                "loss/ar_kl": ar_kl,
-                "loss/ec": ec,
-                "loss/td": td,
-                "loss/lambda": lam,
+                f"{metric_prefix}/endpoint": endpoint,
+                f"{metric_prefix}/ar_kl": ar_kl,
+                f"{metric_prefix}/ec": ec,
+                f"{metric_prefix}/td": td,
+                f"{metric_prefix}/lambda": lam,
             },
+            on_step=log_on_step,
+            on_epoch=log_on_epoch,
             sync_dist=True,
         )
         return loss
@@ -861,14 +867,27 @@ class FlowDraft(L.LightningModule):
         loss = self.compute_loss(batch, *shared)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
-        self.log("train/loss", loss, prog_bar=True, sync_dist=True)
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+        )
         return loss
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
             shared = self._shared_step(batch)
             teacher_logits, draft_logits = shared[:2]
-            loss = self.compute_loss(batch, *shared)
+            loss = self.compute_loss(
+                batch,
+                *shared,
+                metric_prefix="val/loss",
+                log_on_step=False,
+                log_on_epoch=True,
+            )
             # Cheap acceptance proxy: how often the drafter's argmax already
             # matches the verifier's argmax (shifted: teacher@i predicts i+1).
             mask = shared[-1]
@@ -876,8 +895,21 @@ class FlowDraft(L.LightningModule):
                 draft_logits[:, 1:].argmax(-1)
                 == teacher_logits[:, :-1].argmax(-1)
             )[mask]
-            self.log("val/loss", loss, prog_bar=True, sync_dist=True)
-            self.log("val/teacher_agreement", agree.float().mean(), sync_dist=True)
+            self.log(
+                "val/loss",
+                loss,
+                prog_bar=True,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            self.log(
+                "val/teacher_agreement",
+                agree.float().mean(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
             self._maybe_decode_val(batch, batch_idx)
         return loss
 
