@@ -28,13 +28,13 @@ wandb:
 train:
   variant: flowdraft        # Canonical variants:
                             #   flowdraft | flowdraft_block_wise
-                            #   orthrus | orthrus_block_wise
+                            #   orthrus
                             # Presets (see configs/experiment/):
                             #   `+experiment=flowdraft_staged|orthrus|ablate_*`
-                            #   `+experiment=flowdraft_block_wise|orthrus_block_wise`
-  block_size: 64            # K — block-wise variants; paper baseline overrides to 32
+                            #   `+experiment=flowdraft_block_wise`
+  block_size: 64            # total K: one clean anchor + K-1 drafted positions
   anchors_per_sequence: 1   # block-wise FlowDraft can flatten multiple isolated
-                            # anchor+K blocks into one DF pass; Orthrus uses 256
+                            # width-K blocks into one DF pass; Orthrus uses 256
   min_prefix: 1             # block-wise only: shortest clean prefix
   respect_document_boundaries: true  # packed training: isolate DF documents / reject crossing blocks
   lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)

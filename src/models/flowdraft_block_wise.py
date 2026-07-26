@@ -17,14 +17,14 @@ class FlowDraftBlockWise(FlowDraft):
       2. the block mirrors the decode cycle exactly: position ``p`` is the
          CLEAN in-block anchor (the decode loop's pending correction/bonus
          token, whose K/V are not in the cache while drafting), positions
-         ``p+1 .. p+K`` are noised and drafted;
+         ``p+1 .. p+K-1`` are noised and drafted;
       3. every DF forward of the loss (one-jump verifier alignment, draft,
          anchor, EC expert, TD) runs WITH the cache AND the clean anchor at
          in-block position 0. Multiple blocks are isolated with the same
          dual-pass mask used by Orthrus.
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
-    ``train.block_size`` (K), ``train.anchors_per_sequence``,
+    ``train.block_size`` (K = anchor + K-1 drafts), ``train.anchors_per_sequence``,
     ``train.verify_kl_weight`` and ``train.min_prefix``.
     """
 
@@ -42,10 +42,10 @@ class FlowDraftBlockWise(FlowDraft):
         if document_ids is not None and respect:
             if document_ids.shape != attention_mask.shape:
                 raise ValueError("document_ids must have the same shape as attention_mask")
-            if attention_mask.size(1) < block + 1:
+            if attention_mask.size(1) < block:
                 raise ValueError("no packed document contains anchor + requested block")
-            live_windows = attention_mask.bool().unfold(1, block + 1, 1).all(-1)
-            doc_windows = document_ids.unfold(1, block + 1, 1)
+            live_windows = attention_mask.bool().unfold(1, block, 1).all(-1)
+            doc_windows = document_ids.unfold(1, block, 1)
             same_document = (doc_windows == doc_windows[..., :1]).all(-1)
 
             valid = live_windows & same_document
@@ -61,8 +61,8 @@ class FlowDraftBlockWise(FlowDraft):
             return int(candidates[choice])
 
         true_min = int(attention_mask.sum(dim=1).min())
-        # the window is anchor + K fresh tokens: p + 1 + K must fit
-        high = max(min_prefix + 1, true_min - block)
+        # The K-wide window is one anchor + K-1 fresh tokens.
+        high = max(min_prefix + 1, true_min - block + 1)
         return int(torch.randint(min_prefix, high, (1,)))
 
     def _df_forward(
@@ -70,7 +70,7 @@ class FlowDraftBlockWise(FlowDraft):
     ):
         """One DF forward in the decode configuration: the clean anchor rides
         at in-block position 0, its output row is discarded — returned logits
-        cover the K fresh positions only."""
+        cover the K-1 fresh positions only."""
         df_kwargs = df_kwargs or {}
         anchors = anchor.size(1)
         if anchors == 1:
@@ -88,9 +88,12 @@ class FlowDraftBlockWise(FlowDraft):
 
         if x_block.size(1) % anchors:
             raise ValueError("flattened drafted tokens must divide evenly across anchors")
-        block = x_block.size(1) // anchors
+        drafted = x_block.size(1) // anchors
         x_in = torch.cat(
-            [anchor[:, :, None], x_block.view(x_block.size(0), anchors, block, -1)],
+            [
+                anchor[:, :, None],
+                x_block.view(x_block.size(0), anchors, drafted, -1),
+            ],
             dim=2,
         ).flatten(1, 2)
         logits = self.orthrus(
@@ -102,7 +105,7 @@ class FlowDraftBlockWise(FlowDraft):
             past_key_values=cache,
             **df_kwargs,
         ).logits
-        return logits.view(logits.size(0), anchors, block + 1, -1)[
+        return logits.view(logits.size(0), anchors, drafted + 1, -1)[
             :, :, 1:
         ].flatten(1, 2)
 
@@ -111,15 +114,15 @@ class FlowDraftBlockWise(FlowDraft):
     ):
         """Sample shared valid anchors for one multi-block diffusion forward."""
         min_prefix = int(self.cfg.train.get("min_prefix", 1))
-        if attention_mask.size(1) < block + 1:
+        if attention_mask.size(1) < block:
             return None
-        valid = attention_mask.bool().unfold(1, block + 1, 1).all(-1)
+        valid = attention_mask.bool().unfold(1, block, 1).all(-1)
         if document_ids is not None and bool(
             self.cfg.train.get("respect_document_boundaries", True)
         ):
             if document_ids.shape != attention_mask.shape:
                 raise ValueError("document_ids must have the same shape as attention_mask")
-            windows = document_ids.unfold(1, block + 1, 1)
+            windows = document_ids.unfold(1, block, 1)
             valid = valid & (windows == windows[..., :1]).all(-1)
         candidates = torch.nonzero(valid.all(0), as_tuple=False).flatten()
         candidates = candidates[candidates >= min_prefix]
@@ -132,7 +135,7 @@ class FlowDraftBlockWise(FlowDraft):
     def _prepare_block(self, batch):
         """The window math shared by the flow and baseline block variants:
         split at ``p``, ONE no-grad AR forward, clean-prefix cache, clean
-        anchor, teacher for the K fresh tokens.
+        anchor, teacher for the K-1 fresh tokens.
 
         With dynamic padding the tensor can be NARROWER than the window —
         the window shrinks to what exists, otherwise the teacher and block
@@ -140,53 +143,59 @@ class FlowDraftBlockWise(FlowDraft):
         """
         ids, mask = batch["input_ids"], batch["attention_mask"]
         document_ids = batch.get("document_ids")
-        block = int(self.cfg.train.get("block_size", 64))
-        p = self._split_point(mask, block, document_ids)
+        block_width = int(self.cfg.train.get("block_size", 64))
+        if block_width < 2:
+            raise ValueError("block_size must be at least 2 (anchor + one draft)")
+        p = self._split_point(mask, block_width, document_ids)
         width = ids.size(1)
         if width < 3:
-            raise ValueError("cannot train on width<3 batches: prefix + anchor + block needed")
+            raise ValueError("cannot train on width<3 batches: prefix + anchor + draft needed")
         p = min(p, width - 2)
-        block = min(block, width - p - 1)
+        block_width = min(block_width, width - p)
+        drafted = block_width - 1
         # Match Orthrus packing semantics: the AR teacher and clean cache see
         # the complete causal packed prefix. Document IDs constrain only the
         # anchor + drafted window, so no proposal crosses an EOS boundary.
         # Keeping a common prefix length lets local batches larger than one
         # share a rectangular KV cache even when their document starts differ.
-        ctx_mask = mask[:, : p + 1 + block]
+        ctx_mask = mask[:, : p + block_width]
 
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad(), self._teacher_eval():
             teacher_full = self.orthrus(
-                ids[:, : p + 1 + block],
+                ids[:, : p + block_width],
                 ctx_mask,
                 past_key_values=cache,
             ).logits
         # Keep ONLY the clean-prefix K/V: at decode time the pending anchor's
         # K/V are NOT in the cache while drafting. The AR logits at
-        # [p : p+K] are the distributions of the fresh tokens p+1..p+K.
+        # [p : p+K-1] predicts the fresh tokens p+1..p+K-1.
         cache.crop(p)
-        teacher_logits = teacher_full[:, p : p + block]
+        teacher_logits = teacher_full[:, p : p + drafted]
 
-        # position p — the clean in-block anchor; p+1..p+K — the drafted block
+        # position p is the clean anchor; p+1..p+K-1 are drafted.
         anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])
-        block_mask = mask[:, p + 1 : p + 1 + block]
-        block_ids = ids[:, p + 1 : p + 1 + block]
+        block_mask = mask[:, p + 1 : p + block_width]
+        block_ids = ids[:, p + 1 : p + block_width]
         return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
 
     def _prepare_blocks(self, batch):
         """Prepare several isolated inference-geometry blocks in one DF pass.
 
         The frozen AR path runs once over the packed sequence. Synthetic
-        ``[anchor + K]`` blocks are flattened along sequence length and the
+        K-wide ``[anchor + K-1 drafts]`` blocks are flattened along sequence length and the
         Orthrus dual-pass mask gives each one access only to the AR prefix
         preceding its own anchor and to itself bidirectionally.
         """
         ids, mask = batch["input_ids"], batch["attention_mask"]
         document_ids = batch.get("document_ids")
-        block = int(self.cfg.train.get("block_size", 64))
+        block_width = int(self.cfg.train.get("block_size", 64))
+        if block_width < 2:
+            raise ValueError("block_size must be at least 2 (anchor + one draft)")
+        drafted = block_width - 1
         count = int(self.cfg.train.get("anchors_per_sequence", 1))
         anchors = self._sample_anchor_points(
-            mask, block, count, document_ids=document_ids
+            mask, block_width, count, document_ids=document_ids
         )
         if anchors is None:
             raise ValueError("no packed document contains anchor + requested block")
@@ -202,7 +211,7 @@ class FlowDraftBlockWise(FlowDraft):
                 ids, mask, past_key_values=cache
             ).logits
 
-        offsets = torch.arange(block, device=ids.device)
+        offsets = torch.arange(drafted, device=ids.device)
         fresh_positions = anchors[:, None] + 1 + offsets
         teacher_positions = anchors[:, None] + offsets
         block_ids = ids[:, fresh_positions].flatten(1, 2)
@@ -212,7 +221,6 @@ class FlowDraftBlockWise(FlowDraft):
             ids[:, anchors], attention_mask=mask[:, anchors]
         )
 
-        block_width = block + 1
         position_ids = (
             anchors[:, None]
             + torch.arange(block_width, device=ids.device)[None]

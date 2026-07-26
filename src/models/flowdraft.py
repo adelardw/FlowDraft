@@ -556,13 +556,18 @@ class FlowDraft(L.LightningModule):
         K/V get committed by the NEXT verify forward, not by a standalone
         1-token pass — that keeps the cycle at ``jumps + 1`` forwards.
 
-        Returns ``(draft_ids [1, K], q [1, K, V])`` for the K FRESH positions.
+        ``block_size`` is the total parallel width: one clean anchor plus
+        ``K-1`` fresh positions. Returns draft tensors with shape
+        ``[1, K-1]``.
         """
         vocab = self.df_processor.vocab_size
         device = self._generation_device()
+        drafted = block_size - 1
+        if drafted <= 0:
+            raise ValueError("block_size must be at least 2 (anchor + one draft)")
         x = torch.distributions.Dirichlet(
             torch.ones(vocab, device=device)
-        ).sample((1, block_size))
+        ).sample((1, drafted))
         anchor = None
         if anchor_token is not None:
             anchor = F.one_hot(
@@ -604,7 +609,7 @@ class FlowDraft(L.LightningModule):
     ):
         """FULL lossless generation: draft -> verify -> commit, until done.
 
-        Every cycle: the flow map drafts ``block_size`` fresh tokens in
+        Every cycle: the flow map drafts ``block_size - 1`` fresh tokens in
         ``jumps`` forwards (the previous cycle's correction/bonus token rides
         along as a clean in-block anchor), then ONE AR forward verifies the
         block — committing the anchor's K/V and scoring every draft position

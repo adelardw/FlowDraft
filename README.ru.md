@@ -201,14 +201,14 @@ Lossless утверждается **побитово** — падение про
 `orthrus`) — в самом задании про геометрию обучения ничего не сказано. Наше
 дополнение: те же два драфтера, переобученные в точной геометрии
 декодирования (block-causal: каузально к закэшированному префиксу,
-двунаправленно внутри блока, чистый якорь) — варианты `flowdraft_block_wise` /
-`orthrus_block_wise`. Это убирает расхождение геометрий обучения и
-инференса и даёт сравнение «геометрия-в-геометрию»:
+двунаправленно внутри блока, чистый якорь) — вариант `flowdraft_block_wise`.
+Обычный `orthrus` уже использует эту геометрию, поэтому они дают сравнение
+«геометрия-в-геометрию»:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=orthrus_block_wise
+./hf-auth.sh uv run python src/train.py +experiment=orthrus
 ./hf-auth.sh uv run python src/train.py +experiment=flowdraft_block_wise
-# оценка: те же команды этапа 5 с variant=orthrus_block_wise / flowdraft_block_wise
+# оценка: те же команды этапа 5 с variant=orthrus / flowdraft_block_wise
 ```
 
 **Формулы метрик и что чему соответствует:**
@@ -333,7 +333,7 @@ AR-модель остаётся замороженной: в block-wise обу�
   - **EC** — ур. (18) из *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — прыжки учатся у диагонали в точке собственного приземления; знание течёт `x1 → π_{t,t} → π_{s,t}`.
   - **TD** — ур. (16): временной дрейф `‖∂_t π_{s,t}‖²`.
   - Пары `(s, t)` на сэмпл (`train.time_sampling`): `paper` (дефолт: t~U, s~U[0,t]) | `triangle` | `sequential`.
-- **Геометрии обучения** (`train.variant`): варианты из задания — полноследовательные: `flowdraft` (шумится вся последовательность) и `orthrus` (одношаговый masked-diffusion драфтер самого Orthrus: без времени, барицентр как симплекс-нативный `[MASK]`). Наше **дополнение сверх задания**: `flowdraft_block_wise` / `orthrus_block_wise` — те же два драфтера, переобученные в точности в инференсной геометрии (чистый AR-префикс в KV-кэше, ЧИСТАЯ якорная позиция блока — pending-токен decode-петли, см. ниже — и шумный K-блок; заодно сжимает тензоры лосса `[B,T,V]` → `[B,K,V]`).
+- **Геометрии обучения** (`train.variant`): `flowdraft` шумит всю последовательность; `flowdraft_block_wise` обучает FlowDraft в точной инференсной геометрии; `orthrus` использует собственную одношаговую block-causal masked-diffusion геометрию Orthrus без временного кондиционирования. Обе blockwise-реализации используют чистый AR-префикс в KV-кэше и чистую якорную позицию блока.
 - **Декодирование** (`FlowDraft.generate`): драфт K свежих токенов за 1–несколько прыжков → ОДИН AR-forward верифицирует блок. Коррекция/бонус прошлого цикла не коммитится отдельным проходом: она едет чистым якорем внутри блока, и следующая верификация коммитит её K/V, одновременно оценивая драфты — **цикл = `jumps + 1` forward'ов** (паритет TPF с конвенцией Orthrus). `temperature=0`: жадная верификация, выход **побитово** равен `ar_generate`. `temperature>0` с Gumbel-связыванием (дефолт): пер-позиционный Gumbel-шум делает сэмплирование детерминированным argmax'ом — выход **побитово** равен сэмплирующему `ar_generate` с тем же сидом. Без связывания (`coupled=false`): спекулятивное сэмплирование Левиафана, lossless **по распределению**.
 
 ## Структура репозитория
@@ -351,8 +351,7 @@ FlowDraft/
     │   ├── factory.py             # build_lit: выбор варианта + загрузка чекпоинта
     │   ├── flowdraft.py           # FlowDraft: лосс, обучение, lossless generate
     │   ├── flowdraft_block_wise.py        # FlowDraft в инференсной геометрии
-    │   ├── orthrus.py             # masked-драфтер Orthrus (full-sequence)
-    │   └── orthrus_block_wise.py          # masked-драфтер Orthrus, block-causal
+    │   └── orthrus.py             # masked-драфтер Orthrus, block-causal
     ├── preprocessor/df_processor.py   # токенизация + one-hot вершины симплекса
     ├── data/dataloaders.py        # стриминговый Dataset / collate / DataLoader;
     │                              #   EpochShuffled: повторы в новом порядке (эпохи)
@@ -363,8 +362,7 @@ FlowDraft/
     │   ├── data/                  # nemotron (обучение) | math500 (оценка, не было в обучении)
     │   └── experiment/            # по пресету на этап задания + дополнения:
     │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
-    │                              #   ablate_consistency_only | orthrus_block_wise |
-    │                              #   flowdraft_block_wise
+    │                              #   ablate_consistency_only | flowdraft_block_wise
     ├── train.py                   # точка входа обучения
     ├── eval.py                    # оценка на датасете: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # фигуры отчёта: frontier / TPF-бары / TPF-от-K
@@ -473,7 +471,7 @@ cosine 2e-4 с 5% разогревом):
 | `wandb.project` / `entity` / `name` | `flowdraft` / null / null | проект, команда/пользователь и имя прогона; null берёт дефолт W&B |
 | `wandb.group` / `tags` | null / [] | необязательная группировка прогонов в W&B |
 | `wandb.offline` | false | писать локально для последующего `wandb sync`, не загружая сразу |
-| `train.variant` | `flowdraft` | какой драфтер учить: из задания — `flowdraft` \| `orthrus` (полноследовательные); дополнение — `flowdraft_block_wise` \| `orthrus_block_wise` (инференсная геометрия) |
+| `train.variant` | `flowdraft` | какой драфтер учить: `flowdraft` (полноследовательный CFM) \| `flowdraft_block_wise` (CFM в инференсной геометрии) \| `orthrus` (block-causal masked-драфтер) |
 | `train.block_size` | 64 | K — длина блока на обучении (block-wise варианты) |
 | `train.min_prefix` | 1 | минимальный чистый префикс перед блоком |
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW только по DF-голове; `lr` — ПИК расписания |
@@ -530,7 +528,6 @@ cosine 2e-4 с 5% разогревом):
 | `flowdraft_staged` | `variant=flowdraft`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-staged/flowdraft-staged-*.ckpt` |
 | `ablate_teacher_only` | `variant=flowdraft`, `lambda=0` (endpoint-only; legacy-имя) | `checkpoints/ablate-endpoint/ablate-endpoint-*.ckpt` |
 | `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
-| `orthrus_block_wise` (дополнение) | `variant=orthrus_block_wise` | `checkpoints/orthrus-block-wise/orthrus-block-wise-*.ckpt` |
 | `flowdraft_block_wise` (дополнение) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
 
 Свой эксперимент (например, серия по `anchor_point` после основных этапов,
