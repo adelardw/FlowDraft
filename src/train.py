@@ -95,13 +95,31 @@ class FinalCheckpoint(L.Callback):
         self.path = path
         self._saved = False
 
-    def _save(self, trainer, *, reason: str):
+    def _save(self, trainer, *, reason: str, triggering_exception=None):
         if self._saved or trainer.fast_dev_run:
             return
         try:
-            trainer.save_checkpoint(self.path)
-        except Exception:
-            logger.exception(f"failed to save {reason} checkpoint to {self.path}")
+            # This is a resumable training checkpoint, not merely model
+            # weights: retain optimizer, scheduler, loop and callback state.
+            # Passing the value explicitly also avoids Lightning's ambiguous
+            # ``weights_only`` default warning.
+            trainer.save_checkpoint(self.path, weights_only=False)
+        except Exception as checkpoint_exception:
+            # ``on_exception`` runs while Lightning is already handling the
+            # training exception. ``logger.exception`` would therefore print
+            # the entire nested training traceback before finally revealing
+            # the checkpoint error, which makes the save failure look like
+            # the cause of the crash. Report both exceptions directly.
+            message = (
+                f"failed to save {reason} checkpoint to {self.path}: "
+                f"{type(checkpoint_exception).__name__}: {checkpoint_exception}"
+            )
+            if triggering_exception is not None:
+                message += (
+                    "; triggering training exception: "
+                    f"{type(triggering_exception).__name__}: {triggering_exception}"
+                )
+            logger.error(message)
             if reason == "final":
                 raise
         else:
@@ -113,7 +131,31 @@ class FinalCheckpoint(L.Callback):
         self._save(trainer, reason="final")
 
     def on_exception(self, trainer, pl_module, exception):
-        self._save(trainer, reason="exception")
+        # Once CUDA reports a launch/illegal-address failure, its context is
+        # unusable. Lightning checkpoints contain CUDA model/optimizer
+        # storages, and torch.save must copy them to CPU; attempting that only
+        # raises a second AcceleratorError and hides the useful first failure.
+        cuda_fatal_markers = (
+            "cublas_status_execution_failed",
+            "illegal memory access",
+            "cudaerrorillegaladdress",
+            "device-side assert",
+            "unspecified launch failure",
+        )
+        exception_text = f"{type(exception).__name__}: {exception}".lower()
+        if any(marker in exception_text for marker in cuda_fatal_markers):
+            if trainer.is_global_zero:
+                logger.error(
+                    "skipping exception checkpoint because the CUDA context "
+                    f"is unusable after {type(exception).__name__}: {exception}; "
+                    "resume from the newest periodic checkpoint"
+                )
+            return
+        self._save(
+            trainer,
+            reason="exception",
+            triggering_exception=exception,
+        )
 
 
 def build_checkpoint_callbacks(cfg: DictConfig, *, has_validation: bool):

@@ -37,8 +37,8 @@ trainer:
   # Paper: 8 devices x local batch 1 x accumulation 16 = global batch 128.
   # On fewer GPUs, increase accumulation to preserve that product.
   max_epochs: 2
-  # 471,952 naturally packed sequences over two epochs at global batch 128
-  # yields ceil(471952 / 128) * 2 = 7,376 optimizer updates. This is only the
-  # cosine horizon; the loader itself ends epochs by exhausting 600K raw rows.
+  # 471,952 naturally packed sequences per epoch at global batch 128 over two
+  # epochs yield ceil(471952 / 128) * 2 = 7,376 optimizer updates. This is only
+  # the cosine horizon; the loader itself ends epochs by exhausting 600K raw rows.
   max_steps: 7376
   accumulate_grad_batches: 128

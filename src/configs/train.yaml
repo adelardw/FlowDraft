@@ -28,13 +28,15 @@ wandb:
 train:
   variant: flowdraft        # Canonical variants:
                             #   flowdraft | flowdraft_block_wise
-                            #   orthrus | orthrus_block_wise
+                            #   orthrus
                             # Presets (see configs/experiment/):
                             #   `+experiment=flowdraft_staged|orthrus|ablate_*`
-                            #   `+experiment=flowdraft_block_wise|orthrus_block_wise`
-  block_size: 64            # K — block-wise variants; paper baseline overrides to 32
-  anchors_per_sequence: 1   # paper baseline overrides this to 256
+                            #   `+experiment=flowdraft_block_wise`
+  block_size: 64            # total K: one clean anchor + K-1 drafted positions
+  anchors_per_sequence: 1   # block-wise FlowDraft can flatten multiple isolated
+                            # width-K blocks into one DF pass; Orthrus uses 256
   min_prefix: 1             # block-wise only: shortest clean prefix
+  respect_document_boundaries: true  # packed training: isolate DF documents / reject crossing blocks
   lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)
   lr_schedule: cosine       # cosine (linear warmup -> cosine decay to 0, needs a finite
                             #   trainer.max_steps or limit_train_batches+max_epochs) | constant
@@ -45,6 +47,8 @@ train:
   lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
   endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
   ar_kl_weight: 0.0         # optional verifier-alignment auxiliary; 0 keeps the CFM objective paper-faithful
+  verify_kl_weight: 0.0     # direct KL(p_AR || pi_{0,1}) on the exact one-jump
+                            # inference pair; packed block-wise preset enables it
   lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
                             #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern

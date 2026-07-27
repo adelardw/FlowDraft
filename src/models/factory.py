@@ -11,7 +11,6 @@ _VARIANT_ALIASES = {
     "fixed": "flowdraft",
     "block_wise": "flowdraft_block_wise",
     "baseline": "orthrus",
-    "baseline_block_wise": "orthrus_block_wise",
 }
 _RUNTIME_BACKBONE_KEYS = {
     "attn_implementation",
@@ -20,6 +19,7 @@ _RUNTIME_BACKBONE_KEYS = {
     "compile_mode",
     "device_map",
     "dtype",
+    "gradient_checkpointing",
     "low_cpu_mem_usage",
 }
 
@@ -126,6 +126,9 @@ def _load_df_state(model, checkpoint: Mapping, checkpoint_path: Path) -> None:
     model.checkpoint_path = str(checkpoint_path)
     model.checkpoint_global_step = checkpoint.get("global_step")
     model.checkpoint_epoch = checkpoint.get("epoch")
+    campaign = checkpoint.get("campaign_metadata", {})
+    model.checkpoint_elapsed_seconds = campaign.get("elapsed_seconds")
+    model.checkpoint_device_hours = campaign.get("device_hours")
     logger.info(
         f"loaded {len(trainable_state)} DF tensors from {checkpoint_path} "
         f"(step={model.checkpoint_global_step}, epoch={model.checkpoint_epoch})"
@@ -179,8 +182,6 @@ def build_lit(
 
     if canonical_variant == "orthrus":
         from src.models.orthrus import Orthrus as Module
-    elif canonical_variant == "orthrus_block_wise":
-        from src.models.orthrus_block_wise import OrthrusBlockWise as Module
     elif canonical_variant == "flowdraft_block_wise":
         from src.models.flowdraft_block_wise import FlowDraftBlockWise as Module
     elif canonical_variant == "flowdraft":
@@ -188,10 +189,16 @@ def build_lit(
     else:
         raise ValueError(
             f"unknown variant='{requested_variant}' (flowdraft | flowdraft_block_wise | "
-            "orthrus | orthrus_block_wise)"
+            "orthrus)"
         )
 
     model = Module(cfg)
     if checkpoint is not None:
         _load_df_state(model, checkpoint, checkpoint_path)
+        hparams = _checkpoint_hparams(checkpoint)
+        model.checkpoint_seed = hparams.get("seed")
+        wandb = hparams.get("wandb", {})
+        model.checkpoint_run_name = (
+            wandb.get("name") if isinstance(wandb, Mapping) else None
+        )
     return model

@@ -10,7 +10,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: core implementation landed and smoke-verified** — adapter, four training variants (`flowdraft`, `flowdraft_block_wise`, `orthrus`, and `orthrus_block_wise`; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
+> 🚧 **Status: core implementation landed and smoke-verified** — adapter, three training variants (`flowdraft`, `flowdraft_block_wise`, and `orthrus`; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -86,16 +86,17 @@ For multi-GPU training, let Lightning run DDP and specify the GPU count:
 
 Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. Streaming train and validation datasets are split into disjoint, equal rank shards (and then partitioned among DataLoader workers). The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
 
-## H100 sparse-attention setup
+## Sparse-attention setup
 
 The paper-style `+experiment=orthrus` uses PyTorch **FlexAttention** for its
-256 isolated masked blocks. On Hopper (H100/H200) and Blackwell, it selects
-FlexAttention's `FLASH` backend (the FlashAttention-4 path); on older CUDA
-GPUs it falls back to FlexAttention's Triton backend with the same sparse-mask
-semantics but lower throughput.
+256 isolated masked blocks. The stable default is FlexAttention's Triton
+backend on every CUDA architecture. It has the same sparse-mask semantics as
+the newer FlashAttention-4 path.
 
-Install FA4 manually on the CUDA node (it is deliberately not a project
-dependency, so CPU/macOS development environments remain lightweight):
+FA4 can be tested as an explicit H100/H200/Blackwell performance opt-in with
+`model.adapter.flex_attention_backend=flash`. Install it manually on the CUDA
+node (it is deliberately not a project dependency, so CPU/macOS development
+environments remain lightweight):
 
 ```bash
 uv pip install ninja packaging
@@ -154,18 +155,17 @@ The command summary:
 # Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
 #           (data=nemotron evaluates on the training distribution);
 #           block-size x jumps grid -> results/eval.jsonl -> report figures.
-#           NOTE: decode.block_size = K, the number of tokens drafted per cycle at
-#           INFERENCE — a knob of EVERY variant; it is unrelated to the
+#           NOTE: decode.block_size = total width K: one clean anchor + K-1
+#           drafted tokens per cycle — a knob of EVERY variant; it is unrelated to the
 #           flowdraft_block_wise TRAINING-geometry variant despite the similar name
 ./hf-auth.sh uv run python src/eval.py -m model=qwen3_1.7b variant=flowdraft checkpoint=<ckpt> \
     decode.block_size=4,8,16 decode.jumps=1,2,4
 uv run python src/plots.py
 
-# ADDITION (beyond the task) — both drafters retrained in the exact inference
-# geometry (block-causal): the geometry-for-geometry comparison
-./hf-auth.sh uv run python src/train.py +experiment=orthrus_block_wise
+# ADDITION (beyond the task) — FlowDraft retrained in the exact inference
+# geometry (block-causal), directly comparable with Orthrus
 ./hf-auth.sh uv run python src/train.py +experiment=flowdraft_block_wise
-#   eval: same stage-5 commands with variant=orthrus_block_wise / flowdraft_block_wise
+#   eval: same stage-5 commands with variant=orthrus / flowdraft_block_wise
 ```
 
 Training curves land in TensorBoard (`uv run tensorboard --logdir checkpoints`);
@@ -246,14 +246,15 @@ The AR model remains frozen throughout. In paper-faithful CFM training it suppli
 One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained with VFM endpoint inference plus ECLD. Implemented; large-scale validation pending.
 
 - **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
-- **Objective** (`FlowDraft.compute_loss`): `loss = endpoint_weight·endpoint + ar_kl_weight·AR_KL + λ·(4·EC + 2·TD)`
+- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + endpoint_weight·endpoint + ar_kl_weight·AR_KL + λ·(4·EC + 2·TD)`
+  - **verify KL** — block-wise inference alignment: `KL(sg(p_AR) ‖ π_{0,1}(x_0))` on the exact one-jump query used by decoding.
   - **endpoint** — `CE(x1, π_{t,t}(x_t))`: the paper's categorical VFM diagonal objective. The paper-faithful evaluation point is `train.anchor_point=trajectory`; `landing` is retained as an experimental option.
   - **AR KL** — optional `KL(sg(p_AR) ‖ π_{t,t})`, separately weighted and off by default because it is not part of the CFM objective.
   - **EC** — eq. (18) of *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — jumps learn from the diagonal at their own landing point; truth flows `x1 → π_{t,t} → π_{s,t}`.
   - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
   - Time pairs `(s, t)` per sample (`train.time_sampling`): `paper` (default: t~U, s~U[0,t]) | `triangle` | `sequential`.
-- **Training geometries** (`train.variant`): the task's variants are full-sequence — `flowdraft` (noise the whole sequence) and `orthrus` (Orthrus' own single-step masked-diffusion drafter: no time conditioning, barycenter as the simplex-native `[MASK]`). Our **addition beyond the task**: `flowdraft_block_wise` / `orthrus_block_wise` — the same two drafters retrained in the exact inference geometry (clean AR prefix in the KV cache, a CLEAN in-block anchor position — the decode loop's pending token, see below — and a noisy K-token block; also shrinks every `[B,T,V]` loss tensor to `[B,K,V]`).
-- **Decoding** (`FlowDraft.generate`): draft K fresh tokens in 1–few jumps → ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as a clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
+- **Training geometries** (`train.variant`): `flowdraft` noises the full sequence; `flowdraft_block_wise` trains FlowDraft in the exact inference geometry; and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
+- **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ## Repository structure
 
@@ -270,8 +271,7 @@ FlowDraft/
     │   ├── factory.py             # build_lit: variant selection + checkpoint loading
     │   ├── flowdraft.py           # FlowDraft: loss, training, lossless generate
     │   ├── flowdraft_block_wise.py        # FlowDraft in the inference geometry
-    │   ├── orthrus.py             # Orthrus masked drafter (full-sequence)
-    │   └── orthrus_block_wise.py          # Orthrus masked drafter, block-causal
+    │   └── orthrus.py             # Orthrus masked drafter, block-causal
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
     ├── data/dataloaders.py        # streaming Dataset / collate / DataLoader;
     │                              #   EpochShuffled: repetitions in a new order (epochs)
@@ -282,8 +282,7 @@ FlowDraft/
     │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
     │   └── experiment/            # one preset per task stage + additions:
     │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
-    │                              #   ablate_consistency_only | orthrus_block_wise |
-    │                              #   flowdraft_block_wise
+    │                              #   ablate_consistency_only | flowdraft_block_wise
     ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
@@ -323,10 +322,10 @@ on-device, never in the batch.
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
-Variants: `flowdraft` is the project flow-map objective; `orthrus` is the
-paper-style Orthrus recipe (frozen AR cache plus 256 isolated anchored masked
-blocks); `flowdraft_block_wise` and `orthrus_block_wise` are the project’s single-block
-inference-geometry variants.
+Variants: `flowdraft` is the full-sequence flow-map objective; `orthrus` is the
+paper-style block-causal Orthrus recipe (frozen AR cache plus independently
+anchored masked blocks); and `flowdraft_block_wise` trains the flow-map
+drafter in that inference geometry.
 Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`lambda_ramp_steps`
 (VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
@@ -411,9 +410,11 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `wandb.project` / `entity` / `name` | `flowdraft` / null / null | W&B destination and optional run name; null uses W&B defaults |
 | `wandb.group` / `tags` | null / [] | optional W&B organization metadata |
 | `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
-| `train.variant` | `flowdraft` | which drafter to train: the task — `flowdraft` \| `orthrus` (full-sequence); the addition — `flowdraft_block_wise` \| `orthrus_block_wise` (inference geometry) |
-| `train.block_size` | 64 | K — block length seen in training (block-wise variants) |
+| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `flowdraft_block_wise` (inference-geometry CFM) \| `orthrus` (block-causal masked drafter) |
+| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
+| `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; packed block-wise FlowDraft defaults to 4 |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
+| `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
 | `train.lr_schedule` | `cosine` | `cosine` (linear warmup → cosine decay to 0; needs a finite `trainer.max_steps` or `limit_train_batches`+`max_epochs`) \| `constant` |
 | `train.warmup_ratio` | 0.05 | cosine only: fraction of total steps spent warming up |
@@ -421,6 +422,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
 | `train.endpoint_weight` | 1.0 | weight of categorical VFM endpoint CE; 0 = endpoint-off ablation |
 | `train.ar_kl_weight` | 0.0 | optional AR-verifier KL auxiliary; 0 keeps the objective paper-faithful |
+| `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
 | `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
 | `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
 | `train.checkpoint_name` | `flowdraft-{step:07d}` | checkpoint filename pattern — set your own per experiment (quote on CLI: `'train.checkpoint_name="my-run-{step:07d}"'`) |
@@ -441,9 +443,14 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `checkpoint_config` | true | restore the saved backbone/tokenizer/adapter config, train parameters, and variant |
 | `variant` | null | inferred from checkpoint; without a checkpoint null selects `flowdraft` |
 | `results_file` | `results/eval.jsonl` | every run appends one JSON row (input of `src/plots.py`) |
-| `decode.block_size` / `decode.jumps` | 8 / 1 | inference-time K and refinement passes — knobs of EVERY variant; `block_size` is NOT related to the `flowdraft_block_wise` training variant (see the plain-words guide below) |
+| `per_prompt_file` | `results/eval-prompts.jsonl` | prompt-level metrics and first-divergence diagnostics |
+| `run_id` / `experiment_id` / `split_label` | null | optional result attribution; `experiment_id` can be shared across training seeds |
+| `lossless_policy` | `assert` | canonical eager runs assert; separate SDPA throughput audits use `diagnose` |
+| `data.truncation` | false | evaluate the complete rendered dataset sample; dataset `max_length` limits remain active during training |
+| `decode.block_size` / `decode.jumps` | 8 / 1 | inference total width K (one anchor + 7 drafts at K=8) and refinement passes — knobs of EVERY variant |
 | `decode.max_new_tokens` | 64 | tokens generated per prompt |
 | `decode.n_prompts` | 64 | prompts taken from the dataset (100–200 for a paper table) |
+| `decode.prompt_offset` | 0 | skip N usable prompts for reproducible disjoint development/test slices |
 | `decode.prompt_len` | null | null = the full rendered prompt; int N = first N tokens only |
 | `decode.temperature` / `top_k` / `top_p` | 0 / null / null | 0 = greedy; >0 = sampling |
 | `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
@@ -469,8 +476,9 @@ overwrite each other:
 | `flowdraft_staged` | `variant=flowdraft`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-staged/flowdraft-staged-*.ckpt` |
 | `ablate_teacher_only` | `variant=flowdraft`, `lambda=0` (endpoint-only; legacy preset name) | `checkpoints/ablate-endpoint/ablate-endpoint-*.ckpt` |
 | `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
-| `orthrus_block_wise` (addition) | `variant=orthrus_block_wise` | `checkpoints/orthrus-block-wise/orthrus-block-wise-*.ckpt` |
 | `flowdraft_block_wise` (addition) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
+| `flowdraft_packed_full` | boundary-aware packed-2048 full-sequence FlowDraft | `checkpoints/flowdraft-packed-full/` |
+| `flowdraft_packed_blockwise` | boundary-aware packed-2048 inference-geometry FlowDraft | `checkpoints/flowdraft-packed-blockwise/` |
 
 Your own experiment (e.g. the `anchor_point` study) — override name and dir
 so it gets its own shelf too:
@@ -520,8 +528,12 @@ how fast. The verifier has the final word on every token.
 
 ## Evaluation
 
-Dataset prompts (full rendered prompts by default; `decode.prompt_len=N` for
-N-token prefixes) are decoded twice — flow-draft vs plain AR — and compared. Greedy losslessness is asserted **bitwise**, not assumed.
+Dataset prompts (complete rendered samples by default; `decode.prompt_len=N`
+for explicit N-token prefixes) are decoded twice — flow-draft vs plain AR —
+and compared. Dataset `max_length` limits apply to training, not standalone
+evaluation. Canonical evaluation uses eager attention and asserts greedy
+losslessness **bitwise**, not by assumption. SDPA throughput audits should use
+`lossless_policy=diagnose` and separate result files.
 
 When `checkpoint` is set, evaluation resolves the path from the original
 working directory, restores the saved model architecture and variant, and
@@ -541,7 +553,7 @@ Main metrics (mean ± std over `n_prompts`): **acceptance** per cycle and
 **TPF** (tokens per forward; cycle = `jumps+1`). Wall-clock tokens/s and
 speedup vs AR are reported as diagnostics (hardware/kernel dependent). The
 attention kernel is a config switch (`model.backbone.attn_implementation`):
-`sdpa` (default; fused, supports the DF mask — verified against eager) |
+`eager` (canonical evaluation default) | `sdpa` (fused throughput audit) |
 `flex_attention` (compiled block masks, GPU only) | `eager` (reference).
 **Continuation NLL** under the frozen teacher is computed in sampling mode
 only (at greedy the output is bitwise equal to AR, so it measures nothing).

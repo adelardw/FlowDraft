@@ -274,11 +274,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         return "\n".join(m["content"] for m in messages)
 
     def collate(examples):
+        truncation = d.get("truncation", True)
         enc = df_processor(
             [render(e) for e in examples],
             return_simplex=False,
-            truncation=True,
-            max_length=d.max_length,
+            # Training keeps bounded sequence lengths. Evaluation overrides
+            # this to false so dataset prompts are not silently shortened
+            # before decode.prompt_len is applied.
+            truncation=truncation,
+            max_length=d.get("max_length") if truncation else None,
             # Fixed shapes avoid a new FlexAttention compilation whenever a
             # one-example validation batch has a different rendered length.
             padding="max_length" if d.get("pad_to_max_length", False) else True,
@@ -300,7 +304,9 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # Validation is a separate read of the source stream. It must not consume
     # rows from the paper-faithful 600K-example training sample.
     val_ds = RankSharded(ds.take(val_size), size=val_size) if val_size else None
-    train_ds = ds
+    # Keep validation genuinely held out while preserving exactly
+    # ``train_size`` training rows after it.
+    train_ds = ds.skip(val_size) if val_size else ds
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
