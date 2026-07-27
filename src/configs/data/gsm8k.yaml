@@ -1,0 +1,12 @@
+# Orthrus quality/efficiency benchmark: grade-school mathematical reasoning.
+benchmark: gsm8k
+dataset: openai/gsm8k
+subset: main
+splits: [test]
+text_field: question
+streaming: true
+enable_thinking: false
+val_size: 1319
+batch_size: 4
+max_length: 1024
+num_workers: 0

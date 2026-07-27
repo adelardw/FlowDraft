@@ -186,3 +186,6 @@ CLAUDE.md
 .claude/*
 .agents/*
 AGENTS.md
+
+outputs
+checkpoints

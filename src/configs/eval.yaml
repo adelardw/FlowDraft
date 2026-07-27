@@ -1,22 +1,42 @@
 
 defaults:
-  - model: llama3_3b
+  - model: qwen3_1.7b
   - data: math500   # default: a dataset NEVER SEEN in training; data=nemotron -> training distribution
   - _self_
 
 seed: 42
-checkpoint: null            # path to a FlowMapOrthrus .ckpt (DF head only); null = untrained drafter
+checkpoint: null            # path to a FlowDraft/Orthrus .ckpt (DF head only); null = untrained drafter
+checkpoint_config: true     # restore saved model/train config and variant; false = use explicit eval config
 results_file: results/eval.jsonl   # every run appends a JSON row; plots: uv run python src/plots.py
-variant: fixed              # which drafter the checkpoint was trained as:
-                            #   fixed | block_wise (flow-map draft) | baseline (single-step masked)
+per_prompt_file: results/eval-prompts.jsonl
+run_id: null
+experiment_id: null          # stable configuration ID shared across training seeds
+split_label: null
+lossless_policy: assert       # assert (canonical) | diagnose (throughput audit) | ignore
+variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
+
+# Eager is the canonical bitwise-correctness backend. SDPA throughput audits
+# override this explicitly and use lossless_policy=diagnose.
+model:
+  backbone:
+    attn_implementation: eager
+
+# Evaluate the complete rendered dataset sample. Individual data configs keep
+# max_length for bounded training/validation batches, but that limit must not
+# silently shorten standalone benchmark prompts. decode.prompt_len remains the
+# explicit opt-in control for prefix-only evaluation.
+data:
+  truncation: false
 
 # metrics: acceptance / TPF / tokens-per-s + speedup vs greedy AR; lossless is asserted
-# ablation grids via hydra multirun: `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
+# K is total width (one anchor + K-1 drafts). Grid example:
+# `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
 decode:
   block_size: 8
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
   n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
+  prompt_offset: 0          # skip this many usable prompts (disjoint dev/test slices)
   prompt_len: null          # null = the full rendered prompt (honest bench setting);
                             #   int N = first N tokens only (prefix-continuation mode)
   temperature: 0.0          # 0 = greedy (bitwise lossless); >0 = sampling
@@ -27,11 +47,6 @@ decode:
   equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
                             #   on the first prompt (e.g. 500 draws); 0 = off
 
-# Prompt source lives in configs/data/. Two datasets, two questions:
-#   data=math500  (default) — a DIFFERENT dataset the drafter never saw in
-#                 training: the honest generalization number;
-#   data=nemotron            — the training distribution; its val samples were
-#                 excluded from training (train skips the first val_size of
-#                 the same seeded stream) but the texts are of the same kind.
-# Report both: the gap between them shows how much the drafter overfits the
-# training mix.
+# Prompt sources live in configs/data/. The Orthrus-compatible suite is
+# gsm8k, math500, aime24, aime25, humaneval, and mbpp; nemotron measures the
+# training distribution. Compose the paper protocol with +benchmark=orthrus.

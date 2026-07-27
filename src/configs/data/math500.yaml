@@ -2,10 +2,12 @@
 # just set-aside samples of the training stream. The drafter never sees these
 # problems (training reads data=nemotron), so acceptance/TPF measured here is
 # the honest generalization number.
+benchmark: math500
 dataset: HuggingFaceH4/MATH-500
 splits: [test]              # the bench ships a single split
 text_field: problem         # no `messages` column — this text becomes the user turn
 streaming: true
+enable_thinking: false      # Orthrus reports deterministic non-thinking generation
 shuffle_buffer: 500
 val_size: 500               # the whole bench feeds the eval prompt stream
 batch_size: 4

@@ -1,9 +1,14 @@
 # Training distribution: nvidia/Nemotron-Post-Training-Dataset-v2 (streaming).
 # Consumed by src/data/dataloaders.py::build_dataloaders.
 dataset: nvidia/Nemotron-Post-Training-Dataset-v2
+# Set to a Hub commit SHA for a fully reproducible corpus snapshot. null uses
+# the dataset's current main revision.
+revision: null
 splits: [chat, code, math, stem]   # interleaved; multilingual_{ja,de,it,es,fr} also available
 streaming: true
 shuffle_buffer: 1000
+pack_sequences: false       # baseline paper preset enables fixed-length packing
+pad_to_max_length: false    # baseline paper preset fixes validation shapes for FlexAttention
 val_size: 256               # first N samples of the stream -> validation
 train_size: null            # null = the whole stream; int N = train on a FIXED
                             #   pool of N samples, so trainer.max_epochs repeats

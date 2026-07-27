@@ -1,0 +1,11 @@
+# Orthrus quality/efficiency benchmark: AIME I and II 2024 (30 problems).
+benchmark: aime24
+dataset: HuggingFaceH4/aime_2024
+splits: [train]
+text_field: problem
+streaming: true
+enable_thinking: false
+val_size: 30
+batch_size: 4
+max_length: 2048
+num_workers: 0

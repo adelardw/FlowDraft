@@ -22,4 +22,6 @@ tokenizer:
   trust_remote_code: false
 
 adapter:
-  w_names: [q_proj, k_proj, v_proj]
+  # Qwen2 has no per-head Q/K norms, but Orthrus still uses an independent
+  # diffusion output projection in addition to Q/K/V.
+  w_names: [q_proj, k_proj, v_proj, o_proj]
