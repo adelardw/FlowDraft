@@ -430,7 +430,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.checkpoint_save_top_k` | 2 | how many best validation-metric checkpoints to retain |
 | `train.best_checkpoint_name` | `best-tpf-{step:07d}` | filename pattern for metric-selected checkpoints |
 | `train.final_checkpoint_name` | `last.ckpt` | terminal checkpoint, written independently of the periodic interval |
-| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | run the real decode loop on N val prompts each validation → `val/tpf`, `val/acceptance_decode`; 0 = off |
+| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | run the real decode loop on N val prompts each validation → `val/tpf`, legacy prompt-mean `val/acceptance_decode`, pooled `val/decode/acceptance_pos_*`, and `val/decode/accepted_cycle_*`; 0 = off |
 | `train.monitor` / `monitor_mode` | `val/tpf` / `max` | which curve selects the best checkpoint |
 | `train.early_stop_patience` | 5 | stop after N validations without `val/loss` improvement; 0 = off |
 | `trainer.*` | — | passed verbatim to `lightning.Trainer` (precision, max_steps, …) |

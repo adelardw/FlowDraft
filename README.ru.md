@@ -213,7 +213,7 @@ Lossless утверждается **побитово** — падение про
 
 **Формулы метрик и что чему соответствует:**
 
-Цикл декодирования `c` принимает `a_c` драфт-токенов (0 ≤ a_c ≤ K) и всегда
+Цикл декодирования `c` принимает `a_c` драфт-токенов (0 ≤ a_c ≤ K−1) и всегда
 добавляет 1 токен от верификатора (коррекцию или бонус):
 
 ```
@@ -227,9 +227,11 @@ TPF_ar             = 1.0                              # ровно 1 токен 
 
 Соответствие между обучением и оценкой: `val/teacher_agreement` —
 по-позиционный прокси приёма (доля argmax-совпадений драфтера с
-верификатором); `val/acceptance_decode` и `val/tpf` — те же `acceptance` и
-`TPF`, измеренные настоящей петлёй на валидационных промптах во время
-обучения; `acceptance`/`tpf` в `src/eval.py` — они же на полноразмерной
+верификатором); `val/decode/acceptance_pos_*` — cumulative acceptance уже
+на настоящих decode-циклах; `val/decode/accepted_cycle_*` — среднее число
+принятых драфтов по номеру цикла; `val/acceptance_decode` и `val/tpf` —
+prompt-mean `acceptance` и `TPF`, измеренные той же петлёй во время обучения;
+`acceptance`/`tpf` в `src/eval.py` — они же на полноразмерной
 оценке (`n_prompts` × `max_new_tokens`, ± std). Драфтер «бьёт бейзлайн»,
 когда его TPF выше при том же числе прыжков — то есть когда
 `acceptance_flow > acceptance_baseline` при jumps=1.
@@ -238,7 +240,8 @@ TPF_ar             = 1.0                              # ровно 1 токен 
 
 Во время обучения, помимо лоссов, на каждой валидации гоняется настоящая
 decode-петля (одношаговая) на `train.val_decode_prompts` промптах — в
-TensorBoard появляются кривые **`val/tpf`** и **`val/acceptance_decode`**:
+TensorBoard появляются кривые **`val/tpf`**, **`val/acceptance_decode`** и
+позиционные/поцикловые метрики **`val/decode/*`**:
 это ровно те метрики, по которым проект сравнивается с бейзлайном, видимые
 по ходу обучения. Чекпоинт отбирается по лучшему `val/tpf`
 (`train.monitor`); осторожно — на малом числе промптов метрика шумная,
@@ -488,7 +491,7 @@ cosine 2e-4 с 5% разогревом):
 | `train.checkpoint_save_top_k` | 2 | сколько лучших по validation-метрике чекпоинтов хранить |
 | `train.best_checkpoint_name` | `best-tpf-{step:07d}` | шаблон имени чекпоинтов, выбранных по метрике |
 | `train.final_checkpoint_name` | `last.ckpt` | терминальный чекпоинт, сохраняемый независимо от периодического интервала |
-| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | настоящая петля декодирования на N val-промптах каждую валидацию → `val/tpf`, `val/acceptance_decode`; 0 = выкл |
+| `train.val_decode_prompts` / `val_decode_max_new` | 2 / 32 | настоящая петля декодирования на N val-промптах каждую валидацию → `val/tpf`, прежняя средняя по промптам `val/acceptance_decode`, pooled-метрики `val/decode/acceptance_pos_*` и `val/decode/accepted_cycle_*`; 0 = выкл |
 | `train.monitor` / `monitor_mode` | `val/tpf` / `max` | по какой кривой выбирается лучший чекпоинт |
 | `train.early_stop_patience` | 5 | стоп после N валидаций без улучшения `val/loss`; 0 = выкл |
 | `trainer.*` | — | прокидывается в `lightning.Trainer` как есть (precision, max_steps, …) |

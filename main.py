@@ -16,7 +16,9 @@ app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 @app.command()
 def generate(
     prompt: list[str] = typer.Option(..., "--prompt", "-p", help="Repeat -p for several prompts."),
-    block_size: int = typer.Option(8, help="Drafted block size K."),
+    block_size: int = typer.Option(
+        8, help="Total block width K: one anchor plus K-1 drafted tokens."
+    ),
     jumps: int = typer.Option(1, help="Flow-map jumps per block."),
     max_new_tokens: int = typer.Option(64),
     model_cfg: str = typer.Option(
@@ -25,7 +27,7 @@ def generate(
     ),
     variant: str | None = typer.Option(
         None,
-        help="Override checkpoint variant: flowdraft | flowdraft_block_wise | orthrus | orthrus_block_wise",
+        help="Override checkpoint variant: flowdraft | flowdraft_block_wise | orthrus",
     ),
     checkpoint: str = typer.Option(None, help="Trained DF-head .ckpt; omit for the raw drafter."),
     temperature: float = typer.Option(0.0, help="0 = greedy; >0 = sampling (coupled: bitwise lossless)."),
