@@ -929,6 +929,15 @@ class FlowDraft(L.LightningModule):
         )
         self._val_decode_accs = []
         self._val_decode_tpfs = []
+        drafted = max(int(self.cfg.train.get("block_size", 8)) - 1, 0)
+        max_cycles = max(int(self.cfg.train.get("val_decode_max_new", 32)), 0)
+        # Pooled real-decode statistics. Position j records how many actual
+        # speculative cycles accepted at least j drafts. Cycle j records the
+        # accepted-draft count for prompts that reached that generation cycle.
+        self._val_decode_position_hits = torch.zeros(drafted, dtype=torch.float64)
+        self._val_decode_cycle_sums = torch.zeros(max_cycles, dtype=torch.float64)
+        self._val_decode_cycle_counts = torch.zeros(max_cycles, dtype=torch.float64)
+        self._val_decode_cycle_count = 0
 
     def on_validation_epoch_end(self):
         requested = self.cfg.train.get("val_decode_prompts", 0)
@@ -938,15 +947,26 @@ class FlowDraft(L.LightningModule):
         # Reduce sums and counts instead of averaging rank-local means. This
         # remains correct when the final validation shard is uneven, and all
         # ranks participate even if one rank had no usable prompt.
-        stats = torch.tensor(
+        position_hits = self._val_decode_position_hits.to(self.device)
+        cycle_sums = self._val_decode_cycle_sums.to(self.device)
+        cycle_counts = self._val_decode_cycle_counts.to(self.device)
+        stats = torch.cat(
             [
-                sum(self._val_decode_tpfs),
-                len(self._val_decode_tpfs),
-                sum(self._val_decode_accs),
-                len(self._val_decode_accs),
-            ],
-            dtype=torch.float64,
-            device=self.device,
+                torch.tensor(
+                    [
+                        sum(self._val_decode_tpfs),
+                        len(self._val_decode_tpfs),
+                        sum(self._val_decode_accs),
+                        len(self._val_decode_accs),
+                        self._val_decode_cycle_count,
+                    ],
+                    dtype=torch.float64,
+                    device=self.device,
+                ),
+                position_hits,
+                cycle_sums,
+                cycle_counts,
+            ]
         )
         stats = self.trainer.strategy.reduce(stats, reduce_op="sum")
         if stats[1].item() == 0:
@@ -964,6 +984,41 @@ class FlowDraft(L.LightningModule):
                 # warning-free.
                 sync_dist=True,
             )
+        drafted = position_hits.numel()
+        max_cycles = cycle_sums.numel()
+        cycle_count = stats[4]
+        cursor = 5
+        global_position_hits = stats[cursor : cursor + drafted]
+        cursor += drafted
+        global_cycle_sums = stats[cursor : cursor + max_cycles]
+        cursor += max_cycles
+        global_cycle_counts = stats[cursor : cursor + max_cycles]
+
+        decode_metrics = {}
+        if cycle_count.item() > 0:
+            position_acceptance = global_position_hits / cycle_count
+            decode_metrics.update(
+                {
+                    f"val/decode/acceptance_pos_{position + 1:02d}": value
+                    for position, value in enumerate(position_acceptance)
+                }
+            )
+            # Tail-sum identity: the expected accepted-draft count equals the
+            # sum of P(n_accepted >= j) over all draft positions.
+            decode_metrics["val/decode/accepted_mean"] = position_acceptance.sum()
+        decode_metrics.update(
+            {
+                f"val/decode/accepted_cycle_{cycle + 1:02d}": (
+                    global_cycle_sums[cycle] / global_cycle_counts[cycle]
+                )
+                for cycle in range(max_cycles)
+                if global_cycle_counts[cycle].item() > 0
+            }
+        )
+        if decode_metrics:
+            # Every value was explicitly reduced above and is identical on
+            # each rank; another Lightning synchronization is unnecessary.
+            self.log_dict(decode_metrics, sync_dist=False)
         self.log(
             "val/tpf",
             stats[0] / stats[1],
@@ -971,13 +1026,41 @@ class FlowDraft(L.LightningModule):
             sync_dist=True,
         )
 
+    @staticmethod
+    def _decode_acceptance_parts(acceptance, drafted, max_cycles):
+        """Sufficient statistics for on-policy positional/cycle acceptance.
+
+        ``acceptance[c]`` is the number of drafts accepted in real generation
+        cycle ``c``. The positional tail counts satisfy
+        ``sum_j P(acceptance >= j) == mean(acceptance)``.
+        """
+        accepted = torch.as_tensor(acceptance, dtype=torch.long)
+        position_hits = torch.zeros(drafted, dtype=torch.float64)
+        cycle_sums = torch.zeros(max_cycles, dtype=torch.float64)
+        cycle_counts = torch.zeros(max_cycles, dtype=torch.float64)
+        if accepted.numel() == 0:
+            return position_hits, cycle_sums, cycle_counts, 0
+        if (accepted < 0).any() or (accepted > drafted).any():
+            raise ValueError(
+                f"decode acceptance must be between 0 and {drafted}, "
+                f"got {accepted.tolist()}"
+            )
+        if drafted:
+            positions = torch.arange(1, drafted + 1)
+            position_hits = (accepted[:, None] >= positions[None]).sum(0).to(torch.float64)
+        observed_cycles = min(accepted.numel(), max_cycles)
+        cycle_sums[:observed_cycles] = accepted[:observed_cycles].to(torch.float64)
+        cycle_counts[:observed_cycles] = 1.0
+        return position_hits, cycle_sums, cycle_counts, int(accepted.numel())
+
     @torch.no_grad()
     def _maybe_decode_val(self, batch, batch_idx):
         """The REAL target metrics as validation curves: run the lossless
         decode loop (single-jump — the headline configuration) on a few val
-        prompts and log ``val/acceptance_decode`` and ``val/tpf``. This is
-        what training should improve to beat the baseline, and what the
-        checkpoint monitor tracks; ``train.val_decode_prompts=0`` disables.
+        prompts and log ``val/acceptance_decode``, ``val/decode/*``, and
+        ``val/tpf``. This is what training should improve to beat the baseline,
+        and what the checkpoint monitor tracks; ``train.val_decode_prompts=0``
+        disables.
         """
         remaining = getattr(self, "_val_decode_remaining", 0)
         if remaining <= 0:
@@ -997,6 +1080,17 @@ class FlowDraft(L.LightningModule):
             )
             if out["acceptance"]:
                 accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
+            position_hits, cycle_sums, cycle_counts, cycle_count = (
+                self._decode_acceptance_parts(
+                    out["acceptance"],
+                    drafted=self._val_decode_position_hits.numel(),
+                    max_cycles=self._val_decode_cycle_sums.numel(),
+                )
+            )
+            self._val_decode_position_hits += position_hits
+            self._val_decode_cycle_sums += cycle_sums
+            self._val_decode_cycle_counts += cycle_counts
+            self._val_decode_cycle_count += cycle_count
             tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
             decoded += 1
         self._val_decode_remaining -= decoded
