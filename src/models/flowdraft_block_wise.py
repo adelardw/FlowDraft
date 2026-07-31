@@ -18,14 +18,15 @@ class FlowDraftBlockWise(FlowDraft):
          CLEAN in-block anchor (the decode loop's pending correction/bonus
          token, whose K/V are not in the cache while drafting), positions
          ``p+1 .. p+K-1`` are noised and drafted;
-      3. every DF forward of the loss (one-jump verifier alignment, draft,
+      3. every DF forward of the loss (last-jump verifier alignment, draft,
          anchor, EC expert, TD) runs WITH the cache AND the clean anchor at
          in-block position 0. Multiple blocks are isolated with the same
          dual-pass mask used by Orthrus.
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
     ``train.block_size`` (K = anchor + K-1 drafts), ``train.anchors_per_sequence``,
-    ``train.verify_kl_weight`` and ``train.min_prefix``.
+    ``train.verify_kl_weight``, ``train.verify_s_uniform`` and
+    ``train.min_prefix``.
     """
 
     def _split_point(self, attention_mask, block: int, document_ids=None) -> int:
@@ -264,10 +265,27 @@ class FlowDraftBlockWise(FlowDraft):
             x_s, anchor, ctx_mask, cache, s, t, df_kwargs
         )
         prior = self.sample_prior(x1, block_mask)
-        zeros = torch.zeros_like(s)
         ones = torch.ones_like(t)
+        if bool(self.cfg.train.get("verify_s_uniform", False)):
+            # Align the verifier with the whole LAST-JUMP family. Any decode
+            # schedule, however many jumps it takes, finishes on ``π_{s,1}``:
+            # a one-jump run calls ``π_{0,1}(x_0)``, a two-jump run finishes on
+            # ``π_{s,1}(x_s)`` at the intermediate noise level. Drawing
+            # ``s ~ U[0,1)`` trains that family; ``s = 0`` is only its lower
+            # endpoint, and the input there is pure noise carrying nothing
+            # about ``x1``, so a fixed one-jump term supervises the least
+            # informative point of it. Sampled independently of the ``(s, t)``
+            # pair above so the two terms never share a trajectory.
+            verify_s = torch.rand_like(s)
+            verify_input = (
+                (1.0 - verify_s[:, None, None]) * prior
+                + verify_s[:, None, None] * x1
+            )
+        else:
+            verify_s = torch.zeros_like(s)
+            verify_input = prior
         verify_logits = self._df_forward(
-            prior, anchor, ctx_mask, cache, zeros, ones, df_kwargs
+            verify_input, anchor, ctx_mask, cache, verify_s, ones, df_kwargs
         )
         return (
             teacher_logits,
@@ -319,6 +337,13 @@ class FlowDraftBlockWise(FlowDraft):
             # graph instead of NaN from a mean over an empty tensor
             return draft_logits.sum() * 0.0
         log_draft = F.log_softmax(draft_logits.float(), -1)
+        # Verifier alignment on the jump the decode loop finishes with.
+        #   KL input:  π^θ_{s,1}(x_s) — s = 0 by default (the pure prior, the
+        #              exact one-jump map), or s ~ U[0,1) with
+        #              train.verify_s_uniform, which covers the last jump of
+        #              any multi-jump schedule.
+        #   KL target: sg(p_AR) — the frozen AR path's distribution for the
+        #              same block positions, already aligned in _shared_step.
         verify_kl = self._masked_kl(
             F.log_softmax(teacher_logits.float(), -1),
             F.log_softmax(verify_logits.float(), -1),

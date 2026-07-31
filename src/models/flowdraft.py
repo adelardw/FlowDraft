@@ -27,8 +27,9 @@ class FlowDraft(L.LightningModule):
     ``endpoint + lambda * (4*EC + 2*TD)`` — categorical VFM anchors the
     diagonal ``π_{t,t}``, endpoint consistency propagates it to the jumps,
     and temporal drift keeps the family smooth in ``t``. Optional verifier
-    auxiliaries align either the diagonal or, in block-wise training, the
-    exact one-jump inference map ``π_{0,1}`` with the frozen AR distribution.
+    auxiliaries align either the diagonal or, in block-wise training, the jump
+    the decode loop finishes with — ``π_{0,1}`` alone, or the whole last-jump
+    family ``π_{s,1}`` — with the frozen AR distribution.
 
     Expected batch — a dict with:
         ``input_ids [B, T]`` (long) · ``attention_mask [B, T]`` (long, 1=live)
