@@ -729,18 +729,26 @@ class FlowDraft(L.LightningModule):
         if drafted <= 0:
             raise ValueError("block_size must be at least 2 (anchor + one draft)")
         decode_cfg = self.cfg.get("decode", {}) if hasattr(self.cfg, "get") else {}
+        # Draw through sample_prior so the decode entry state is the SAME
+        # distribution the model was trained on. Hardcoding a family here would
+        # mismatch train and inference on the one input the deployed map ever
+        # reads, and no metric produced by such a run would mean anything.
+        x = self.sample_prior(
+            torch.zeros(1, drafted, vocab, device=device)
+        )
         if bool(decode_cfg.get("fixed_prior", False)):
-            # The Dirichlet mean, i.e. the uniform point of the simplex. Greedy
-            # verification accepts on an argmax match, a criterion with no
-            # randomness in it, so drawing a fresh prior each cycle only adds
-            # variance to the one input the deployed map ever sees. Sampling
-            # decoding still gets its randomness from the proposal draw and the
-            # coupled Gumbel noise, neither of which comes from here.
-            x = torch.full((1, drafted, vocab), 1.0 / vocab, device=device)
-        else:
-            x = torch.distributions.Dirichlet(
-                torch.ones(vocab, device=device)
-            ).sample((1, drafted))
+            # Greedy verification accepts on an argmax match, a criterion with
+            # no randomness in it, so redrawing the prior each cycle only adds
+            # variance to that one input. Freeze it instead — deterministically
+            # per cycle, but still a sample from the training prior rather than
+            # its mean, which for a one-hot prior is the uniform point and for
+            # a Dirichlet prior embeds to the vocabulary mean. Sampled decoding
+            # keeps its randomness from the proposal draw and the coupled
+            # Gumbel noise, neither of which comes from here.
+            with torch.random.fork_rng(devices=[device] if device.type != "cpu" else None,
+                                       device_type=device.type):
+                torch.manual_seed(int(self.cfg.get("seed", 0)))
+                x = self.sample_prior(torch.zeros(1, drafted, vocab, device=device))
         anchor = None
         if anchor_token is not None:
             anchor = F.one_hot(
