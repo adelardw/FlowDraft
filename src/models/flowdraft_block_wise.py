@@ -180,6 +180,24 @@ class FlowDraftBlockWise(FlowDraft):
         block_ids = ids[:, p + 1 : p + block_width]
         return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
 
+    def _sample_verify_s(self, like):
+        """Noise levels for the last-jump verifier term, ``s ∈ [0, 1)``.
+
+        Plain i.i.d. uniforms leave the coverage of ``[0, 1)`` to chance, and
+        at the batch sizes used here (1-2 sequences) a step can easily see only
+        one end of the range. Stratified sampling splits ``[0, 1)`` into B
+        equal bins and draws one point per bin, so every step covers the family
+        evenly at the same cost; the permutation keeps the level uncorrelated
+        with a sequence's position in the batch.
+        """
+        u = torch.rand_like(like)
+        if not bool(self.cfg.train.get("verify_s_stratified", True)):
+            return u
+        batch = like.size(0)
+        bins = torch.arange(batch, device=like.device, dtype=like.dtype)
+        strata = (bins + u) / batch
+        return strata[torch.randperm(batch, device=like.device)]
+
     def _prepare_blocks(self, batch):
         """Prepare several isolated inference-geometry blocks in one DF pass.
 
@@ -276,7 +294,7 @@ class FlowDraftBlockWise(FlowDraft):
             # about ``x1``, so a fixed one-jump term supervises the least
             # informative point of it. Sampled independently of the ``(s, t)``
             # pair above so the two terms never share a trajectory.
-            verify_s = torch.rand_like(s)
+            verify_s = self._sample_verify_s(s)
             verify_input = (
                 (1.0 - verify_s[:, None, None]) * prior
                 + verify_s[:, None, None] * x1

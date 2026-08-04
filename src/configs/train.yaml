@@ -52,6 +52,8 @@ train:
   verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)
                             # true:  s ~ U[0,1) -- the whole last-jump family, so the
                             #        final jump of a multi-jump schedule is trained too
+  verify_s_stratified: true # with verify_s_uniform: one s per equal bin of [0,1) instead
+                            # of i.i.d. draws, so a small batch still covers the family
   lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
                             #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
