@@ -730,4 +730,3 @@ class FlowDraftBlockWise(FlowDraft):
                     on_epoch=True,
                     sync_dist=True,
                 )
-        return loss
