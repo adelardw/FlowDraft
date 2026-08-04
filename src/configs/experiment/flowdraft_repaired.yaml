@@ -1,0 +1,71 @@
+# @package _global_
+# The configuration four independent reviews and the measurements converge on.
+# Every setting below is here because something was measured, not because it
+# seemed reasonable.
+#
+# prior_type=discunif. The reference categorical-flow-map code uses a Gaussian
+# or a uniformly-random one-hot prior for text; Dirichlet is this project's
+# substitution and it breaks two things at once. At V=151936 the clean token
+# becomes the argmax of x_s once s > 7.4e-5, so 99.99% of training samples hand
+# the answer to the model and the endpoint/EC/TD terms measure a copy task --
+# which is what their near-zero converged values were. And ||x0 @ E|| is 0.004
+# against a token embedding's 1.0, so the frozen trunk receives approximately
+# the mean embedding: the near-constant behaviour was partly forced by the
+# architecture, not only by the objective. A one-hot prior fixes both at once,
+# keeping the interpolant a convex combination of two real token embeddings
+# along the whole path (0.99 -> 0.72 -> 1.02) and putting the argmax crossing
+# at s = 0.5. Gaussian works too but only at 1/sqrt(V); against a frozen
+# embedding the one-hot needs no scaling at all.
+#
+# anchors_per_sequence=128. The baseline supervises 229,376 drafted positions
+# per optimizer step; at 32 anchors this supervises 14,336, a 16x deficit that
+# confounds every comparison made so far.
+#
+# val_decode_prompts=128. The pre-registered early signal is the ratio
+# val/decode/acceptance_pos_02 / pos_01, currently 0.605, expected to move to
+# ~0.63 if the conditioning fix works. At 32 prompts that ratio has sd 0.033 --
+# a 1-sigma effect, i.e. unreadable. 128 brings it to ~0.016.
+#
+# teacher_chain_tail_weight and position_weights are left at their defaults on
+# purpose. Both are per-position weights that were verified correct, but they
+# change the supervision volume and the gradient allocation, and this preset is
+# meant to isolate the prior. Turn them on in the following run.
+#   uv run python src/train.py +experiment=flowdraft_repaired
+defaults:
+  - override /model: qwen3_1.7b
+
+output_dir: checkpoints/flowdraft-repaired
+
+train:
+  variant: flowdraft_block_wise
+  prior_type: discunif
+  block_size: 8
+  anchors_per_sequence: 128
+  min_prefix: 1
+  respect_document_boundaries: true
+  lr: 1e-4
+  verify_kl_weight: 1.0
+  endpoint_weight: 0.5
+  lambda: 0.25
+  lambda_ramp_steps: 2000
+  early_stop_patience: 0
+  monitor: val/tpf
+  monitor_mode: max
+  val_decode_prompts: 128
+  val_decode_max_new: 128
+  checkpoint_every_n_steps: 1000
+  checkpoint_name: flowdraft-repaired-{step:07d}
+  best_checkpoint_name: best-tpf-{step:07d}
+
+data:
+  splits: [chat, math, code]
+  pack_sequences: true
+  pad_to_max_length: true
+  train_size: 600000
+  batch_size: 2
+  max_length: 2048
+
+trainer:
+  max_steps: 10000
+  accumulate_grad_batches: 32
+  val_check_interval: 500
