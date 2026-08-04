@@ -389,8 +389,15 @@ class FlowDraftBlockWise(FlowDraft):
             s_w = lo + (hi - lo) * torch.rand_like(s)
             width = x1.size(1) // max(count, 1)
             shift = int(torch.randint(1, max(2, width - 1), (1,)))
-            fresh = F.softmax(teacher_logits.roll(shift, dims=1).float(), -1)
-            stale = F.softmax(teacher_logits.roll(shift + 1, dims=1).float(), -1)
+            # Roll WITHIN each block. teacher_logits is flattened over anchors,
+            # so rolling the flat axis fills the head of block b from block
+            # b-1 — an unrelated document position. At shift ~ U{1..width-1}
+            # that is 43% of slots on average, and the map's best response to
+            # an unrelated input is to ignore it, which is the opposite of what
+            # this term is for.
+            tl = teacher_logits.view(teacher_logits.size(0), count, width, -1)
+            fresh = F.softmax(tl.roll(shift, dims=2).float(), -1).flatten(1, 2)
+            stale = F.softmax(tl.roll(shift + 1, dims=2).float(), -1).flatten(1, 2)
             # cut grows with s_w: at the top of the range almost every slot is
             # the fresher row, at the bottom almost none is.
             pos = torch.arange(width, device=x1.device)[None, None, :]

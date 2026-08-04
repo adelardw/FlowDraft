@@ -228,9 +228,22 @@ class FlowDraft(L.LightningModule):
             # does. No draw, no variance in the one input the deployed map
             # reads. It stays on the simplex, so nothing downstream — the
             # embedding x @ E, the transport x + gamma(pi - x) — has to change.
-            x0 = F.softmax(self.orthrus.prior_logits.float(), -1).to(
-                simplex.dtype
-            ).expand(*shape, vocab)
+            base = F.softmax(self.orthrus.prior_logits.float(), -1).to(simplex.dtype)
+            noise = float(self.cfg.train.get("prior_noise", 0.5))
+            if noise <= 0.0:
+                x0 = base.expand(*shape, vocab)
+            else:
+                # A purely deterministic base point would fix s = 0 and destroy
+                # s > 0: with a linear embedding and a convex interpolant, a
+                # FIXED base makes (1-s)m + s x1 noiselessly invertible for
+                # every s, so the endpoint and consistency terms would face no
+                # ambiguity at all. Mixing in a genuine draw keeps the learned,
+                # consistent baseline the frozen trunk can read as "unknown"
+                # while leaving the interpolant ambiguous where it has to be.
+                draw = torch.distributions.Dirichlet(
+                    torch.ones(vocab, device=simplex.device)
+                ).sample(shape).to(simplex.dtype)
+                x0 = (1.0 - noise) * base + noise * draw
         elif kind == "discunif":
             idx = torch.randint(vocab, shape, device=simplex.device)
             x0 = F.one_hot(idx, vocab).to(simplex.dtype)
@@ -774,10 +787,15 @@ class FlowDraft(L.LightningModule):
         # token verification replaced. That staleness is the point.
         entry_s = 0.0
         if seed_logits is not None:
-            usable = min(drafted, seed_logits.size(1) - accepted - 1)
+            # seed_logits[:, j] is the AR distribution of absolute P+j+2, and
+            # slot d covers P+n+1+d, so slot d needs column n+d-1 — starting at
+            # n, not n+1. Off by one here hands every position the NEXT token's
+            # distribution, which is the worst possible input for a metric that
+            # is a conjunction over the prefix.
+            usable = min(drafted, seed_logits.size(1) - accepted)
             if usable > 0:
                 seeded = F.softmax(
-                    seed_logits[:, accepted + 1 : accepted + 1 + usable].float(), -1
+                    seed_logits[:, accepted : accepted + usable].float(), -1
                 ).to(x.dtype)
                 x = torch.cat([seeded, x[:, usable:]], dim=1)
                 entry_s = float(self.cfg.train.get("warm_start_s_min", 0.5))

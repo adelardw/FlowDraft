@@ -36,7 +36,7 @@ decode:
   fixed_prior: false        # true: start each cycle from the uniform simplex point instead
                             # of a fresh Dirichlet draw -- greedy verification has no
                             # randomness in it, so the draw only adds variance
-  warm_start: true          # enter each cycle from the previous verify pass's AR logits
+  warm_start: false         # enter each cycle from the previous verify pass's AR logits
                             # instead of from noise. Costs nothing -- those logits were
                             # already computed -- and is the only way the map's dependence
                             # on its input state can pay at one weight load per jump.

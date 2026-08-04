@@ -62,6 +62,11 @@ train:
                             # | learned (deterministic, trained, on the simplex, initialised
                             # uniform so its embedding starts at the vocabulary mean --
                             # exactly where the masked baseline's mask token starts)
+  prior_noise: 0.5          # learned prior only: how much of a real draw to mix into the
+                            # learned base point. Zero makes the interpolant (1-s)m + s x1
+                            # noiselessly invertible at every s, which fixes the s=0 state
+                            # and destroys the ambiguity the endpoint and consistency terms
+                            # exist to resolve.
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
                             #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
                             # The clean token is the argmax of x_s once s > 1e-4 and is
