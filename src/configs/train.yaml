@@ -50,13 +50,11 @@ train:
                             # linear scale ~98% of samples train a copy task. Coverage below
                             # s=1e-2: paper 5.7%, triangle 2.0%, sequential 1.0%, log ~50%.
   time_min: 1.0e-5          # log mode only: lower end of the range for both s and t
-  lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
+  lambda: 1.0               # weight of the ECLD part:
+                            #   loss = verify_kl_weight*verify_kl
+                            #        + endpoint_weight*endpoint
+                            #        + lambda*(4*EC + 2*TD)
   endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
-  ar_kl_weight: 0.0         # teacher alignment ON THE DIAGONAL; with endpoint_weight the
-                            # minimiser is their mixture, not a contested target
-  ar_kl_t_decay: 0.0        # scale that term by (1-t)^p: teacher leads near t=0 where the
-                            # input says nothing, vanishes near t=1 where x1 is the sharp
-                            # and correct target; 0 = flat weight
   teacher_target: soft      # how every teacher term matches p_AR. The two verification
                             # rules read different things, so the metric-matched loss
                             # differs by decoding mode -- and they disagree: a blurred
@@ -86,39 +84,10 @@ train:
                             # probability of reaching it; uniform weighting spends most of the
                             # gradient past position 4, reached on a few percent of blocks.
                             # Normalised to mean 1, so it does not change the effective LR.
-  verify_kl_weight: 0.0     # direct KL(p_AR || pi_{s,1}) on the jump the decode
-                            # loop finishes with; packed block-wise preset enables it
-  verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)
-                            # true:  s ~ U[0,1) -- the whole last-jump family, so the
-                            #        final jump of a multi-jump schedule is trained too
-  verify_s_stratified: true # with verify_s_uniform: one s per equal bin instead of i.i.d.
-                            # draws, so a small batch still covers the family
-  verify_s_log: true        # draw log s uniformly rather than s. With x0 ~ Dirichlet(1) over
-                            # V ~ 1.5e5 the prior's largest component is ~9e-5, so the clean
-                            # token is the argmax of the input once s > 1e-4 and is linearly
-                            # readable from its embedding once s > V^-0.5 ~ 3e-3: above that
-                            # the task is copying, and no such state occurs at decode time.
-                            # Linear sampling puts 0.8% of the draws below s=1e-2; log puts 50%.
-  verify_s_min: 1.0e-6      # lower end of the log range; BELOW the 1e-4 argmax
-                            # threshold, otherwise every sample sits on the leak boundary
-  # --- rollout: supervise the drafter on its OWN multi-jump path -------------
-  # Every other term lives on the interpolation path x_s = (1-s) x0 + s x1,
-  # which is built from the answer; decoding starts from the prior and feeds
-  # each step its own previous output. This term closes that gap and is the
-  # only one that sees a composition of jumps end to end.
-  rollout_kl_weight: 0.0    # 0 = off, costs nothing when off
-  rollout_max_jumps: 8      # n ~ U{1..N} per step, so no single schedule is specialised for
-  rollout_grad_jumps: 4     # backprop through the last k jumps only; earlier ones no_grad,
-                            # so memory follows k, not n, and the recurrence is truncated
-  rollout_anytime: true     # supervise every step in the window as "if you stopped here",
-                            # i.e. pi_{s_k,1}; false = terminal jump only (k-1 fewer forwards)
-  rollout_stratified: true  # interior jump times one per equal bin instead of a fixed grid
+  verify_kl_weight: 0.0     # KL(p_AR || pi_{0,1}(x_0)) on the pure prior -- the exact
+                            # state the decode loop enters every cycle at; the packed
+                            # block-wise preset enables it
 
-  prior_disagreement_samples: 0  # >1 logs val/prior_disagreement: JSD between predictions
-                            # from M priors at the same noise level. Must fall to zero as
-                            # s -> 0 (input independent of the endpoint); a near-zero value
-                            # at interior s means the drafter ignores its input entirely.
-                            # Diagnostic only, validation only, M extra forwards
   lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
                             #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern

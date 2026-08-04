@@ -1,0 +1,323 @@
+\documentclass{zapiski}
+\originfo{1}{}{}{2026}
+\setcounter{page}{1}
+\date{}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian, english]{babel}
+
+% Fix the incorrectly decoded Russian masthead from zapiski.cls
+\renewcommand{\publnamef}{%
+  \hbox{\foreignlanguage{russian}{Записки научных}}}
+
+\renewcommand{\publnames}{%
+  \hbox{\foreignlanguage{russian}{семинаров ПОМИ}}}
+
+\renewcommand{\russianvolinfo}{%
+  \hbox{\foreignlanguage{russian}{Том~\origvolume, \origyear~г.}}}
+
+\usepackage{times}
+\usepackage{url}
+\usepackage{latexsym}
+\usepackage{multirow}
+\usepackage{lipsum}
+\usepackage{graphicx}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{caption}
+\usepackage{cite}
+
+\usepackage{paralist}
+\usepackage{subcaption}
+\usepackage{xcolor,colortbl}
+\usepackage{array}
+%\usepackage{captionof}
+%\usepackage{multirow}
+\usepackage{setspace}
+
+\usepackage{placeins}
+
+\usepackage{tikz}
+\usepackage{pgfplots}
+
+\usepackage{array}
+\newcolumntype{H}{>{\setbox0=\hbox\bgroup}c<{\egroup}@{}}
+\newcolumntype{Z}{>{\setbox0=\hbox\bgroup}c<{\egroup}@{\hspace*{-\tabcolsep}}}
+
+\renewcommand{\UrlFont}{\ttfamily\small}
+\newcommand{\cm}[1]{\textcolor{red}{#1}}
+\newcommand{\bm}[1]{\textcolor{blue}{#1}}
+\newcommand{\naacl}[1]{#1}
+
+\usepackage{float}
+\restylefloat{table}
+
+\english
+
+\begin{document}
+
+\title[Your Paper Short Title]{Your Paper Full Title}
+
+
+\author[Author]{Full Name}
+\address[F.~Name]{Address}
+\email{email}
+
+\begin{abstract}
+This document will provide you with guidelines for your article. You will learn how to structure the article and present your results. Use this field for the short description of your work.
+\end{abstract}
+
+\keywords{key  \and words.}
+
+\maketitle
+
+\section{Introduction}
+\label{sec:intro}
+
+First of all, you will need to write the whole report in English, with a few exceptions mentioned below.
+This section is devoted to a problem motivation. You should answer the question of why the problem you were working on is important. Also, you should describe what is unique in your approach to this problem, what are the differences to other approaches.
+
+\section{Related Work}
+\label{sec:related}
+In this section, you will describe in details the existing approaches to the problem you work on. For each approach, you need to provide a reference. 
+
+In this paragraph you could find a sample citation.
+Hussain et al. \cite{hussain2017automatic} present a crowdsourced dataset of such advertisements, including images and videos, and formulate several annotation tasks: topic detection, sentiment type detection, symbolism recognition, strategy analysis, slogan annotation, and Q/A for texts related to the ads' messages and motivation. We focus on the first three tasks, each of which can be formulated as a classification problem.
+
+Please avoid direct indication that you are the authors of some other works, since this will be considered as double blind policy violation. Please cite your works in the same manner as other references, e.g. Smith et al. showed something in~\cite{smith2007overview}. 
+
+In references section please make sure that your citations are in alphabetical order.
+
+
+\section{Model Description}
+Here you need to write a detailed description of your approach. It is important to mention that this description should give more details than the descriptions from section \ref{sec:related}\footnote{This is an example of internal references and footnotes at the same time.}. 
+
+Fig.~\ref{fig:model} is a sample for image inclusion presenting your proposed approach. 
+
+\begin{figure}[!tbh]
+    \centering
+    \includegraphics[width=0.95\textwidth]{pic/model.png}\vspace{-.5cm}
+
+    \caption{The proposed blending scheme.}
+    \label{fig:model}\vspace{-.3cm}
+\end{figure}
+
+The other possible contents of this section are formulae. They could be on a new line:
+$$S=\pi r^2,$$
+or they could be inline, e.g. if you want to describe the used variables, like $S$ is an area of a circle, while $r$ is its radius. 
+
+\section{Dataset}
+In this section, you need to describe the dataset(s) you are working with. 
+An example dataset we will use is Flickr30k. Please mention a paper where it was presented, e.g. Flickr30k was presented in~\cite{plummer2015flickr30k}. Please provide guidance on how to obtain the dataset\footnote{The one way to do it is to include a link to the website, where it could be downloaded from. Like~\href{https://www.kaggle.com/datasets/hsankesara/flickr-image-dataset}{this}.}. It is important to mention that the dataset you use must be available for the research purposes. So please make sure about that. It is important to notice that there is a split of the dataset and this split is covered by the description.
+
+Your description will likely be including a table. Tab.~\ref{tab:ocr} is a sample of table inclusion presenting a sample from the dataset. 
+
+
+\begin{table}[!tbh]\setlength{\tabcolsep}{2pt}
+\begin{tabular}{p{.17\linewidth}|p{.79\linewidth}}
+\hline
+\emph{Tesseract}\newline  \cite{smith2007overview} & 
+Maybe all that raven
+wants is to wet its
+beak in a cold glass of milk.
+poe mea lo EISsTo) aU eg
+\\\hline
+EAST+\newline\emph{Tesseract}\newline\cite{kopeykina2019automatic} & 
+Maybe are Gein) eu SH Hostel S to wet its ake cold Me TS 10a milk. eee me glass 0) aa Penal see 
+\\\hline
+PSENet \newline \cite{wang2019shape} &  Elle that eV WM eMey iy is 10 Wed Mey in beak | Ey milk. of (eek glass | ranlll@a a me al eee) glass be at jeffreycombs-com  \\ \hline
+EasyOCR \newline \cite{easyocr} &  Maybe all that raven poe me a glass ofmik? beak in a cold glass ofmik. wants is to wet its seen 3t jefieycomlzesolm  \\ \hline
+Charnet \newline \cite{xing2019convolutional} & MAYBE ALL THAT RAVEN WANTS WET ITS BEAKIN COLD GLASS MILK POE GLASS MILK? SEEN ATJ COM 
+\\ \hline
+CloudVision \newline \cite{otani2018} & Maybe all that raven
+wants is to wet its
+beak in a cold glass of milk.
+poe me a glass of milk?
+seen at jeffreycombs.com
+ \\\hline
+\end{tabular}
+
+\caption{Sample  texts obtained via OCR/captioning.}\label{tab:ocr}
+\end{table}
+
+If you were collecting the dataset on your own please describe the collection procedure, like criteria were used to filter the documents, the pre-processing steps, etc. It is preferable that you release your dataset for the public, but you are not obliged to do this. Please make sure that you have legal rights to collect and distribute the data you were working with.
+
+\section{Experiments}
+This section should include several subsections.
+\subsection{Metrics}
+First of all, you should describe the metric(s) you were using to evaluate your approach. Most likely a metric description will include a formula.
+
+\subsection{Experiment Setup}
+Secondly, you need to describe the design of your experiment, e.g. how many runs there were, how the data split was done. The important details of your model, like hyper-parameters used in the experiments, and so on.
+
+\subsection{Baselines}
+Another important feature is that you could provide here the description of some simple approaches for your problem, like logistic regression over TF-IDF embedding for text classification. The baselines are needed is there is no previous art on the problem you are presenting.
+
+\section{Results}
+In this section, you need to list and describe the achieved results. It is crucial to have the results of the experiments for the other approaches. This is needed to be able to compare your results with some competitors. Most preferably, you should provide some references with results on the same problem.
+
+Almost inevitably the results are presented as a table, but it is also possible to have a graph, i.e. a figure. Fig.~\ref{tab:topics_sentiments_overall_accuracy} is a sample of tikz figure inclusion.
+
+You need also to provide an interpretation of the presented results, to describe some features. E.g. your approach shows higher results on the short texts or by one metric instead of another. Also in this section, you could provide some results for your model inference.
+
+
+
+\begin{figure}[!tbh] 
+\centering
+    % \includegraphics[width=0.5\textwidth]{pic/Fig_ads_221_f1.eps}
+    \tikzset{dashdot/.style={dash pattern=on .4pt off 3pt on 4pt off 3pt}}
+\pgfplotsset{every tick label/.append style={font=\footnotesize}}
+\pgfplotsset{every axis legend/.append style={font=\footnotesize,draw=none}}
+\pgfplotsset{every axis label/.append style={font=\footnotesize}}
+
+\pgfplotsset{every axis/.append style={width=\linewidth, height={.6\linewidth}, grid=major, grid style={dashed,gray!25}, legend cell align=left, legend columns=1}}
+\pgfplotsset{every axis x label/.append style={at={(axis description cs:1.0,0.1)}, anchor=north east}}
+\pgfplotsset{every axis y label/.append style={at={(axis description cs:-0.,0.5)}, anchor=north}}
+
+\begin{tikzpicture}
+  \begin{axis}[
+    height=4cm,
+      xlabel={Threshold $t_0$},
+      ylabel={F1-score},
+      enlargelimits=false,
+      % ymin=1,
+      ytick={0,0.05,0.1,0.15},yticklabels={0,0.05,0.1,0.15},
+      % ytick={1,50,100},yticklabels={1,50,100},
+      xmax=1.0,xmin=0,
+      % x tick label style={rotate=90,anchor=east} % Display labels sideways
+    ]
+    \addplot[color=blue,line width=0.9pt,mark size=1.5pt,mark=star] table[x index=0,y index=1] {pic/symbols_fscore_on_threshold.csv};
+    \addplot[color=red,line width=0.9pt,mark size=1pt,mark=*] table[x index=0,y index=2] {pic/symbols_fscore_on_threshold.csv};
+    \addplot[color=green!60!black,line width=0.9pt,mark size=1pt,mark=triangle] table[x index=0,y index=3] {pic/symbols_fscore_on_threshold.csv};
+    \legend{{MobileNet v1},{Inception v3},{EfficientNet-B3}};
+  \end{axis}
+\end{tikzpicture}   
+    
+	\caption{F1-score for image-based symbol recognition (221 categories).} 
+	\label{visual-221-f1}
+% \end{figure}
+
+% \begin{table}[!t]
+    \footnotesize\setlength{\tabcolsep}{2.8pt}
+    \begin{tabular}{|c|c|c|}
+    \hline
+        CNN & Topics & Sentiments \\
+        \hline
+        Baseline~\cite{hussain2017automatic} & 60.34& 27.92\\
+        Curriculum learning~\cite{10.1007/978-3-030-01216-8_36} & --- & 27.96\\
+        \hline
+        ResNet-50 & 53.90 & 34.34 \\
+        Resnet-152 & 52.67 & 27.58 \\
+        Resnet-152 V2 & 52.12 & 27.64 \\
+        MobileNet v1& 50.56 & 33.50\\
+        MobileNet v2 & 54.76  & \textbf{34.58}\\
+        EfficientNet-B0 & 60.06 & 34.03\\
+        EfficientNet-B3 & \textbf{62.62} & 34.12 \\
+        \hline
+        Our multitask model & \textbf{62.99} & \textbf{36.27} \\ \hline
+    \end{tabular}
+    \captionof{table}{Image-based topic/sentiment classification.}
+    \label{tab:topics_sentiments_overall_accuracy}
+\end{figure}
+
+\section{Conclusion}
+In this section, you need to describe all the work in short: what you have done and what has been achieved. E.g. you have collected a dataset, made a markup for it and developed a model showing the best results compared to other models. 
+
+Please do not forget to include author names, title, keywords, and abstract in Russian after the References section.
+
+\section*{Acknowledgments}
+In the final version of your paper you can include granting information. E.g. The work has been supported by the Fund grant \#XXX. Please DO NOT include it in the review version, since it is considered as double blind policy violation. That could lead to desk reject of your paper.
+
+% \bibliographystyle{amsplain}
+% \bibliography{anthology,eacl2021}
+
+\providecommand{\bysame}{\leavevmode\hbox to3em{\hrulefill}\thinspace}
+\providecommand{\MR}{\relax\ifhmode\unskip\space\fi MR }
+% \MRhref is called by the amsart/book/proc definition of \MR.
+\providecommand{\MRhref}[2]{%
+  \href{http://www.ams.org/mathscinet-getitem?mr=#1}{#2}
+}
+\providecommand{\href}[2]{#2}
+\begin{thebibliography}{10}
+
+
+\bibitem{hussain2017automatic}
+Zaeem Hussain, Mingda Zhang, Xiaozhong Zhang, Keren Ye, Christopher Thomas,
+  Zuha Agha, Nathan Ong, and Adriana Kovashka, \emph{Automatic understanding of
+  image and video advertisements}, Proceedings of the IEEE Conference on
+  Computer Vision and Pattern Recognition (CVPR), 2017, pp.~1705--1715.
+
+
+\bibitem{easyocr}
+JaidedAI, \emph{{EasyOCR}: Ready-to-use ocr with 70+ languages supported
+  including chinese, japanese, korean and thai.},
+  \url{https://github.com/JaidedAI/EasyOCR}, 2020.
+
+
+\bibitem{kopeykina2019automatic}
+Lyudmila Kopeykina and Andrey~V Savchenko, \emph{Automatic privacy detection in
+  scanned document images based on deep neural networks}, Proceedings of the
+  International Russian Automation Conference (RusAutoCon), IEEE, 2019,
+  pp.~1--6.
+
+
+\bibitem{otani2018}
+Mayu Otani, Yuki Iwazaki, and Kota Yamaguchi, \emph{Unreasonable effectiveness
+  of {OCR} in visual advertisement understanding}, 2018.
+  
+  
+  \bibitem{10.1007/978-3-030-01216-8_36}
+Rameswar Panda, Jianming Zhang, Haoxiang Li, Joon-Young Lee, Xin Lu, and
+  Amit~K. Roy-Chowdhury, \emph{Contemplating visual emotions: Understanding and
+  overcoming dataset bias}, Proceedings of European Conference on Computer
+  Vision (ECCV) (Cham) (Vittorio Ferrari, Martial Hebert, Cristian
+  Sminchisescu, and Yair Weiss, eds.), Springer International Publishing, 2018,
+  pp.~594--612.
+
+\bibitem{plummer2015flickr30k}
+Bryan~A Plummer, Liwei Wang, Chris~M Cervantes, Juan~C Caicedo, Julia
+  Hockenmaier, and Svetlana Lazebnik, \emph{Flickr30k entities: Collecting
+  region-to-phrase correspondences for richer image-to-sentence models},
+  Proceedings of the IEEE international conference on computer vision, 2015,
+  pp.~2641--2649.
+
+
+
+
+\bibitem{smith2007overview}
+Ray Smith, \emph{An overview of the {Tesseract} {OCR} engine}, Proceedings of
+  the International Conference on Document Analysis and Recognition (ICDAR),
+  vol.~2, IEEE, 2007, pp.~629--633.
+
+
+
+\bibitem{wang2019shape}
+Wenhai Wang, Enze Xie, Xiang Li, Wenbo Hou, Tong Lu, Gang Yu, and Shuai Shao,
+  \emph{Shape robust text detection with progressive scale expansion network},
+Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, 2019.
+
+
+\bibitem{xing2019convolutional}
+Linjie Xing, Zhi Tian, Weilin Huang, and Matthew~R Scott, \emph{Convolutional
+  character networks}, Proceedings of the IEEE International Conference on
+  Computer Vision (ICCV), 2019, pp.~9126--9136.
+
+
+
+
+
+\end{thebibliography}
+
+\end{document}
+
+À. Àëåêñååâ, À. Ñàâ÷åíêî, Å. Òóòóáàëèíà, Å. Ìÿñíèêîâ, Ñ. Íèêîëåíêî. Îáúåäèíåíèå ïðåäñêàçàíèé óëó÷øàåò ïîíèìàíèå ìóëüòèìîäàëüíîãî ðåêëàìíîãî êîíòåíòà
+
+\begin{abstract}
+Ðåêëàìíàÿ èíäóñòðèÿ èñïîëüçóåò íåñêîëüêî ìîäàëüíîñòåé êîíòåíòà äëÿ äîñòàâêè ïîäðàçóìåâàåìûõ ñîîáùåíèé: èçîáðàæåíèÿ, âèäåî, òåêñò, ìóçûêà, è âñå ýòî âìåñòå âçÿòîå. ``Äåêîäèðîâàíèå'' ñîîáùåíèÿ, ïîäðàçóìåâàåìîãî â ìóëüòèìîäàëüíîì êîíòåíòå, ÷àñòî òðåáóåò àíàëèçà êàê òåêñòîâûõ, òàê è âèçóàëüíûõ åãî êîìïîíåíòîâ. Ìû èçó÷àåì çàäà÷è ðàñïîçíàâàíèÿ ìóëüòèìîäàëüíîãî ñèìâîëèçìà, îáíàðóæåíèÿ òåì è êëàññèôèêàöèè òîíàëüíîñòè. Ðóêîâîäñòâóÿñü ðàçíèöåé â ÷àñòÿõ ñîîáùåíèÿ, ïåðåäàâàåìûõ ðàçíûìè ìîäàëüíîñòÿìè â ðåêëàìíûõ îáúÿâëåíèÿõ, ìû îáó÷àåì îòäåëüíûå ìîäåëè äëÿ èçîáðàæåíèé è òåêñòîâ è çíà÷èòåëüíî óëó÷øàåì ðåçóëüòàòû, ñìåøèâàÿ ïðîãíîçû íà îñíîâå èçîáðàæåíèé è òåêñòà (ñ àâòîìàòè÷åñêè ðàñïîçíàííûì òåêñòîì), ÷òî äàåò ýêñïåðèìåíòàëüíîå ïîäòâåðæäåíèå íàøåãî ïîäõîäà.
+\end{abstract}
+
+\keywords{ìóëüòèìîäàëüíîå ìàøèííîå îáó÷åíèå \and ïîíèìàíèå ðåêëàìíîãî êîíòåíòà \and ðàñïîçíàâàíèå òåìàòèêè \and òîíàëüíîñòü òåêñòà \and êëàññèôèêàöèÿ òîíàëüíîñòè}

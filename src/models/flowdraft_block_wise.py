@@ -1,5 +1,3 @@
-import contextlib
-
 import torch
 import torch.nn.functional as F
 from transformers import DynamicCache
@@ -27,8 +25,8 @@ class FlowDraftBlockWise(FlowDraft):
 
     Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
     ``train.block_size`` (K = anchor + K-1 drafts), ``train.anchors_per_sequence``,
-    ``train.verify_kl_weight``, ``train.verify_s_uniform`` and
-    ``train.min_prefix``.
+    ``train.verify_kl_weight``, ``train.teacher_chain_tail_weight``,
+    ``train.position_weights`` and ``train.min_prefix``.
     """
 
     def _split_point(self, attention_mask, block: int, document_ids=None) -> int:
@@ -240,141 +238,7 @@ class FlowDraftBlockWise(FlowDraft):
             return None
         return weights * live.to(weights.dtype)
 
-    def _rollout_schedule(self, jumps, device):
-        """Jump times ``0 = t_0 < ... < t_n = 1`` for one rollout.
 
-        The interior boundaries are drawn one per equal bin of ``(0, 1)``
-        rather than placed on a uniform grid, so successive steps see a
-        different partition and the family is covered rather than sampled at
-        the same n-1 points every time. Both ends are kept strictly inside
-        ``(0, 1)``: the transport factor ``(t - s) / (1 - s)`` is unbounded as
-        ``s -> 1``.
-        """
-        if jumps < 2:
-            return [0.0, 1.0]
-        interior = jumps - 1
-        bins = torch.arange(interior, device=device, dtype=torch.float32)
-        if bool(self.cfg.train.get("rollout_stratified", True)):
-            offsets = torch.rand(interior, device=device)
-        else:
-            offsets = torch.full((interior,), 0.5, device=device)
-        times = ((bins + offsets) / interior).clamp(1e-3, 1.0 - 1e-3)
-        return [0.0] + times.sort().values.tolist() + [1.0]
-
-    def _rollout_kl(self, teacher_logits, x1, block_mask, ctx_mask, cache,
-                    anchor, df_kwargs):
-        """Teacher alignment along the drafter's OWN multi-jump path.
-
-        Every other term is evaluated on the interpolation path
-        ``x_s = (1-s) x_0 + s x_1``, which is built from the answer. Decoding
-        never sees that path: it starts from the prior and each step consumes
-        the previous step's own output. Training on one and running on the
-        other is the same exposure mismatch teacher forcing produces in an AR
-        model, and nothing in the objective addresses it. This term rolls the
-        drafter forward exactly as the decode loop does and supervises what it
-        actually produces.
-
-        It also gives the composition a direct signal. Endpoint consistency
-        relates ``π_{s,t}`` to the diagonal pairwise; a schedule of ``n`` jumps
-        executes a composition that no pairwise term ever evaluates end to end,
-        so accumulated error is unconstrained.
-
-        The target is the frozen AR distribution at every step, asked as "if
-        you had to finish here, what would you emit" — that is ``π_{s_k,1}``,
-        the map a schedule of any length terminates on. Supervising the
-        intermediate horizons themselves would instead drive the family towards
-        independence of ``t``, since the target does not depend on it.
-
-        Gradients flow through the last ``train.rollout_grad_jumps`` steps
-        only. The earlier ones run under ``no_grad``, so memory is bounded by
-        that window rather than by the schedule length, and the recurrence is
-        truncated before its conditioning degrades. Note the transport step is
-        a convex combination with factor below one except at ``t = 1``, so the
-        iteration is damped rather than expansive.
-        """
-        weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
-        if weight <= 0.0:
-            return None
-        live = block_mask.bool()
-        if not live.any():
-            return None
-        max_jumps = max(1, int(self.cfg.train.get("rollout_max_jumps", 8)))
-        window = max(1, int(self.cfg.train.get("rollout_grad_jumps", 4)))
-        anytime = bool(self.cfg.train.get("rollout_anytime", True))
-        jumps = int(torch.randint(1, max_jumps + 1, (1,)))
-        times = self._rollout_schedule(jumps, x1.device)
-        pad = block_mask[..., None].to(x1.dtype)
-
-        x = self.sample_prior(x1, block_mask)
-        ones = x1.new_ones(x1.size(0))
-        terms = []
-        for step, (s_k, t_k) in enumerate(zip(times[:-1], times[1:])):
-            grad_on = step >= jumps - window
-            ctx = contextlib.nullcontext() if grad_on else torch.no_grad()
-            s_vec = x1.new_full((x1.size(0),), s_k)
-            x_in = x
-            with ctx:
-                logits = self._df_forward(
-                    x_in, anchor, ctx_mask, cache,
-                    s_vec, x1.new_full((x1.size(0),), t_k), df_kwargs,
-                )
-                pi = F.softmax(logits.float(), -1).to(x_in.dtype)
-                # Endpoint prediction for this step's own horizon; the state
-                # moves a (t-s)/(1-s) fraction of the way towards it.
-                gamma = (t_k - s_k) / max(1.0 - s_k, 1e-3)
-                x = (x_in + gamma * (pi - x_in)) * pad
-            if not grad_on:
-                continue
-            if t_k >= 1.0:
-                # The last step already asks the t = 1 question, so its own
-                # output IS the "finish here" prediction — no extra forward.
-                finish = logits
-            elif anytime:
-                # Same state, horizon moved to 1: what this step would emit if
-                # the schedule stopped here.
-                finish = self._df_forward(
-                    x_in, anchor, ctx_mask, cache, s_vec, ones, df_kwargs,
-                )
-            else:
-                continue
-            terms.append(self._teacher_loss(teacher_logits, finish, live))
-        if not terms:
-            return None
-        return torch.stack(terms).mean()
-
-    def _sample_verify_s(self, like):
-        """Noise levels for the last-jump verifier term.
-
-        Sampled on a LOG scale, because a linear scale spends almost all of its
-        budget on states that give the answer away. The interpolant is
-        ``x_s = (1-s) x0 + s x1`` with ``x0 ~ Dirichlet(1)`` over the full
-        vocabulary: at ``V ≈ 1.5e5`` the largest component of the prior is about
-        ``ln(V)/V ≈ 9e-5``, so the clean token becomes the argmax of the input
-        once ``s`` exceeds roughly ``1e-4``, and is linearly recoverable from
-        the input embedding once ``s`` exceeds roughly ``V^{-1/2} ≈ 3e-3``. Above
-        that the task degenerates into copying the input, and the drafter never
-        sees such a state at decode time — a one-jump schedule enters at
-        ``s = 0`` and a multi-jump schedule enters later steps on its own
-        transported state, which is not an interpolation with the answer.
-
-        Drawing ``log s`` uniformly on ``[log s_min, 0]`` puts about half the
-        samples below ``1e-2``. ``s_min`` sits BELOW the argmax threshold on
-        purpose: stopping at ``1e-4`` would leave every single sample in the
-        regime where the clean token is the argmax of the input, which is the
-        boundary of the leak rather than the far side of it. Stratification is applied
-        in log space for the same reason as before: at a batch of one or two,
-        i.i.d. draws leave coverage to chance.
-        """
-        batch = like.size(0)
-        u = torch.rand_like(like)
-        if bool(self.cfg.train.get("verify_s_stratified", True)):
-            bins = torch.arange(batch, device=like.device, dtype=like.dtype)
-            u = ((bins + u) / batch)[torch.randperm(batch, device=like.device)]
-        if not bool(self.cfg.train.get("verify_s_log", True)):
-            return u
-        s_min = float(self.cfg.train.get("verify_s_min", 1e-6))
-        log_min = torch.log(torch.tensor(s_min, device=like.device, dtype=like.dtype))
-        return (log_min * (1.0 - u)).exp().clamp(0.0, 1.0 - 1e-3)
 
     def _prepare_blocks(self, batch):
         """Prepare several isolated inference-geometry blocks in one DF pass.
@@ -460,26 +324,11 @@ class FlowDraftBlockWise(FlowDraft):
         draft_logits = self._df_forward(
             x_s, anchor, ctx_mask, cache, s, t, df_kwargs
         )
-        prior = self.sample_prior(x1, block_mask)
+        # The decode loop enters every cycle at the pure prior, s = 0, so that
+        # is the only state this term should be evaluated at.
+        verify_input = self.sample_prior(x1, block_mask)
+        verify_s = torch.zeros_like(s)
         ones = torch.ones_like(t)
-        if bool(self.cfg.train.get("verify_s_uniform", False)):
-            # Align the verifier with the whole LAST-JUMP family. Any decode
-            # schedule, however many jumps it takes, finishes on ``π_{s,1}``:
-            # a one-jump run calls ``π_{0,1}(x_0)``, a two-jump run finishes on
-            # ``π_{s,1}(x_s)`` at the intermediate noise level. Drawing
-            # ``s ~ U[0,1)`` trains that family; ``s = 0`` is only its lower
-            # endpoint, and the input there is pure noise carrying nothing
-            # about ``x1``, so a fixed one-jump term supervises the least
-            # informative point of it. Sampled independently of the ``(s, t)``
-            # pair above so the two terms never share a trajectory.
-            verify_s = self._sample_verify_s(s)
-            verify_input = (
-                (1.0 - verify_s[:, None, None]) * prior
-                + verify_s[:, None, None] * x1
-            )
-        else:
-            verify_s = torch.zeros_like(s)
-            verify_input = prior
         verify_logits = self._df_forward(
             verify_input, anchor, ctx_mask, cache, verify_s, ones, df_kwargs
         )
@@ -534,10 +383,8 @@ class FlowDraftBlockWise(FlowDraft):
             return draft_logits.sum() * 0.0
         log_draft = F.log_softmax(draft_logits.float(), -1)
         # Verifier alignment on the jump the decode loop finishes with.
-        #   KL input:  π^θ_{s,1}(x_s) — s = 0 by default (the pure prior, the
-        #              exact one-jump map), or s ~ U[0,1) with
-        #              train.verify_s_uniform, which covers the last jump of
-        #              any multi-jump schedule.
+        #   KL input:  π^θ_{0,1}(x_0) — the pure prior at s = 0, i.e.
+        #              the state the decode loop enters every cycle at.
         #   KL target: sg(p_AR) — the frozen AR path's distribution for the
         #              same block positions, already aligned in _shared_step.
         pos_w = self._position_weights(teacher_logits, x1, live)
@@ -567,23 +414,6 @@ class FlowDraftBlockWise(FlowDraft):
             reduction="none",
         )
         endpoint = endpoint_nll[live].mean()
-        # Teacher alignment on the diagonal. Combined with the endpoint CE this
-        # is not a pair of competing targets: both are forward KLs, which are
-        # linear in the target, so the weighted sum is minimised by the MIXTURE
-        # (w_e * p(x1|x_t) + w_a * p_AR) / (w_e + w_a). What the flat weight
-        # gets wrong is the blend ratio, which should not be constant in t —
-        # see _ar_kl_sample_weight.
-        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
-        ar_kl = (
-            self._teacher_loss(
-                teacher_logits, diag_logits, live,
-                sample_weight=self._ar_kl_sample_weight(t),
-                position_weight=pos_w,
-            )
-            if ar_kl_weight
-            else diag_logits.sum() * 0.0
-        )
-
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
         # the jump must agree with the stop-grad expert at its landing point.
         if anchor_point == "landing":
@@ -612,13 +442,6 @@ class FlowDraftBlockWise(FlowDraft):
             ),
         )
 
-        rollout_kl_weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
-        rollout_kl = self._rollout_kl(
-            teacher_logits, x1, block_mask, ctx_mask, cache, anchor, df_kwargs
-        )
-        if rollout_kl is None:
-            rollout_kl = draft_logits.sum() * 0.0
-
         lam = self._lambda()
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
@@ -626,17 +449,13 @@ class FlowDraftBlockWise(FlowDraft):
         verify_kl_weight = self.cfg.train.get("verify_kl_weight", 0.0)
         loss = (
             verify_kl_weight * verify_kl
-            + rollout_kl_weight * rollout_kl
             + endpoint_weight * endpoint
-            + ar_kl_weight * ar_kl
             + lam * (4.0 * ec + 2.0 * td)
         )
         self.log_dict(
             {
                 f"{metric_prefix}/endpoint": endpoint,
                 f"{metric_prefix}/verify_kl": verify_kl,
-                f"{metric_prefix}/rollout_kl": rollout_kl,
-                f"{metric_prefix}/ar_kl": ar_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
                 f"{metric_prefix}/lambda": lam,
@@ -720,75 +539,4 @@ class FlowDraftBlockWise(FlowDraft):
                 on_epoch=True,
                 sync_dist=True,
             )
-            self._log_prior_disagreement(rest)
             self._maybe_decode_val(batch, batch_idx)
-
-    def _log_prior_disagreement(self, rest):
-        """How much the drafter's endpoint prediction depends on the noise seed.
-
-        Several priors are drawn for the SAME batch — same clean endpoints,
-        same context, same noise level — and the spread of the resulting
-        predictions is measured as the Jensen-Shannon divergence of the M
-        predictive distributions, ``H(mean) - mean(H)``, averaged over live
-        positions. Zero means the prediction is a function of the data alone;
-        large values mean the seed is moving it.
-
-        Two readings, at the two ends of the noise level:
-
-        * ``s -> 0`` the input is independent of the endpoints, so the optimal
-          prediction cannot depend on the seed and the divergence must fall to
-          zero as training proceeds. If it plateaus above zero, the drafter is
-          reading structure out of the noise.
-        * ``s`` in the interior the input genuinely carries part of the answer,
-          different seeds give different partial evidence, and a NON-zero
-          spread is correct. A value near zero here means the opposite failure:
-          the drafter ignores its input and predicts from context alone, which
-          would make the whole diffusion path decorative.
-
-        Diagnostic only, validation only, no gradient. Enable with
-        ``train.prior_disagreement_samples > 1``.
-        """
-        samples = int(self.cfg.train.get("prior_disagreement_samples", 0))
-        if samples < 2:
-            return
-        (_x_s, _x_t, x1, s, _t, ctx_mask, block_mask, cache, anchor,
-         df_kwargs) = rest
-        live = block_mask.bool()
-        if not live.any():
-            return
-        ones = torch.ones_like(s)
-        preds = []
-        with torch.no_grad():
-            for _ in range(samples):
-                prior = self.sample_prior(x1, block_mask)
-                x_seed = (1.0 - s[:, None, None]) * prior + s[:, None, None] * x1
-                logits = self._df_forward(
-                    x_seed, anchor, ctx_mask, cache, s, ones, df_kwargs
-                )
-                preds.append(F.softmax(logits.float(), -1))
-        stack = torch.stack(preds)                       # [M, B, K, V]
-        mean = stack.mean(0)
-        # JSD = H(mean) - mean(H); both entropies in nats, so the value is
-        # bounded by log(M) and comparable across runs with the same M.
-        entropy = lambda p: -(p.clamp_min(1e-12).log() * p).sum(-1)
-        jsd = entropy(mean) - entropy(stack).mean(0)
-        self.log(
-            "val/prior_disagreement",
-            jsd[live].mean(),
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        # Split by noise level: the two ends carry opposite expectations.
-        low = s < 0.5
-        for name, sel in (("low_s", low), ("high_s", ~low)):
-            rows = sel[:, None] & live
-            if rows.any():
-                self.log(
-                    f"val/prior_disagreement_{name}",
-                    jsd[rows].mean(),
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
