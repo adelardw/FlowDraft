@@ -270,7 +270,8 @@ class Orthrus(FlowDraftBlockWise):
             self._maybe_decode_val(batch, batch_idx)
         return loss
 
-    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
+    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None,
+                     seed_logits=None, accepted: int = 0):
         if len(times) != 2:
             raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
         embed = self.orthrus.model.get_input_embeddings()

@@ -49,6 +49,12 @@ class FlowDraft(L.LightningModule):
         # learned mask token. Leaving this parameter trainable makes it unused
         # in the backward graph and breaks DDP with find_unused_parameters=False.
         self.orthrus.mask_embedding.requires_grad_(False)
+        # The learned prior trains only when it is the one in use; leaving it
+        # on otherwise gives DDP an unused parameter and forces every existing
+        # checkpoint to carry a tensor it does not have.
+        self.orthrus.prior_logits.requires_grad_(
+            str(cfg.train.get("prior_type", "dirichlet")) == "learned"
+        )
         # Checkpoints hold only the DF head (see on_save_checkpoint), so the
         # frozen backbone keys are legitimately absent on load.
         self.strict_loading = False
