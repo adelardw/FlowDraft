@@ -71,8 +71,15 @@ train:
   verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)
                             # true:  s ~ U[0,1) -- the whole last-jump family, so the
                             #        final jump of a multi-jump schedule is trained too
-  verify_s_stratified: true # with verify_s_uniform: one s per equal bin of [0,1) instead
-                            # of i.i.d. draws, so a small batch still covers the family
+  verify_s_stratified: true # with verify_s_uniform: one s per equal bin instead of i.i.d.
+                            # draws, so a small batch still covers the family
+  verify_s_log: true        # draw log s uniformly rather than s. With x0 ~ Dirichlet(1) over
+                            # V ~ 1.5e5 the prior's largest component is ~9e-5, so the clean
+                            # token is the argmax of the input once s > 1e-4 and is linearly
+                            # readable from its embedding once s > V^-0.5 ~ 3e-3: above that
+                            # the task is copying, and no such state occurs at decode time.
+                            # Linear sampling puts 0.8% of the draws below s=1e-2; log puts 50%.
+  verify_s_min: 1.0e-4      # lower end of the log range
   # --- rollout: supervise the drafter on its OWN multi-jump path -------------
   # Every other term lives on the interpolation path x_s = (1-s) x0 + s x1,
   # which is built from the answer; decoding starts from the prior and feeds

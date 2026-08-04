@@ -285,22 +285,36 @@ class FlowDraftBlockWise(FlowDraft):
         return torch.stack(terms).mean()
 
     def _sample_verify_s(self, like):
-        """Noise levels for the last-jump verifier term, ``s ∈ [0, 1)``.
+        """Noise levels for the last-jump verifier term.
 
-        Plain i.i.d. uniforms leave the coverage of ``[0, 1)`` to chance, and
-        at the batch sizes used here (1-2 sequences) a step can easily see only
-        one end of the range. Stratified sampling splits ``[0, 1)`` into B
-        equal bins and draws one point per bin, so every step covers the family
-        evenly at the same cost; the permutation keeps the level uncorrelated
-        with a sequence's position in the batch.
+        Sampled on a LOG scale, because a linear scale spends almost all of its
+        budget on states that give the answer away. The interpolant is
+        ``x_s = (1-s) x0 + s x1`` with ``x0 ~ Dirichlet(1)`` over the full
+        vocabulary: at ``V ≈ 1.5e5`` the largest component of the prior is about
+        ``ln(V)/V ≈ 9e-5``, so the clean token becomes the argmax of the input
+        once ``s`` exceeds roughly ``1e-4``, and is linearly recoverable from
+        the input embedding once ``s`` exceeds roughly ``V^{-1/2} ≈ 3e-3``. Above
+        that the task degenerates into copying the input, and the drafter never
+        sees such a state at decode time — a one-jump schedule enters at
+        ``s = 0`` and a multi-jump schedule enters later steps on its own
+        transported state, which is not an interpolation with the answer.
+
+        Drawing ``log s`` uniformly on ``[log s_min, 0]`` puts about half the
+        samples below ``1e-2``, i.e. in the range where the input is genuinely
+        uninformative and the term trains something. Stratification is applied
+        in log space for the same reason as before: at a batch of one or two,
+        i.i.d. draws leave coverage to chance.
         """
-        u = torch.rand_like(like)
-        if not bool(self.cfg.train.get("verify_s_stratified", True)):
-            return u
         batch = like.size(0)
-        bins = torch.arange(batch, device=like.device, dtype=like.dtype)
-        strata = (bins + u) / batch
-        return strata[torch.randperm(batch, device=like.device)]
+        u = torch.rand_like(like)
+        if bool(self.cfg.train.get("verify_s_stratified", True)):
+            bins = torch.arange(batch, device=like.device, dtype=like.dtype)
+            u = ((bins + u) / batch)[torch.randperm(batch, device=like.device)]
+        if not bool(self.cfg.train.get("verify_s_log", True)):
+            return u
+        s_min = float(self.cfg.train.get("verify_s_min", 1e-4))
+        log_min = torch.log(torch.tensor(s_min, device=like.device, dtype=like.dtype))
+        return (log_min * (1.0 - u)).exp().clamp(0.0, 1.0 - 1e-3)
 
     def _prepare_blocks(self, batch):
         """Prepare several isolated inference-geometry blocks in one DF pass.
