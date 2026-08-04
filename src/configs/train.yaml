@@ -72,6 +72,20 @@ train:
                             #           acceptance rate. Use when decoding with sampling.
                             # None of them affects output quality: verification makes the
                             # text identical to the AR model's either way. Only speed moves.
+  teacher_chain_tail_weight: 1.0  # Acceptance is judged against p_AR conditioned on the
+                            # tokens already ACCEPTED, i.e. under greedy verification the
+                            # frozen model's own greedy chain. The single AR pass conditions
+                            # on the CORPUS tokens instead, and the two agree only until the
+                            # model's top-1 first differs from the data -- about two positions
+                            # at ~55% agreement. This scales the teacher terms past that point:
+                            # 1.0 = previous behaviour, 0.0 = hard mask, in between trades bias
+                            # for keeping the deep positions from starving. Costs no forwards.
+  position_weights: null    # per-position weights for the teacher terms, e.g. the measured
+                            # prefix-survival curve [1, 0.882, 0.533, 0.265, 0.153, 0.084, 0.052].
+                            # TPF is a conjunction over the prefix, so position j is worth the
+                            # probability of reaching it; uniform weighting spends most of the
+                            # gradient past position 4, reached on a few percent of blocks.
+                            # Normalised to mean 1, so it does not change the effective LR.
   verify_kl_weight: 0.0     # direct KL(p_AR || pi_{s,1}) on the jump the decode
                             # loop finishes with; packed block-wise preset enables it
   verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)

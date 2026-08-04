@@ -182,6 +182,64 @@ class FlowDraftBlockWise(FlowDraft):
         block_ids = ids[:, p + 1 : p + block_width]
         return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
 
+    def _position_weights(self, teacher_logits, x1, live):
+        """Per-position weights for the teacher terms: chain consistency, then
+        prefix survival.
+
+        **Chain consistency.** Acceptance at position ``j`` is judged against
+        ``p_AR`` conditioned on the tokens already accepted, and under greedy
+        verification those are the frozen model's own greedy continuation. The
+        single AR pass over the packed sequence conditions instead on the
+        CORPUS tokens, and the two chains part company as soon as the model's
+        top-1 disagrees with the data — after roughly two positions at the
+        observed ~55% agreement. Up to that point the two conditionings are
+        identical and the existing teacher is exactly right; past it the target
+        is conditioned on a context the verifier is never in. So keep full
+        weight up to the first disagreement and fall to
+        ``train.teacher_chain_tail_weight`` after it. Costs nothing: the
+        comparison uses logits that were already computed.
+
+        Setting the tail to 1.0 restores the previous behaviour; 0.0 is a hard
+        mask. A middle value trades bias for keeping the deep positions alive,
+        which matters because they would otherwise receive gradient on only a
+        few percent of blocks and could never improve ahead of the shallow ones.
+
+        **Prefix survival.** The throughput metric is a conjunction over the
+        prefix, ``E[len] = sum_j prod_{i<=j} a_i``, so the marginal value of
+        position ``j`` is the probability of reaching it. Weighting by the
+        measured survival curve moves gradient onto the early positions where
+        the tokens actually are; uniform weighting spends most of it past
+        position 4, which is reached on a few percent of blocks.
+        """
+        count = int(self.cfg.train.get("anchors_per_sequence", 1))
+        drafted = teacher_logits.size(1) // count
+        weights = None
+
+        tail = self.cfg.train.get("teacher_chain_tail_weight", 1.0)
+        if tail is not None and float(tail) != 1.0:
+            matched = (
+                teacher_logits.argmax(-1) == x1.argmax(-1)
+            ).view(-1, count, drafted)
+            keep = torch.ones_like(matched, dtype=teacher_logits.dtype)
+            if drafted > 1:
+                # position i survives iff every earlier position agreed
+                keep[:, :, 1:] = matched[:, :, :-1].to(keep.dtype).cumprod(-1)
+            weights = keep.flatten(1, 2) * (1.0 - float(tail)) + float(tail)
+
+        survival = self.cfg.train.get("position_weights", None)
+        if survival:
+            w = torch.as_tensor(
+                list(survival)[:drafted], device=teacher_logits.device,
+                dtype=teacher_logits.dtype,
+            )
+            if w.numel() < drafted:
+                w = torch.cat([w, w.new_full((drafted - w.numel(),), float(w[-1]))])
+            w = (w / w.mean()).repeat(count)[None]
+            weights = w if weights is None else weights * w
+        if weights is None:
+            return None
+        return weights * live.to(weights.dtype)
+
     def _rollout_schedule(self, jumps, device):
         """Jump times ``0 = t_0 < ... < t_n = 1`` for one rollout.
 
@@ -482,7 +540,10 @@ class FlowDraftBlockWise(FlowDraft):
         #              any multi-jump schedule.
         #   KL target: sg(p_AR) — the frozen AR path's distribution for the
         #              same block positions, already aligned in _shared_step.
-        verify_kl = self._teacher_loss(teacher_logits, verify_logits, live)
+        pos_w = self._position_weights(teacher_logits, x1, live)
+        verify_kl = self._teacher_loss(
+            teacher_logits, verify_logits, live, position_weight=pos_w
+        )
 
         # Landing point of the jump — the EC-target input. Detached: the
         # jump's single teacher is ECLD.
@@ -517,6 +578,7 @@ class FlowDraftBlockWise(FlowDraft):
             self._teacher_loss(
                 teacher_logits, diag_logits, live,
                 sample_weight=self._ar_kl_sample_weight(t),
+                position_weight=pos_w,
             )
             if ar_kl_weight
             else diag_logits.sum() * 0.0

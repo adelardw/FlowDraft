@@ -180,7 +180,8 @@ class FlowDraft(L.LightningModule):
 
     # --- the loss is yours ----------------------------------------------------
 
-    def _teacher_loss(self, teacher_logits, logits, live, sample_weight=None):
+    def _teacher_loss(self, teacher_logits, logits, live, sample_weight=None,
+                      position_weight=None):
         """Match the drafter to the frozen AR path, in one of two senses.
 
         ``train.teacher_target``:
@@ -234,8 +235,18 @@ class FlowDraft(L.LightningModule):
                 return logits.sum() * 0.0
             if sample_weight is not None:
                 per_token = per_token * sample_weight[:, None].to(per_token.dtype)
+            if position_weight is not None:
+                per_token = per_token * position_weight.to(per_token.dtype)
+            if sample_weight is not None or position_weight is not None:
                 return (per_token * live).sum() / live.sum()
             return per_token[live].mean()
+        if position_weight is not None:
+            log_p = F.log_softmax(teacher_logits.float(), -1)
+            log_q = F.log_softmax(logits.float(), -1)
+            kl = (log_p.exp() * (log_p - log_q)).sum(-1) * position_weight.to(log_q.dtype)
+            if sample_weight is not None:
+                kl = kl * sample_weight[:, None].to(kl.dtype)
+            return (kl * live).sum() / live.sum().clamp_min(1)
         return self._masked_kl(
             F.log_softmax(teacher_logits.float(), -1),
             F.log_softmax(logits.float(), -1),
