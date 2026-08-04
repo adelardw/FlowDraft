@@ -222,7 +222,19 @@ class FlowDraftBlockWise(FlowDraft):
             if drafted > 1:
                 # position i survives iff every earlier position agreed
                 keep[:, :, 1:] = matched[:, :, :-1].to(keep.dtype).cumprod(-1)
-            weights = keep.flatten(1, 2) * (1.0 - float(tail)) + float(tail)
+            gate = keep * (1.0 - float(tail)) + float(tail)
+            # Normalise the gate PER POSITION, not globally. It selects which
+            # samples carry a valid target; it is not a statement about how
+            # much position j is worth. Left un-normalised it decays
+            # geometrically at roughly the divergence hazard, and the survival
+            # weights decay at nearly the same rate from an unrelated cause, so
+            # the product applies one schedule twice — under-weighting position
+            # 4 by about six times and position 7 by seventeen against the exact
+            # metric gradient, which are the positions a second jump has to earn
+            # its cost on. Per-position normalisation makes it a mean-one
+            # validity gate and leaves the across-position schedule to u_j alone.
+            gate = gate / gate.mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+            weights = gate.flatten(1, 2)
 
         survival = self.cfg.train.get("position_weights", None)
         if survival:
@@ -324,6 +336,7 @@ class FlowDraftBlockWise(FlowDraft):
         draft_logits = self._df_forward(
             x_s, anchor, ctx_mask, cache, s, t, df_kwargs
         )
+        count = int(self.cfg.train.get("anchors_per_sequence", 1))
         # The decode loop enters every cycle at the pure prior, s = 0, so that
         # is the only state this term should be evaluated at.
         verify_input = self.sample_prior(x1, block_mask)
@@ -350,18 +363,42 @@ class FlowDraftBlockWise(FlowDraft):
         # which sweeps "roughly right" through "exact".
         warm_weight = float(self.cfg.train.get("warm_start_weight", 0.0))
         if warm_weight:
-            # The entry state is the teacher's OWN distribution read one
-            # position out of place — informed, on the right manifold, and
-            # wrong in the way a stale prediction is wrong. It must not be
-            # mixed with x1: a convex mix with the clean endpoint puts the
-            # answer at the argmax for any weight above a half, which recreates
-            # the leak the prior change was made to remove.
-            x_w = F.softmax(
-                teacher_logits.roll(1, dims=1).float(), -1
+            # The entry state is the teacher's OWN distribution read out of
+            # place — informed, on the simplex, and wrong in the way a stale
+            # prediction is wrong. Never mixed with x1: a convex mix with the
+            # clean endpoint puts the answer at the argmax for any weight above
+            # a half, which is the leak the prior change removed.
+            #
+            # Three properties are sampled rather than fixed, because at decode
+            # they vary and a point estimate trains a point.
+            #   shift  — the decode seed is displaced by the accepted length
+            #            plus one, not by one, so draw it over the block.
+            #   cut    — the decode seed is right in front and wrong behind: the
+            #            leading slots were conditioned on tokens that survived
+            #            verification, the trailing ones on tokens that did not.
+            #            Positions past the cut get a staler row so the map
+            #            learns to distrust its input rather than propagate it.
+            #   s_w    — a label only, since the state is off the interpolation
+            #            path. Tied to the cut so a higher label really does
+            #            mean a cleaner state, giving the schedule a family to
+            #            interpolate instead of one point. Note 0.5 is the worst
+            #            fixed choice available: it is the discunif argmax
+            #            crossing, so it labels the state "maximally ambiguous".
+            lo = float(self.cfg.train.get("warm_start_s_min", 0.5))
+            hi = float(self.cfg.train.get("warm_start_s_max", 0.95))
+            s_w = lo + (hi - lo) * torch.rand_like(s)
+            width = x1.size(1) // max(count, 1)
+            shift = int(torch.randint(1, max(2, width - 1), (1,)))
+            fresh = F.softmax(teacher_logits.roll(shift, dims=1).float(), -1)
+            stale = F.softmax(teacher_logits.roll(shift + 1, dims=1).float(), -1)
+            # cut grows with s_w: at the top of the range almost every slot is
+            # the fresher row, at the bottom almost none is.
+            pos = torch.arange(width, device=x1.device)[None, None, :]
+            keep_fresh = pos < (s_w[:, None, None] * width)
+            x_w = torch.where(
+                keep_fresh.expand(-1, count, -1).flatten(1, 2)[..., None],
+                fresh, stale,
             ).to(x1.dtype) * block_mask[..., None].to(x1.dtype)
-            # s is a label, not a position on the interpolation path — this
-            # state is off it. Train and decode only have to agree on the value.
-            s_w = torch.full_like(s, float(self.cfg.train.get("warm_start_s", 0.5)))
             warm_logits = self._df_forward(
                 x_w, anchor, ctx_mask, cache, s_w, ones, df_kwargs
             )

@@ -713,7 +713,8 @@ class FlowDraft(L.LightningModule):
         bonus = self._target_probs(verify_logits[:, -1], temperature, top_k, top_p)
         return draft_ids.size(1), torch.multinomial(bonus[0], 1)
 
-    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
+    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None,
+                     seed_logits=None, accepted: int = 0):
         """Dirichlet noise -> jump schedule via :meth:`predict`.
 
         The final simplex point IS the proposal distribution ``q`` (a convex
@@ -746,6 +747,31 @@ class FlowDraft(L.LightningModule):
         x = self.sample_prior(
             torch.zeros(1, drafted, vocab, device=device)
         )
+        # Warm start. The verify pass of the previous cycle already produced AR
+        # logits at every position it scored, so the next block can enter from
+        # them instead of from noise — a second evaluation of the map per block
+        # at no extra forward, which is the only way a multi-jump schedule pays
+        # under a cost of one weight load per jump.
+        #
+        # Alignment: the cache was committed through absolute P and the verify
+        # input was [pending(P), draft_1(P+1) .. draft_{K-1}(P+K-1)], so
+        # logits[:, i] is the AR distribution of absolute position P+i+1. After
+        # accepting n drafts the new anchor sits at P+n+1 and the new block
+        # covers P+n+2 .. P+n+K, so slot d takes logits[:, n+d] while n+d stays
+        # inside the row. Slot 1 is stale too: it was conditioned on the draft
+        # token verification replaced. That staleness is the point.
+        entry_s = 0.0
+        if seed_logits is not None:
+            usable = min(drafted, seed_logits.size(1) - accepted - 1)
+            if usable > 0:
+                seeded = F.softmax(
+                    seed_logits[:, accepted + 1 : accepted + 1 + usable].float(), -1
+                ).to(x.dtype)
+                x = torch.cat([seeded, x[:, usable:]], dim=1)
+                entry_s = float(self.cfg.train.get("warm_start_s_min", 0.5))
+        times = list(times)
+        if entry_s > 0.0 and len(times) == 2:
+            times = [entry_s, 1.0]
         if bool(decode_cfg.get("fixed_prior", False)):
             # Greedy verification accepts on an argmax match, a criterion with
             # no randomness in it, so redrawing the prior each cycle only adds
@@ -845,6 +871,8 @@ class FlowDraft(L.LightningModule):
         # anchor, and the next verify forward commits its K/V and yields the
         # first fresh position's target in one go — the cycle is jumps+1.
         pending = None
+        # Carried between cycles for the warm start; None on the first cycle.
+        warm_seed, warm_accepted = None, 0
 
         # Materialise the first token directly from the already-computed
         # prefill distribution. It becomes the clean, uncommitted anchor for
@@ -874,6 +902,7 @@ class FlowDraft(L.LightningModule):
             draft_ids, q = self._draft_block(
                 cache, block_size, times,
                 sample=temperature > 0 and not coupled, anchor_token=pending,
+                seed_logits=warm_seed, accepted=warm_accepted,
             )
             n_forwards += len(times) - 1
             if temperature > 0 and coupled:
@@ -929,6 +958,8 @@ class FlowDraft(L.LightningModule):
             # rejected draft K/V never pollute the cache
             cache.crop(committed + (0 if pending is None else 1) + n_accepted)
             acceptance.append(n_accepted)
+            if bool(self.cfg.get("decode", {}).get("warm_start", False)):
+                warm_seed, warm_accepted = verify_logits, n_accepted
             new = draft_ids[0, :n_accepted].tolist() + [int(next_token)]
             emitted.extend(new)
             pending = next_token

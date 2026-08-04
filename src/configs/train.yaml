@@ -110,9 +110,11 @@ train:
                             # verify pass already yields AR logits at every drafted
                             # position, so the next cycle can enter from them at zero extra
                             # forward, and this term trains on that state.
-  warm_start_s: 0.5         # the time LABEL attached to that state. It is off the
-                            # interpolation path, so the value carries no geometric
-                            # meaning; training and decoding only have to agree on it.
+  warm_start_s_min: 0.5     # the time LABEL attached to that state, drawn over a range and
+  warm_start_s_max: 0.95    # tied to how clean the state is, so the label means something
+                            # the schedule can interpolate. The state is off the
+                            # interpolation path, so the values carry no geometric meaning
+                            # beyond that ordering; training and decoding must agree.
   verify_kl_weight: 0.0     # KL(p_AR || pi_{0,1}(x_0)) on the pure prior -- the exact
                             # state the decode loop enters every cycle at; the packed
                             # block-wise preset enables it
