@@ -116,6 +116,33 @@ class FlowDraft(L.LightningModule):
         s = t * torch.rand(batch, device=device)
         return s, t
 
+    def sample_times_log(self, batch, device):
+        """``log t`` uniform on ``[log t_min, 0]``, then ``log s`` uniform on
+        ``[log s_min, log t]``.
+
+        A linear scale spends nearly all of its budget where the input already
+        contains the answer. With ``x0 ~ Dirichlet(1)`` over ``V ≈ 1.5e5`` the
+        prior's largest component is about ``ln(V)/V ≈ 9e-5``, so the clean
+        token is the argmax of ``x_s`` once ``s > 1e-4``, and linear readout
+        from the input embedding succeeds once ``s > V^{-1/2} ≈ 2.6e-3``. Under
+        the ``paper`` schedule only 5.7% of pairs fall below ``s = 1e-2`` and
+        2% below ``3e-3``, so the endpoint and consistency terms spend ~98% of
+        their samples on a copy task — which is what their near-zero converged
+        values measure.
+
+        Log spacing moves roughly half the mass under ``1e-2``. Both ends are
+        drawn this way because the diagonal reads ``x_t`` while consistency
+        reads ``x_s``, so leaving ``t`` linear would leave the diagonal leaked.
+        """
+        t_min = float(self.cfg.train.get("time_min", 1e-5))
+        log_t_min = torch.log(torch.tensor(t_min, device=device))
+        t = (log_t_min * torch.rand(batch, device=device)).exp()
+        # s log-uniform inside (s_min, t] keeps the pair ordered without
+        # collapsing s onto t when t itself is already tiny.
+        log_t = t.clamp_min(t_min).log()
+        s = (log_t_min + (log_t - log_t_min) * torch.rand(batch, device=device)).exp()
+        return s.clamp(max=1.0 - 1e-4), t.clamp(max=1.0)
+
     def sample_trajectory(self, simplex, attention_mask=None):
         """Draw one training point of the linear simplex path per sample.
 
@@ -687,8 +714,15 @@ class FlowDraft(L.LightningModule):
             dtype=torch.long,
             device=x.device,
         )
+        # Diagnostic: re-enter every jump from the ORIGINAL prior instead of the
+        # transported state. If acceptance is unchanged, the map is not reading
+        # its input and the two-time family is doing no work — the drafter has
+        # collapsed onto a context-only predictor, which is what a
+        # state-independent teacher target is minimised by.
+        frozen = bool(decode_cfg.get("frozen_state", False))
+        entry = x
         for s_i, t_i in zip(times[:-1], times[1:]):
-            x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
+            x = self.predict(entry if frozen else x, mask, s_i, t_i, past_key_values=cache)
             if anchor is not None:
                 x = torch.cat([anchor, x[:, 1:]], dim=1)  # keep the clean position clean
         fresh = x[:, 1:] if anchor is not None else x

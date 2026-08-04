@@ -43,7 +43,13 @@ train:
   warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1])
+  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
+                            #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
+                            # The clean token is the argmax of x_s once s > 1e-4 and is
+                            # linearly readable from its embedding once s > 2.6e-3, so on a
+                            # linear scale ~98% of samples train a copy task. Coverage below
+                            # s=1e-2: paper 5.7%, triangle 2.0%, sequential 1.0%, log ~50%.
+  time_min: 1.0e-5          # log mode only: lower end of the range for both s and t
   lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
   endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
   ar_kl_weight: 0.0         # teacher alignment ON THE DIAGONAL; with endpoint_weight the
@@ -79,7 +85,8 @@ train:
                             # readable from its embedding once s > V^-0.5 ~ 3e-3: above that
                             # the task is copying, and no such state occurs at decode time.
                             # Linear sampling puts 0.8% of the draws below s=1e-2; log puts 50%.
-  verify_s_min: 1.0e-4      # lower end of the log range
+  verify_s_min: 1.0e-6      # lower end of the log range; BELOW the 1e-4 argmax
+                            # threshold, otherwise every sample sits on the leak boundary
   # --- rollout: supervise the drafter on its OWN multi-jump path -------------
   # Every other term lives on the interpolation path x_s = (1-s) x0 + s x1,
   # which is built from the answer; decoding starts from the prior and feeds

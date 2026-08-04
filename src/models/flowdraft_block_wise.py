@@ -300,8 +300,10 @@ class FlowDraftBlockWise(FlowDraft):
         transported state, which is not an interpolation with the answer.
 
         Drawing ``log s`` uniformly on ``[log s_min, 0]`` puts about half the
-        samples below ``1e-2``, i.e. in the range where the input is genuinely
-        uninformative and the term trains something. Stratification is applied
+        samples below ``1e-2``. ``s_min`` sits BELOW the argmax threshold on
+        purpose: stopping at ``1e-4`` would leave every single sample in the
+        regime where the clean token is the argmax of the input, which is the
+        boundary of the leak rather than the far side of it. Stratification is applied
         in log space for the same reason as before: at a batch of one or two,
         i.i.d. draws leave coverage to chance.
         """
@@ -312,7 +314,7 @@ class FlowDraftBlockWise(FlowDraft):
             u = ((bins + u) / batch)[torch.randperm(batch, device=like.device)]
         if not bool(self.cfg.train.get("verify_s_log", True)):
             return u
-        s_min = float(self.cfg.train.get("verify_s_min", 1e-4))
+        s_min = float(self.cfg.train.get("verify_s_min", 1e-6))
         log_min = torch.log(torch.tensor(s_min, device=like.device, dtype=like.dtype))
         return (log_min * (1.0 - u)).exp().clamp(0.0, 1.0 - 1e-3)
 

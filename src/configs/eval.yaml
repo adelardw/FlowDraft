@@ -36,6 +36,10 @@ decode:
   fixed_prior: false        # true: start each cycle from the uniform simplex point instead
                             # of a fresh Dirichlet draw -- greedy verification has no
                             # randomness in it, so the draw only adds variance
+  frozen_state: false       # DIAGNOSTIC: re-enter every jump from the original prior instead
+                            # of the transported state. Unchanged acceptance means the map
+                            # ignores its input and the flow-map family is doing no work.
+                            # Run at jumps=2 and 4; at jumps=1 it is a no-op by construction
   jumps: 1                  # int (equal jumps) — or a grid like [0, 0.5, 1]
   max_new_tokens: 64
   n_prompts: 64             # acceptance is noisy across prompts: 100-200 for a paper table
