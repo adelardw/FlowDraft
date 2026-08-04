@@ -222,11 +222,23 @@ class FlowDraft(L.LightningModule):
             x0 = torch.randn(
                 *shape, vocab, device=simplex.device, dtype=simplex.dtype
             ) / (vocab ** 0.5)
+        elif kind == "learned":
+            # Deterministic: the whole point is that the trunk sees the SAME
+            # "unknown" every time, the way the masked baseline's mask token
+            # does. No draw, no variance in the one input the deployed map
+            # reads. It stays on the simplex, so nothing downstream — the
+            # embedding x @ E, the transport x + gamma(pi - x) — has to change.
+            x0 = F.softmax(self.orthrus.prior_logits.float(), -1).to(
+                simplex.dtype
+            ).expand(*shape, vocab)
         elif kind == "discunif":
             idx = torch.randint(vocab, shape, device=simplex.device)
             x0 = F.one_hot(idx, vocab).to(simplex.dtype)
         else:
-            raise ValueError(f"unknown prior_type='{kind}' (dirichlet | gaussian | discunif)")
+            raise ValueError(
+                f"unknown prior_type='{kind}' "
+                "(dirichlet | gaussian | discunif | learned)"
+            )
         if attention_mask is not None:
             x0 = x0 * attention_mask[..., None].to(x0.dtype)
         return x0

@@ -43,23 +43,25 @@ train:
   warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  prior_type: dirichlet     # x0 in x_s = (1-s) x0 + s x1. Decides whether the input hides
-                            # the answer. At V=151936 the clean token becomes the argmax of
-                            # x_s at s* = 7.4e-5 (dirichlet), 0.500 (discunif), 0.815
-                            # (gaussian) -- so the share of t~U[0,1] with a genuinely
-                            # ambiguous input is 0.007%, 50% and 81%. The reference CFM text
-                            # configs use gaussian; dirichlet is this project's substitution
-                            # and is why the endpoint/EC/TD terms converge to near zero.
-                            # gaussian leaves the simplex: the interpolant is then a point in
-                            # R^V, which x @ E and x + gamma(pi - x) both accept.
-                            # SCALE matters here because the input projection is the FROZEN
-                            # embedding matrix, not a trained Linear as in the reference.
-                            # Measured at V=151936 against a token embedding's norm of 1.0,
-                            # ||x0 @ E|| is 0.004 for dirichlet -- 270x too small, so the trunk
-                            # sees essentially the mean embedding, which pushes the map toward
-                            # behaving as a constant -- 1.00 for discunif, and 392 for an
-                            # unscaled Gaussian. gaussian is therefore emitted at 1/sqrt(V).
-                            # discunif needs no scaling and is the safer choice here.
+  prior_type: dirichlet     # x0 in x_s = (1-s) x0 + s x1. Two roles that pull apart:
+                            #   at s = 0 -- the ONLY state the deployed map reads at one
+                            #     jump -- the minimiser is constant in x0, since the target
+                            #     depends on the prefix alone. So the best object there is
+                            #     not a draw from any family but one consistent learned
+                            #     vector the frozen trunk can read as "unknown", which is
+                            #     what the masked baseline trains. Use `learned`.
+                            #   at s > 0 -- where endpoint/EC/TD live -- what matters is
+                            #     whether the input hides the answer. At V=151936 the clean
+                            #     token is the argmax of x_s once s exceeds 7.4e-5 under
+                            #     `dirichlet` (0.007% of samples ambiguous), 0.500 under
+                            #     `discunif` (50%), 0.815 under `gaussian` (81%). The
+                            #     reference implementation uses gaussian or discunif;
+                            #     dirichlet is this project's substitution.
+                            # dirichlet | discunif | gaussian (emitted at 1/sqrt(V), since
+                            # the input projection here is frozen and cannot absorb scale)
+                            # | learned (deterministic, trained, on the simplex, initialised
+                            # uniform so its embedding starts at the vocabulary mean --
+                            # exactly where the masked baseline's mask token starts)
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
                             #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
                             # The clean token is the argmax of x_s once s > 1e-4 and is

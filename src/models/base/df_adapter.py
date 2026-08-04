@@ -252,6 +252,17 @@ class FlowDraftAttentionAdapter(nn.Module):
         self.mask_embedding = nn.Parameter(
             embed_weight.detach().float().mean(0, keepdim=True)
         )
+        # A learned point ON the simplex, used as the s = 0 state when
+        # train.prior_type is "learned". At s = 0 the deployed map's minimiser
+        # is constant in its input — the target depends on the prefix alone —
+        # so the best thing to put there is not a random draw from any family
+        # but a single consistent vector the frozen trunk can learn to read as
+        # "unknown". That is what the masked baseline has and trains; feeding
+        # x_s @ E instead substitutes an UNTRAINED approximation of it, since a
+        # near-uniform simplex point embeds to the vocabulary mean plus noise.
+        # Initialised uniform, so its embedding starts at exactly that mean and
+        # training begins from the same operating point.
+        self.prior_logits = nn.Parameter(torch.zeros(embed_weight.size(0)))
         self.time_embed = FlowTimeEmbedding(
             self.model.config.hidden_size,
             parameterisation=time_parameterisation,
@@ -321,6 +332,8 @@ class FlowDraftAttentionAdapter(nn.Module):
     def df_parameters(self):
         """Trainable parameters of the DF path (feed these to the optimizer)."""
         yield from (parameter for parameter in self.df_weights if parameter.requires_grad)
+        if self.prior_logits.requires_grad:
+            yield self.prior_logits
         if self.mask_embedding.requires_grad:
             yield self.mask_embedding
         yield from (parameter for parameter in self.time_embed.parameters() if parameter.requires_grad)
