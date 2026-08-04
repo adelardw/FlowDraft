@@ -59,14 +59,6 @@ train:
                             #     dirichlet is this project's substitution.
                             # dirichlet | discunif | gaussian (emitted at 1/sqrt(V), since
                             # the input projection here is frozen and cannot absorb scale)
-                            # | learned (deterministic, trained, on the simplex, initialised
-                            # uniform so its embedding starts at the vocabulary mean --
-                            # exactly where the masked baseline's mask token starts)
-  prior_noise: 0.5          # learned prior only: how much of a real draw to mix into the
-                            # learned base point. Zero makes the interpolant (1-s)m + s x1
-                            # noiselessly invertible at every s, which fixes the s=0 state
-                            # and destroys the ambiguity the endpoint and consistency terms
-                            # exist to resolve.
   terminal_time_fraction: 0.0  # share of the batch forced onto t = 1. pi_{s,1} is the only
                             # map the decode loop executes, and under every continuous
                             # sampler it has probability zero -- 'paper' puts 1% of draws
@@ -80,13 +72,7 @@ train:
   td_min_step: 0.01         # minimum finite-difference probe for the drift term. Below this
                             # the difference of two bf16 softmaxes divided by the step and
                             # squared amplifies quantisation noise by about 1e6.
-  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
-                            #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
-                            # The clean token is the argmax of x_s once s > 1e-4 and is
-                            # linearly readable from its embedding once s > 2.6e-3, so on a
-                            # linear scale ~98% of samples train a copy task. Coverage below
-                            # s=1e-2: paper 5.7%, triangle 2.0%, sequential 1.0%, log ~50%.
-  time_min: 1.0e-5          # log mode only: lower end of the range for both s and t
+  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle | sequential
   lambda: 1.0               # weight of the ECLD part:
                             #   loss = verify_kl_weight*verify_kl
                             #        + endpoint_weight*endpoint
@@ -151,20 +137,6 @@ train:
                             # n=2 should converge to n=1's draft.
   rollout_stratified: true  # interior jump times one per equal bin, not a fixed grid
 
-  warm_start_weight: 0.0    # the only term that teaches the map to READ its input.
-                            # At t=1 the transport factor (t-s)/(1-s) is 1 for every s, so
-                            # the final jump returns pi_{s,1}(x_s) and the incoming state
-                            # adds nothing -- all of a multi-jump schedule's value is in
-                            # d pi_{s,1} / d x_s, and nothing else in the objective rewards
-                            # that derivative. Simulates the decode-time warm start: the
-                            # verify pass already yields AR logits at every drafted
-                            # position, so the next cycle can enter from them at zero extra
-                            # forward, and this term trains on that state.
-  warm_start_s_min: 0.5     # the time LABEL attached to that state, drawn over a range and
-  warm_start_s_max: 0.95    # tied to how clean the state is, so the label means something
-                            # the schedule can interpolate. The state is off the
-                            # interpolation path, so the values carry no geometric meaning
-                            # beyond that ordering; training and decoding must agree.
   verify_kl_weight: 0.0     # KL(p_AR || pi_{0,1}(x_0)) on the pure prior -- the exact
                             # state the decode loop enters every cycle at; the packed
                             # block-wise preset enables it

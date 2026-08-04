@@ -49,12 +49,6 @@ class FlowDraft(L.LightningModule):
         # learned mask token. Leaving this parameter trainable makes it unused
         # in the backward graph and breaks DDP with find_unused_parameters=False.
         self.orthrus.mask_embedding.requires_grad_(False)
-        # The learned prior trains only when it is the one in use; leaving it
-        # on otherwise gives DDP an unused parameter and forces every existing
-        # checkpoint to carry a tensor it does not have.
-        self.orthrus.prior_logits.requires_grad_(
-            str(cfg.train.get("prior_type", "dirichlet")) == "learned"
-        )
         # Checkpoints hold only the DF head (see on_save_checkpoint), so the
         # frozen backbone keys are legitimately absent on load.
         self.strict_loading = False
@@ -120,33 +114,6 @@ class FlowDraft(L.LightningModule):
         t = torch.rand(batch, device=device)
         s = t * torch.rand(batch, device=device)
         return s, t
-
-    def sample_times_log(self, batch, device):
-        """``log t`` uniform on ``[log t_min, 0]``, then ``log s`` uniform on
-        ``[log s_min, log t]``.
-
-        A linear scale spends nearly all of its budget where the input already
-        contains the answer. With ``x0 ~ Dirichlet(1)`` over ``V ≈ 1.5e5`` the
-        prior's largest component is about ``ln(V)/V ≈ 9e-5``, so the clean
-        token is the argmax of ``x_s`` once ``s > 1e-4``, and linear readout
-        from the input embedding succeeds once ``s > V^{-1/2} ≈ 2.6e-3``. Under
-        the ``paper`` schedule only 5.7% of pairs fall below ``s = 1e-2`` and
-        2% below ``3e-3``, so the endpoint and consistency terms spend ~98% of
-        their samples on a copy task — which is what their near-zero converged
-        values measure.
-
-        Log spacing moves roughly half the mass under ``1e-2``. Both ends are
-        drawn this way because the diagonal reads ``x_t`` while consistency
-        reads ``x_s``, so leaving ``t`` linear would leave the diagonal leaked.
-        """
-        t_min = float(self.cfg.train.get("time_min", 1e-5))
-        log_t_min = torch.log(torch.tensor(t_min, device=device))
-        t = (log_t_min * torch.rand(batch, device=device)).exp()
-        # s log-uniform inside (s_min, t] keeps the pair ordered without
-        # collapsing s onto t when t itself is already tiny.
-        log_t = t.clamp_min(t_min).log()
-        s = (log_t_min + (log_t - log_t_min) * torch.rand(batch, device=device)).exp()
-        return s.clamp(max=1.0 - 1e-4), t.clamp(max=1.0)
 
     def sample_trajectory(self, simplex, attention_mask=None):
         """Draw one training point of the linear simplex path per sample.
@@ -240,35 +207,13 @@ class FlowDraft(L.LightningModule):
             x0 = torch.randn(
                 *shape, vocab, device=simplex.device, dtype=simplex.dtype
             ) / (vocab ** 0.5)
-        elif kind == "learned":
-            # Deterministic: the whole point is that the trunk sees the SAME
-            # "unknown" every time, the way the masked baseline's mask token
-            # does. No draw, no variance in the one input the deployed map
-            # reads. It stays on the simplex, so nothing downstream — the
-            # embedding x @ E, the transport x + gamma(pi - x) — has to change.
-            base = F.softmax(self.orthrus.prior_logits.float(), -1).to(simplex.dtype)
-            noise = float(self.cfg.train.get("prior_noise", 0.5))
-            if noise <= 0.0:
-                x0 = base.expand(*shape, vocab)
-            else:
-                # A purely deterministic base point would fix s = 0 and destroy
-                # s > 0: with a linear embedding and a convex interpolant, a
-                # FIXED base makes (1-s)m + s x1 noiselessly invertible for
-                # every s, so the endpoint and consistency terms would face no
-                # ambiguity at all. Mixing in a genuine draw keeps the learned,
-                # consistent baseline the frozen trunk can read as "unknown"
-                # while leaving the interpolant ambiguous where it has to be.
-                draw = torch.distributions.Dirichlet(
-                    torch.ones(vocab, device=simplex.device)
-                ).sample(shape).to(simplex.dtype)
-                x0 = (1.0 - noise) * base + noise * draw
         elif kind == "discunif":
             idx = torch.randint(vocab, shape, device=simplex.device)
             x0 = F.one_hot(idx, vocab).to(simplex.dtype)
         else:
             raise ValueError(
                 f"unknown prior_type='{kind}' "
-                "(dirichlet | gaussian | discunif | learned)"
+                "(dirichlet | gaussian | discunif)"
             )
         if attention_mask is not None:
             x0 = x0 * attention_mask[..., None].to(x0.dtype)
@@ -762,8 +707,7 @@ class FlowDraft(L.LightningModule):
         bonus = self._target_probs(verify_logits[:, -1], temperature, top_k, top_p)
         return draft_ids.size(1), torch.multinomial(bonus[0], 1)
 
-    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None,
-                     seed_logits=None, accepted: int = 0):
+    def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Dirichlet noise -> jump schedule via :meth:`predict`.
 
         The final simplex point IS the proposal distribution ``q`` (a convex
@@ -796,36 +740,7 @@ class FlowDraft(L.LightningModule):
         x = self.sample_prior(
             torch.zeros(1, drafted, vocab, device=device)
         )
-        # Warm start. The verify pass of the previous cycle already produced AR
-        # logits at every position it scored, so the next block can enter from
-        # them instead of from noise — a second evaluation of the map per block
-        # at no extra forward, which is the only way a multi-jump schedule pays
-        # under a cost of one weight load per jump.
-        #
-        # Alignment: the cache was committed through absolute P and the verify
-        # input was [pending(P), draft_1(P+1) .. draft_{K-1}(P+K-1)], so
-        # logits[:, i] is the AR distribution of absolute position P+i+1. After
-        # accepting n drafts the new anchor sits at P+n+1 and the new block
-        # covers P+n+2 .. P+n+K, so slot d takes logits[:, n+d] while n+d stays
-        # inside the row. Slot 1 is stale too: it was conditioned on the draft
-        # token verification replaced. That staleness is the point.
-        entry_s = 0.0
-        if seed_logits is not None:
-            # seed_logits[:, j] is the AR distribution of absolute P+j+2, and
-            # slot d covers P+n+1+d, so slot d needs column n+d-1 — starting at
-            # n, not n+1. Off by one here hands every position the NEXT token's
-            # distribution, which is the worst possible input for a metric that
-            # is a conjunction over the prefix.
-            usable = min(drafted, seed_logits.size(1) - accepted)
-            if usable > 0:
-                seeded = F.softmax(
-                    seed_logits[:, accepted : accepted + usable].float(), -1
-                ).to(x.dtype)
-                x = torch.cat([seeded, x[:, usable:]], dim=1)
-                entry_s = float(self.cfg.train.get("warm_start_s_min", 0.5))
         times = list(times)
-        if entry_s > 0.0 and len(times) == 2:
-            times = [entry_s, 1.0]
         if bool(decode_cfg.get("fixed_prior", False)):
             # Greedy verification accepts on an argmax match, a criterion with
             # no randomness in it, so redrawing the prior each cycle only adds
@@ -925,8 +840,6 @@ class FlowDraft(L.LightningModule):
         # anchor, and the next verify forward commits its K/V and yields the
         # first fresh position's target in one go — the cycle is jumps+1.
         pending = None
-        # Carried between cycles for the warm start; None on the first cycle.
-        warm_seed, warm_accepted = None, 0
 
         # Materialise the first token directly from the already-computed
         # prefill distribution. It becomes the clean, uncommitted anchor for
@@ -956,7 +869,6 @@ class FlowDraft(L.LightningModule):
             draft_ids, q = self._draft_block(
                 cache, block_size, times,
                 sample=temperature > 0 and not coupled, anchor_token=pending,
-                seed_logits=warm_seed, accepted=warm_accepted,
             )
             n_forwards += len(times) - 1
             if temperature > 0 and coupled:
@@ -1012,8 +924,6 @@ class FlowDraft(L.LightningModule):
             # rejected draft K/V never pollute the cache
             cache.crop(committed + (0 if pending is None else 1) + n_accepted)
             acceptance.append(n_accepted)
-            if bool(self.cfg.get("decode", {}).get("warm_start", False)):
-                warm_seed, warm_accepted = verify_logits, n_accepted
             new = draft_ids[0, :n_accepted].tolist() + [int(next_token)]
             emitted.extend(new)
             pending = next_token

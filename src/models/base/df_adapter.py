@@ -262,16 +262,6 @@ class FlowDraftAttentionAdapter(nn.Module):
         # near-uniform simplex point embeds to the vocabulary mean plus noise.
         # Initialised uniform, so its embedding starts at exactly that mean and
         # training begins from the same operating point.
-        # Frozen by default. An unused trainable parameter breaks DDP under
-        # find_unused_parameters=False — the same reason mask_embedding is
-        # frozen in the FlowDraft policy — and it would also enter the set that
-        # checkpoint validation requires, so adding it unconditionally would
-        # make every checkpoint written before it unloadable. The policy
-        # unfreezes it only when train.prior_type selects it.
-        self.prior_logits = nn.Parameter(
-            torch.zeros(embed_weight.size(0), device=embed_weight.device)
-        )
-        self.prior_logits.requires_grad_(False)
         self.time_embed = FlowTimeEmbedding(
             self.model.config.hidden_size,
             parameterisation=time_parameterisation,
@@ -343,12 +333,6 @@ class FlowDraftAttentionAdapter(nn.Module):
         yield from (parameter for parameter in self.df_weights if parameter.requires_grad)
         if self.mask_embedding.requires_grad:
             yield self.mask_embedding
-        # Yielded LAST on purpose: the legacy-checkpoint migration in the
-        # FlowDraft policy locates mask_embedding by its index in this
-        # generator, so anything inserted before it silently pops the wrong
-        # optimizer slot.
-        if self.prior_logits.requires_grad:
-            yield self.prior_logits
         yield from (parameter for parameter in self.time_embed.parameters() if parameter.requires_grad)
 
     def _df_inputs_embeds(self, input_ids):

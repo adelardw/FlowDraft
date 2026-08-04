@@ -474,63 +474,11 @@ class FlowDraftBlockWise(FlowDraft):
         # seeded with them at no extra forward. Those are a good-but-stale guess
         # — conditioned partly on tokens that were rejected. This term simulates
         # that state: mix the clean endpoint with the teacher's own prediction
-        # shifted one position, at a level drawn from [warm_start_s_min, 1),
         # which sweeps "roughly right" through "exact".
-        warm_weight = float(self.cfg.train.get("warm_start_weight", 0.0))
-        if warm_weight:
-            # The entry state is the teacher's OWN distribution read out of
-            # place — informed, on the simplex, and wrong in the way a stale
-            # prediction is wrong. Never mixed with x1: a convex mix with the
-            # clean endpoint puts the answer at the argmax for any weight above
-            # a half, which is the leak the prior change removed.
-            #
-            # Three properties are sampled rather than fixed, because at decode
-            # they vary and a point estimate trains a point.
-            #   shift  — the decode seed is displaced by the accepted length
-            #            plus one, not by one, so draw it over the block.
-            #   cut    — the decode seed is right in front and wrong behind: the
-            #            leading slots were conditioned on tokens that survived
-            #            verification, the trailing ones on tokens that did not.
-            #            Positions past the cut get a staler row so the map
-            #            learns to distrust its input rather than propagate it.
-            #   s_w    — a label only, since the state is off the interpolation
-            #            path. Tied to the cut so a higher label really does
-            #            mean a cleaner state, giving the schedule a family to
-            #            interpolate instead of one point. Note 0.5 is the worst
-            #            fixed choice available: it is the discunif argmax
-            #            crossing, so it labels the state "maximally ambiguous".
-            lo = float(self.cfg.train.get("warm_start_s_min", 0.5))
-            hi = float(self.cfg.train.get("warm_start_s_max", 0.95))
-            s_w = lo + (hi - lo) * torch.rand_like(s)
-            width = x1.size(1) // max(count, 1)
-            shift = int(torch.randint(1, max(2, width - 1), (1,)))
-            # Roll WITHIN each block. teacher_logits is flattened over anchors,
-            # so rolling the flat axis fills the head of block b from block
-            # b-1 — an unrelated document position. At shift ~ U{1..width-1}
-            # that is 43% of slots on average, and the map's best response to
-            # an unrelated input is to ignore it, which is the opposite of what
-            # this term is for.
-            tl = teacher_logits.view(teacher_logits.size(0), count, width, -1)
-            fresh = F.softmax(tl.roll(shift, dims=2).float(), -1).flatten(1, 2)
-            stale = F.softmax(tl.roll(shift + 1, dims=2).float(), -1).flatten(1, 2)
-            # cut grows with s_w: at the top of the range almost every slot is
-            # the fresher row, at the bottom almost none is.
-            pos = torch.arange(width, device=x1.device)[None, None, :]
-            keep_fresh = pos < (s_w[:, None, None] * width)
-            x_w = torch.where(
-                keep_fresh.expand(-1, count, -1).flatten(1, 2)[..., None],
-                fresh, stale,
-            ).to(x1.dtype) * block_mask[..., None].to(x1.dtype)
-            warm_logits = self._df_forward(
-                x_w, anchor, ctx_mask, cache, s_w, ones, df_kwargs
-            )
-        else:
-            warm_logits = None
         return (
             teacher_logits,
             draft_logits,
             verify_logits,
-            warm_logits,
             x_s,
             x_t,
             x1,
@@ -548,7 +496,6 @@ class FlowDraftBlockWise(FlowDraft):
         teacher_logits,
         draft_logits,
         verify_logits,
-        warm_logits,
         x_s,
         x_t,
         x1,
@@ -586,12 +533,6 @@ class FlowDraftBlockWise(FlowDraft):
         pos_w = self._position_weights(teacher_logits, x1, live)
         verify_kl = self._teacher_loss(
             teacher_logits, verify_logits, live, position_weight=pos_w
-        )
-        warm_weight = float(self.cfg.train.get("warm_start_weight", 0.0))
-        warm_kl = (
-            self._teacher_loss(teacher_logits, warm_logits, live, position_weight=pos_w)
-            if warm_logits is not None
-            else draft_logits.sum() * 0.0
         )
 
         # Landing point of the jump — the EC-target input. Detached: the
@@ -659,7 +600,6 @@ class FlowDraftBlockWise(FlowDraft):
         loss = (
             verify_kl_weight * verify_kl
             + rollout_kl_weight * rollout_kl
-            + warm_weight * warm_kl
             + endpoint_weight * endpoint
             + lam * (4.0 * ec + 2.0 * td)
         )
@@ -668,7 +608,6 @@ class FlowDraftBlockWise(FlowDraft):
                 f"{metric_prefix}/endpoint": endpoint,
                 f"{metric_prefix}/verify_kl": verify_kl,
                 f"{metric_prefix}/rollout_kl": rollout_kl,
-                f"{metric_prefix}/warm_kl": warm_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
                 f"{metric_prefix}/lambda": lam,
@@ -695,12 +634,11 @@ class FlowDraftBlockWise(FlowDraft):
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
-            teacher_logits, draft_logits, verify_logits, warm_logits, *rest = self._shared_step(batch)
+            teacher_logits, draft_logits, verify_logits, *rest = self._shared_step(batch)
             loss = self.compute_loss(
                 teacher_logits,
                 draft_logits,
                 verify_logits,
-                warm_logits,
                 *rest,
                 metric_prefix="val/loss",
                 log_on_step=False,
