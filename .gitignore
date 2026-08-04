@@ -189,3 +189,12 @@ AGENTS.md
 
 outputs
 checkpoints
+
+# Manuscript and write-ups — kept outside the codebase
+paper/
+*.pdf
+*.aux
+*.log
+*.out
+*.synctex.gz
+PROVENANCE.md
