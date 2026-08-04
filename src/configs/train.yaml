@@ -121,6 +121,20 @@ train:
                             # probability of reaching it; uniform weighting spends most of the
                             # gradient past position 4, reached on a few percent of blocks.
                             # Normalised to mean 1, so it does not change the effective LR.
+  # --- rollout: the only term whose INPUT is a transported state -------------
+  # Removed once on the argument that its target depends only on the prefix, so
+  # a map ignoring its input minimises it. True, and beside the point. Measured
+  # on a checkpoint trained with the verifier term at (0,1) alone: two and four
+  # jumps accept exactly zero tokens against 2.34 at one jump, and re-entering
+  # each jump from the original prior instead of the transported state recovers
+  # part of the draft. The defect is the input distribution, not the target.
+  rollout_kl_weight: 0.0    # 0 = off, costs nothing when off
+  rollout_max_jumps: 8      # n ~ U{1..N} per step, so no schedule is specialised for
+  rollout_grad_jumps: 4     # backprop through the last k jumps; earlier ones no_grad, so
+                            # memory follows k rather than n
+  rollout_anytime: true     # supervise every step in the window as "if you stopped here"
+  rollout_stratified: true  # interior jump times one per equal bin, not a fixed grid
+
   warm_start_weight: 0.0    # the only term that teaches the map to READ its input.
                             # At t=1 the transport factor (t-s)/(1-s) is 1 for every s, so
                             # the final jump returns pi_{s,1}(x_s) and the incoming state

@@ -52,6 +52,13 @@ train:
   respect_document_boundaries: true
   lr: 1e-4
   verify_kl_weight: 1.0
+  # The measured failure mode is a distribution mismatch: the second jump reads
+  # a state produced by the model's own transport, and nothing in the objective
+  # was evaluated on such a state. These two put it in the training
+  # distribution -- the rollout by construction, the terminal-time atom by
+  # giving pi_{s,1} gradient at the horizon decode actually executes.
+  rollout_kl_weight: 1.0
+  terminal_time_fraction: 0.25
   endpoint_weight: 0.5
   lambda: 0.25
   lambda_ramp_steps: 2000
@@ -59,6 +66,7 @@ train:
   monitor: val/tpf
   monitor_mode: max
   val_decode_prompts: 128
+  val_decode_jumps: 2
   val_decode_max_new: 128
   teacher_chain_tail_weight: 0.0
   position_weights: [1.0, 0.882, 0.533, 0.265, 0.153, 0.084, 0.052]
