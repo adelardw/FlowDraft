@@ -152,6 +152,10 @@ train:
   # val prompts each validation -> val/tpf & val/acceptance_decode curves.
   val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy
   val_decode_max_new: 32
+  val_decode_jumps: 1       # jump schedule the VALIDATION decode uses -- int, or a list like
+                            # [0, 0.85, 1]. monitor: val/tpf selects checkpoints on this, so
+                            # a run targeting multi-step must set it, or it will select and
+                            # early-stop on single-step throughput instead.
   monitor: val/tpf          # checkpoint selection: val/tpf (beat the baseline on the
   monitor_mode: max         #   target metric; NOISY early) | val/loss + min (smooth)
   early_stop_patience: 5    # stop if val/loss fails to improve N validations in a row; 0 = off

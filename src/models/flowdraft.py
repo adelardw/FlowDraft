@@ -1360,6 +1360,14 @@ class FlowDraft(L.LightningModule):
             return
         max_new = self.cfg.train.get("val_decode_max_new", 32)
         block = self.cfg.train.get("block_size", 8)
+        # The schedule validation decodes with, and therefore the schedule
+        # checkpoint selection and early stopping see. Hardcoding one jump means
+        # a run aiming at multi-step would select on the metric it is not aiming
+        # at: val/tpf is the monitor, and a model better at two jumps can lose
+        # the selection to one that is better at one.
+        val_jumps = self.cfg.train.get("val_decode_jumps", 1)
+        if not isinstance(val_jumps, int):
+            val_jumps = list(val_jumps)
         accs, tpfs = [], []
         decoded = 0
         for i in range(min(remaining, batch["input_ids"].size(0))):
@@ -1369,7 +1377,7 @@ class FlowDraft(L.LightningModule):
                 continue
             out = self.generate(
                 input_ids=batch["input_ids"][i : i + 1, :plen],
-                block_size=block, jumps=1, max_new_tokens=max_new,
+                block_size=block, jumps=val_jumps, max_new_tokens=max_new,
             )
             if out["acceptance"]:
                 accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
