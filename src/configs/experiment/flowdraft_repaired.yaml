@@ -52,12 +52,17 @@ train:
   respect_document_boundaries: true
   lr: 1e-4
   verify_kl_weight: 1.0
-  # The measured failure mode is a distribution mismatch: the second jump reads
-  # a state produced by the model's own transport, and nothing in the objective
-  # was evaluated on such a state. These two put it in the training
-  # distribution -- the rollout by construction, the terminal-time atom by
-  # giving pi_{s,1} gradient at the horizon decode actually executes.
+  # The measured failure mode is LABEL coverage, not state distribution. The map
+  # is c(ctx, s, t) trained at the single pair (0,1); at (0.5,1) it emits a
+  # different constant and acceptance goes to zero. Freezing the state changes
+  # nothing measurable, and the transported state's argmax is the first jump's
+  # own prediction, so a map reading its input would have scored ~2.3 rather
+  # than 0. These two supply the missing pairs: the rollout visits the interior
+  # nodes of the deployed schedule, the terminal atom the horizon t = 1.
   rollout_kl_weight: 1.0
+  rollout_max_jumps: 2
+  rollout_grad_jumps: 1
+  rollout_anytime: false
   terminal_time_fraction: 0.25
   endpoint_weight: 0.5
   lambda: 0.25

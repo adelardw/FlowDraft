@@ -121,18 +121,34 @@ train:
                             # probability of reaching it; uniform weighting spends most of the
                             # gradient past position 4, reached on a few percent of blocks.
                             # Normalised to mean 1, so it does not change the effective LR.
-  # --- rollout: the only term whose INPUT is a transported state -------------
-  # Removed once on the argument that its target depends only on the prefix, so
-  # a map ignoring its input minimises it. True, and beside the point. Measured
-  # on a checkpoint trained with the verifier term at (0,1) alone: two and four
-  # jumps accept exactly zero tokens against 2.34 at one jump, and re-entering
-  # each jump from the original prior instead of the transported state recovers
-  # part of the draft. The defect is the input distribution, not the target.
+  # --- rollout: visits (s,t) pairs the deployed schedule uses --------------
+  # Removed once, then restored, and the reason changed on measurement. The
+  # checkpoint trained with the verifier term at (0,1) alone accepts EXACTLY
+  # zero tokens at two and four jumps against 2.34 at one. Freezing the entry
+  # state instead of transporting it recovers nothing distinguishable from
+  # zero, so the state is not the dominant variable -- the LABEL is. At (0.5,1)
+  # the map emits a different constant, and acceptance zero says that constant
+  # is the wrong token rather than an inconsistent one.
+  # The decisive check: under Dirichlet the transported state's argmax IS the
+  # first jump's own prediction (verified, 100% of draws), so a map copying its
+  # input would have returned its own draft and scored ~2.3. It scored 0. The
+  # map does not read its input at any s; it is c(ctx, s, t), trained at one
+  # pair. The rollout is the only term that visits other pairs with a real
+  # target, which is why it is back.
   rollout_kl_weight: 0.0    # 0 = off, costs nothing when off
-  rollout_max_jumps: 8      # n ~ U{1..N} per step, so no schedule is specialised for
-  rollout_grad_jumps: 4     # backprop through the last k jumps; earlier ones no_grad, so
-                            # memory follows k rather than n
-  rollout_anytime: true     # supervise every step in the window as "if you stopped here"
+  rollout_max_jumps: 2      # CONCENTRATE on the deployed schedule, do not spread. A uniform
+                            # draw over 1..8 spends most of the term on pairs no schedule
+                            # visits, which is the defect being fixed.
+  rollout_grad_jumps: 1     # terminal leg only. Backpropagating through composed legs lets
+                            # earlier ones optimise later ones' inputs -- a self-referential
+                            # objective on a map already collapsing to constants. Widen it
+                            # as an ablation, not as the starting point.
+  rollout_anytime: false    # supervise the TERMINAL leg against p_AR, not every step.
+                            # "If you stopped here" at every step trains each leg to be a
+                            # complete answer, so pi_{s1,1} approaches pi_{0,1} and the
+                            # schedule becomes an n-fold repetition of one map -- redundancy
+                            # trained in on purpose. Falsifiable: under the previous setting
+                            # n=2 should converge to n=1's draft.
   rollout_stratified: true  # interior jump times one per equal bin, not a fixed grid
 
   warm_start_weight: 0.0    # the only term that teaches the map to READ its input.
