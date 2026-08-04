@@ -77,9 +77,22 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
             sum(fd["acceptance"]) / len(fd["acceptance"])
             if fd["acceptance"] else 0.0
         ),
-        # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
+        # End-to-end tokens per forward pass, prefill included and the final
+        # cycle charged in full even where its overflow was discarded. Honest
+        # for a generation of THIS length, but it therefore depends on
+        # max_new_tokens: two systems compare through it only at an identical
+        # setting. AR is ~1.
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
+        # Steady-state rate: every token the draft cycles produced over the
+        # forwards those cycles cost, with the prefill excluded. This is the
+        # quantity the analytic bound (accepted + 1) / (jumps + 1) predicts, so
+        # a gap between the two says the measurement is off rather than the
+        # model. Length-independent, hence the one to compare across runs.
+        "tpf_steady": (
+            fd["produced_tokens"] / fd["cycle_forwards"]
+            if fd.get("cycle_forwards") else float("nan")
+        ),
         # wall-clock DIAGNOSTICS, not headline: hardware/kernel dependent
         # (default kernel is sdpa; try model.backbone.attn_implementation=flex_attention on GPU)
         "tokens_per_s": n_tokens / fd["seconds"],

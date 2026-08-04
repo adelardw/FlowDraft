@@ -153,6 +153,69 @@ class FlowDraft(L.LightningModule):
 
     # --- the loss is yours ----------------------------------------------------
 
+    def _teacher_loss(self, teacher_logits, logits, live, sample_weight=None):
+        """Match the drafter to the frozen AR path, in one of two senses.
+
+        ``train.teacher_target``:
+
+        * ``soft`` — ``KL(sg(p_AR) || π)``. Minimised at ``π = p_AR``, so with an
+          attainable target this is the complete objective.
+        * ``hard`` — ``CE(argmax p_AR, π)``. Minimised by putting the mode where
+          the verifier's mode is, and indifferent to the rest of the mass.
+        * ``tv`` — total variation ``½ Σ |p_AR − π|``. Speculative sampling
+          accepts a proposal with probability ``Σ min(p, q) = 1 − TV(p, q)``, so
+          for sampled decoding this is not a surrogate for the acceptance rate
+          but the acceptance rate itself, up to sign.
+
+        Which one matches the metric depends on how the drafter will be
+        decoded, because the two verification rules read different things.
+        Greedy accepts on ``argmax π == argmax p_AR`` and ignores the rest of
+        the distribution; speculative sampling reads all of it. Note that
+        neither choice can affect output quality — verification makes the
+        emitted text identical to the AR model's under both rules — so this
+        only ever trades acceptance in one decoding mode against the other.
+
+        The choice matters because the target is NOT attainable: ``p_AR`` at a
+        block position is conditioned on the clean tokens before it, which the
+        drafter does not have, so it can only represent a mixture over the
+        predecessors it is uncertain about. Under that constraint a forward KL
+        spends capacity matching mass that greedy verification never reads, and
+        a blurred mixture can score better on it while its argmax sits on a
+        different token than the verifier's — lower loss, rejected block.
+        Greedy acceptance is exactly ``argmax π == argmax p_AR``, which is what
+        the hard target optimises directly.
+
+        Keep ``soft`` for sampled decoding: the coupled-Gumbel scheme accepts
+        against the whole proposal distribution, not just its mode.
+        """
+        mode = str(self.cfg.train.get("teacher_target", "soft"))
+        if mode not in ("soft", "hard", "tv"):
+            raise ValueError(f"unknown teacher_target='{mode}' (soft | hard | tv)")
+        if mode in ("hard", "tv"):
+            if mode == "hard":
+                per_token = F.cross_entropy(
+                    logits.float().transpose(1, 2),
+                    teacher_logits.argmax(-1),
+                    reduction="none",
+                )
+            else:
+                per_token = 0.5 * (
+                    F.softmax(teacher_logits.float(), -1)
+                    - F.softmax(logits.float(), -1)
+                ).abs().sum(-1)
+            if not live.any():
+                return logits.sum() * 0.0
+            if sample_weight is not None:
+                per_token = per_token * sample_weight[:, None].to(per_token.dtype)
+                return (per_token * live).sum() / live.sum()
+            return per_token[live].mean()
+        return self._masked_kl(
+            F.log_softmax(teacher_logits.float(), -1),
+            F.log_softmax(logits.float(), -1),
+            live,
+            sample_weight=sample_weight,
+        )
+
     def _ar_kl_sample_weight(self, t):
         """Per-sequence weight on the diagonal's teacher term, as a function
         of ``t``.
@@ -599,9 +662,19 @@ class FlowDraft(L.LightningModule):
         drafted = block_size - 1
         if drafted <= 0:
             raise ValueError("block_size must be at least 2 (anchor + one draft)")
-        x = torch.distributions.Dirichlet(
-            torch.ones(vocab, device=device)
-        ).sample((1, drafted))
+        decode_cfg = self.cfg.get("decode", {}) if hasattr(self.cfg, "get") else {}
+        if bool(decode_cfg.get("fixed_prior", False)):
+            # The Dirichlet mean, i.e. the uniform point of the simplex. Greedy
+            # verification accepts on an argmax match, a criterion with no
+            # randomness in it, so drawing a fresh prior each cycle only adds
+            # variance to the one input the deployed map ever sees. Sampling
+            # decoding still gets its randomness from the proposal draw and the
+            # coupled Gumbel noise, neither of which comes from here.
+            x = torch.full((1, drafted, vocab), 1.0 / vocab, device=device)
+        else:
+            x = torch.distributions.Dirichlet(
+                torch.ones(vocab, device=device)
+            ).sample((1, drafted))
         anchor = None
         if anchor_token is not None:
             anchor = F.one_hot(
@@ -824,7 +897,8 @@ class FlowDraft(L.LightningModule):
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards)
 
     def _finalize(self, input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                  acceptance=None):
+                  acceptance=None, cycle_forwards=None):
+        produced = len(emitted)
         emitted = emitted[:max_new_tokens]
         if eos_token_id is not None and eos_token_id in emitted:
             emitted = emitted[: emitted.index(eos_token_id) + 1]
@@ -834,6 +908,15 @@ class FlowDraft(L.LightningModule):
             ),
             "new_tokens": emitted,
             "n_forwards": n_forwards,
+            # End-to-end n_forwards charges the run for the prefill and for the
+            # last cycle in full even though its overflow past max_new_tokens is
+            # discarded above, so tokens/n_forwards depends on how long the
+            # generation was asked to be — two systems are only comparable
+            # through it at an identical max_new_tokens. These two report the
+            # steady-state rate instead: every token the cycles actually
+            # produced, over the forwards those cycles actually cost.
+            "produced_tokens": produced,
+            "cycle_forwards": n_forwards - 1 if cycle_forwards is None else cycle_forwards,
             "seconds": time.perf_counter() - start,
         }
         if acceptance is not None:

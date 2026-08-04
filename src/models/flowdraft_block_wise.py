@@ -245,7 +245,6 @@ class FlowDraftBlockWise(FlowDraft):
         anytime = bool(self.cfg.train.get("rollout_anytime", True))
         jumps = int(torch.randint(1, max_jumps + 1, (1,)))
         times = self._rollout_schedule(jumps, x1.device)
-        log_teacher = F.log_softmax(teacher_logits.float(), -1)
         pad = block_mask[..., None].to(x1.dtype)
 
         x = self.sample_prior(x1, block_mask)
@@ -280,9 +279,7 @@ class FlowDraftBlockWise(FlowDraft):
                 )
             else:
                 continue
-            terms.append(
-                self._masked_kl(log_teacher, F.log_softmax(finish.float(), -1), live)
-            )
+            terms.append(self._teacher_loss(teacher_logits, finish, live))
         if not terms:
             return None
         return torch.stack(terms).mean()
@@ -469,11 +466,7 @@ class FlowDraftBlockWise(FlowDraft):
         #              any multi-jump schedule.
         #   KL target: sg(p_AR) — the frozen AR path's distribution for the
         #              same block positions, already aligned in _shared_step.
-        verify_kl = self._masked_kl(
-            F.log_softmax(teacher_logits.float(), -1),
-            F.log_softmax(verify_logits.float(), -1),
-            live,
-        )
+        verify_kl = self._teacher_loss(teacher_logits, verify_logits, live)
 
         # Landing point of the jump — the EC-target input. Detached: the
         # jump's single teacher is ECLD.
@@ -505,10 +498,8 @@ class FlowDraftBlockWise(FlowDraft):
         # see _ar_kl_sample_weight.
         ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
         ar_kl = (
-            self._masked_kl(
-                F.log_softmax(teacher_logits.float(), -1),
-                F.log_softmax(diag_logits.float(), -1),
-                live,
+            self._teacher_loss(
+                teacher_logits, diag_logits, live,
                 sample_weight=self._ar_kl_sample_weight(t),
             )
             if ar_kl_weight

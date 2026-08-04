@@ -51,6 +51,21 @@ train:
   ar_kl_t_decay: 0.0        # scale that term by (1-t)^p: teacher leads near t=0 where the
                             # input says nothing, vanishes near t=1 where x1 is the sharp
                             # and correct target; 0 = flat weight
+  teacher_target: soft      # how every teacher term matches p_AR. The two verification
+                            # rules read different things, so the metric-matched loss
+                            # differs by decoding mode -- and they disagree: a blurred
+                            # proposal is rejected by greedy yet accepted ~94% of the time
+                            # by sampling, a peaked one the reverse.
+                            #   soft -- KL(p_AR || pi). Surrogate for both, matched to
+                            #           neither; safe default.
+                            #   hard -- CE(argmax p_AR, pi). Greedy accepts iff the modes
+                            #           agree, so this targets the criterion directly. Use
+                            #           when decoding at temperature 0.
+                            #   tv   -- total variation. Speculative sampling accepts with
+                            #           probability sum(min(p, q)) = 1 - TV, so this IS the
+                            #           acceptance rate. Use when decoding with sampling.
+                            # None of them affects output quality: verification makes the
+                            # text identical to the AR model's either way. Only speed moves.
   verify_kl_weight: 0.0     # direct KL(p_AR || pi_{s,1}) on the jump the decode
                             # loop finishes with; packed block-wise preset enables it
   verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)
