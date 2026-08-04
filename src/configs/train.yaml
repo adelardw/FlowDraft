@@ -43,6 +43,15 @@ train:
   warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
   weight_decay: 0.01
   betas: [0.9, 0.95]
+  prior_type: dirichlet     # x0 in x_s = (1-s) x0 + s x1. Decides whether the input hides
+                            # the answer. At V=151936 the clean token becomes the argmax of
+                            # x_s at s* = 7.4e-5 (dirichlet), 0.500 (discunif), 0.815
+                            # (gaussian) -- so the share of t~U[0,1] with a genuinely
+                            # ambiguous input is 0.007%, 50% and 81%. The reference CFM text
+                            # configs use gaussian; dirichlet is this project's substitution
+                            # and is why the endpoint/EC/TD terms converge to near zero.
+                            # gaussian leaves the simplex: the interpolant is then a point in
+                            # R^V, which x @ E and x + gamma(pi - x) both accept.
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
                             #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
                             # The clean token is the argmax of x_s once s > 1e-4 and is

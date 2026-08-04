@@ -169,10 +169,48 @@ class FlowDraft(L.LightningModule):
         return x_s, x_t, s, t
 
     def sample_prior(self, simplex, attention_mask=None):
-        """Sample the exact prior consumed by one-jump training and decoding."""
-        x0 = torch.distributions.Dirichlet(
-            torch.ones(simplex.size(-1), device=simplex.device)
-        ).sample(simplex.shape[:2])
+        """Sample the prior consumed by one-jump training and decoding.
+
+        The choice decides whether the interpolant ``x_s = (1-s) x0 + s x1``
+        conceals the answer or hands it over. Writing ``t*`` for the level at
+        which the clean token becomes the argmax of the input, measured at
+        ``V = 151936``:
+
+        ============ ======== ==========================================
+        prior        ``t*``   share of ``t ~ U[0,1]`` that is ambiguous
+        ============ ======== ==========================================
+        dirichlet    7.4e-5   0.007%
+        discunif     0.500    50%
+        gaussian     0.815    81%
+        ============ ======== ==========================================
+
+        Under ``dirichlet`` the prior's largest component is about
+        ``ln(V)/V ≈ 9e-5``, so a spike of size ``s`` on the clean token
+        dominates it almost immediately and every term that reads ``x_s`` is
+        solved by copying the input. ``gaussian`` keeps the largest competing
+        component near ``sqrt(2 ln V) ≈ 4.9``, so the answer stays buried until
+        ``s`` is large; ``discunif`` puts a single competing spike of size
+        ``1 - s`` against the clean ``s``, giving the crossing at one half.
+
+        ``gaussian`` leaves the simplex — the interpolant is then a point in
+        ``R^V``, which the embedding ``x @ E`` and the transport
+        ``x + γ(π - x)`` both accept, and only the model's OUTPUT has to be a
+        distribution.
+        """
+        vocab = simplex.size(-1)
+        kind = str(self.cfg.train.get("prior_type", "dirichlet"))
+        shape = simplex.shape[:2]
+        if kind == "dirichlet":
+            x0 = torch.distributions.Dirichlet(
+                torch.ones(vocab, device=simplex.device)
+            ).sample(shape)
+        elif kind == "gaussian":
+            x0 = torch.randn(*shape, vocab, device=simplex.device, dtype=simplex.dtype)
+        elif kind == "discunif":
+            idx = torch.randint(vocab, shape, device=simplex.device)
+            x0 = F.one_hot(idx, vocab).to(simplex.dtype)
+        else:
+            raise ValueError(f"unknown prior_type='{kind}' (dirichlet | gaussian | discunif)")
         if attention_mask is not None:
             x0 = x0 * attention_mask[..., None].to(x0.dtype)
         return x0
