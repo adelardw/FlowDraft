@@ -37,6 +37,15 @@ adapter:
   # Official Orthrus maintains a full separate diffusion attention path:
   # Q/K/V/O projections plus the per-head Q/K normalization weights.
   w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]
+  # How the flow-map times reach the DF path.
+  #   pair -- encode (s, t)
+  #   jump -- encode (s, t - s), the start and the LENGTH of the jump, which is
+  #           what the reference categorical-flow-map implementation conditions
+  #           on. Under pair the identity jump is the whole diagonal t = s, a
+  #           line the network must learn to recognise; under jump it is the
+  #           single value 0, and intermediate steps of a schedule pool with
+  #           steps of equal length taken from other starts.
+  time_parameterisation: pair
   # Triton is the stable sparse FlexAttention training kernel. FLASH/FA4 has
   # higher peak throughput on H100/H200 but remains an explicit opt-in because
   # irregular block masks can trigger fatal CUDA illegal-memory-access errors.

@@ -230,6 +230,7 @@ class FlowDraftAttentionAdapter(nn.Module):
         model,
         w_names=("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
         flex_attention_backend="triton",
+        time_parameterisation: str = "pair",
     ):
         super().__init__()
         self.model = model
@@ -251,9 +252,10 @@ class FlowDraftAttentionAdapter(nn.Module):
         self.mask_embedding = nn.Parameter(
             embed_weight.detach().float().mean(0, keepdim=True)
         )
-        self.time_embed = FlowTimeEmbedding(self.model.config.hidden_size).to(
-            device=embed_weight.device
-        )
+        self.time_embed = FlowTimeEmbedding(
+            self.model.config.hidden_size,
+            parameterisation=time_parameterisation,
+        ).to(device=embed_weight.device)
         # The paper's training kernel is Qwen3-specific. Patch only Qwen3
         # attention modules; other model families retain the portable SDPA DF
         # implementation below.
