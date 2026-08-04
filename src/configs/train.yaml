@@ -52,6 +52,14 @@ train:
                             # and is why the endpoint/EC/TD terms converge to near zero.
                             # gaussian leaves the simplex: the interpolant is then a point in
                             # R^V, which x @ E and x + gamma(pi - x) both accept.
+                            # SCALE matters here because the input projection is the FROZEN
+                            # embedding matrix, not a trained Linear as in the reference.
+                            # Measured at V=151936 against a token embedding's norm of 1.0,
+                            # ||x0 @ E|| is 0.004 for dirichlet -- 270x too small, so the trunk
+                            # sees essentially the mean embedding, which pushes the map toward
+                            # behaving as a constant -- 1.00 for discunif, and 392 for an
+                            # unscaled Gaussian. gaussian is therefore emitted at 1/sqrt(V).
+                            # discunif needs no scaling and is the safer choice here.
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
                             #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
                             # The clean token is the argmax of x_s once s > 1e-4 and is

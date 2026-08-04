@@ -196,6 +196,16 @@ class FlowDraft(L.LightningModule):
         ``R^V``, which the embedding ``x @ E`` and the transport
         ``x + γ(π - x)`` both accept, and only the model's OUTPUT has to be a
         distribution.
+
+        Scale matters here in a way it does not in the reference method, whose
+        input projection is trained. Measured at ``V = 151936`` against a token
+        embedding's norm of 1.0, ``x0 @ E`` comes out at 0.004 for
+        ``dirichlet`` (270x too small — the frozen trunk sees essentially the
+        mean embedding, which is one reason the map behaves as a constant),
+        1.00 for ``discunif``, and 392 for an unscaled Gaussian. ``gaussian``
+        is therefore emitted at ``1/sqrt(V)``, matching the ``x/sqrt(V)`` the
+        reference feeds its projection. ``discunif`` needs no scaling at all
+        and is the safer choice against a frozen embedding.
         """
         vocab = simplex.size(-1)
         kind = str(self.cfg.train.get("prior_type", "dirichlet"))
@@ -205,7 +215,13 @@ class FlowDraft(L.LightningModule):
                 torch.ones(vocab, device=simplex.device)
             ).sample(shape)
         elif kind == "gaussian":
-            x0 = torch.randn(*shape, vocab, device=simplex.device, dtype=simplex.dtype)
+            # Scaled by 1/sqrt(V), as the reference implementation feeds
+            # x/sqrt(V) to its input projection. Without it the embedding
+            # x0 @ E has norm ~sqrt(V) times a token's — measured at V=151936,
+            # 391 against 1.0 — and a FROZEN trunk has no way to absorb that.
+            x0 = torch.randn(
+                *shape, vocab, device=simplex.device, dtype=simplex.dtype
+            ) / (vocab ** 0.5)
         elif kind == "discunif":
             idx = torch.randint(vocab, shape, device=simplex.device)
             x0 = F.one_hot(idx, vocab).to(simplex.dtype)
