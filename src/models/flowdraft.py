@@ -286,20 +286,30 @@ class FlowDraft(L.LightningModule):
                 ).abs().sum(-1)
             if not live.any():
                 return logits.sum() * 0.0
+            norm = live.to(per_token.dtype)
             if sample_weight is not None:
+                # A sample weight is meant to SHRINK the term (the (1-t)^p
+                # schedule wants the teacher to fade), so it does not enter the
+                # normaliser.
                 per_token = per_token * sample_weight[:, None].to(per_token.dtype)
             if position_weight is not None:
+                # A position weight REALLOCATES within the block; it must not
+                # rescale the term as a whole, or the balance against the other
+                # terms would drift with a property of the data. Dividing by the
+                # realised weight mass keeps the term's scale fixed.
                 per_token = per_token * position_weight.to(per_token.dtype)
+                norm = position_weight.to(per_token.dtype) * live
             if sample_weight is not None or position_weight is not None:
-                return (per_token * live).sum() / live.sum()
+                return (per_token * live).sum() / norm.sum().clamp_min(1e-6)
             return per_token[live].mean()
         if position_weight is not None:
             log_p = F.log_softmax(teacher_logits.float(), -1)
             log_q = F.log_softmax(logits.float(), -1)
-            kl = (log_p.exp() * (log_p - log_q)).sum(-1) * position_weight.to(log_q.dtype)
+            w = position_weight.to(log_q.dtype)
+            kl = (log_p.exp() * (log_p - log_q)).sum(-1) * w
             if sample_weight is not None:
                 kl = kl * sample_weight[:, None].to(kl.dtype)
-            return (kl * live).sum() / live.sum().clamp_min(1)
+            return (kl * live).sum() / (w * live).sum().clamp_min(1e-6)
         return self._masked_kl(
             F.log_softmax(teacher_logits.float(), -1),
             F.log_softmax(logits.float(), -1),
