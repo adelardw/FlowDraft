@@ -198,3 +198,6 @@ paper/
 *.out
 *.synctex.gz
 PROVENANCE.md
+
+# Rejected work kept out of the tree
+bucket/
