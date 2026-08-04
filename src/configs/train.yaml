@@ -67,6 +67,19 @@ train:
                             # noiselessly invertible at every s, which fixes the s=0 state
                             # and destroys the ambiguity the endpoint and consistency terms
                             # exist to resolve.
+  terminal_time_fraction: 0.0  # share of the batch forced onto t = 1. pi_{s,1} is the only
+                            # map the decode loop executes, and under every continuous
+                            # sampler it has probability zero -- 'paper' puts 1% of draws
+                            # above 0.99 -- so endpoint, EC and TD train t < 1 almost surely
+                            # and reach the deployed pair only through the smoothness of one
+                            # additive time vector. The reference implementation puts 75% of
+                            # its batch on the diagonal for the same reason.
+  gamma_clamp: 1.0e-4       # floor on (1-s) in gamma = (t-s)/(1-s). The reference clamps at
+                            # 0.05; 1e-4 admits gamma values three orders larger, and gamma
+                            # squared weights the drift term.
+  td_min_step: 0.01         # minimum finite-difference probe for the drift term. Below this
+                            # the difference of two bf16 softmaxes divided by the step and
+                            # squared amplifies quantisation noise by about 1e6.
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t})
                             #   | sequential (s~U, t~U[s,1]) | log (both log-uniform)
                             # The clean token is the argmax of x_s once s > 1e-4 and is

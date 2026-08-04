@@ -456,7 +456,7 @@ class FlowDraftBlockWise(FlowDraft):
         own, and every DF forward carries the clean-prefix cache AND the
         clean in-block anchor (via :meth:`_df_forward`).
         """
-        eps = 1e-4
+        eps = float(self.cfg.train.get("gamma_clamp", 1e-4))
         live = block_mask.bool()
         if not live.any():
             # the whole block landed in padding: a zero step wired into the

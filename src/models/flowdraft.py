@@ -166,6 +166,18 @@ class FlowDraft(L.LightningModule):
         if sampler is None:
             raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle | paper)")
         s, t = sampler(batch, simplex.device)
+        # Stratify t = 1 as an atom. pi_{s,1} is the ONLY map the decode loop
+        # executes, and under every continuous sampler here it has probability
+        # zero — 'paper' puts 1% of draws above t = 0.99. So the endpoint,
+        # consistency and drift terms train t < 1 almost surely and reach the
+        # deployed pair only through the smoothness of a single additive time
+        # vector. Forcing a share of the batch onto t = 1 gives them gradient
+        # where it is used.
+        atom = float(self.cfg.train.get("terminal_time_fraction", 0.0))
+        if atom > 0.0:
+            pick = torch.rand(batch, device=simplex.device) < atom
+            t = torch.where(pick, torch.ones_like(t), t)
+            s = torch.minimum(s, t)
         x0 = self.sample_prior(simplex, attention_mask)
         x_s = (1.0 - s[:, None, None]) * x0 + s[:, None, None] * simplex
         # Same trajectory at time t — the anchor input. Built from DATA, so it
@@ -441,14 +453,20 @@ class FlowDraft(L.LightningModule):
         dt_val = 0.05
         prefer_forward = (t + dt_val <= 1.0) | (1.0 - t >= t - s)
         room = torch.where(prefer_forward, 1.0 - t, t - s)
-        td_live = room >= 1e-3
-        step = room.clamp(max=dt_val).clamp(min=1e-3)
+        # A probe far below dt_val divides a difference of two bf16-derived
+        # softmaxes by that step and then squares it, so a 1e-3 floor amplifies
+        # quantisation noise by about 1e6. Require real room instead of
+        # clamping into it, and drop the samples that lack it from the average
+        # rather than zeroing them while they still count in the denominator.
+        floor = float(self.cfg.train.get("td_min_step", 0.01))
+        td_live = room >= floor
+        step = room.clamp(max=dt_val).clamp(min=floor)
         dt = torch.where(prefer_forward, step, -step)
         pi_dt = forward_dt(dt).float().softmax(-1)
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
-        drift = drift * td_live[:, None]
         weighted = gamma.squeeze(-1).pow(2) * drift
-        return weighted[live].mean() if live.any() else pi.sum() * 0.0
+        keep = live & td_live[:, None]
+        return weighted[keep].mean() if keep.any() else pi.sum() * 0.0
 
     def compute_loss(
         self,
@@ -491,7 +509,7 @@ class FlowDraft(L.LightningModule):
         hence the shift in the anchor. Masking happens only here, at the
         reductions — padding must not contribute to any mean.
         """
-        eps = 1e-4
+        eps = float(self.cfg.train.get("gamma_clamp", 1e-4))
         mask = batch["attention_mask"]
         live = mask.bool()
         log_draft = F.log_softmax(draft_logits.float(), -1)
@@ -1096,7 +1114,7 @@ class FlowDraft(L.LightningModule):
         pi = logits.float().softmax(-1)
         s = torch.as_tensor(s, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
         t = torch.as_tensor(t, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
-        gamma = (t - s) / (1.0 - s).clamp(min=1e-4)
+        gamma = (t - s) / (1.0 - s).clamp(min=float(self.cfg.train.get("gamma_clamp", 1e-4)))
         return x_s + gamma * (pi - x_s)
 
     def _shared_step(self, batch):
