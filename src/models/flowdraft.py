@@ -153,6 +153,31 @@ class FlowDraft(L.LightningModule):
 
     # --- the loss is yours ----------------------------------------------------
 
+    def _ar_kl_sample_weight(self, t):
+        """Per-sequence weight on the diagonal's teacher term, as a function
+        of ``t``.
+
+        The two targets available for ``π_{t,t}(x_t)`` are informative at
+        opposite ends of the range. The sampled endpoint ``x1`` is the correct
+        target throughout, but near ``t = 0`` the input carries almost nothing
+        about it, so the diagonal has little to go on. The frozen AR path is
+        conditioned on the clean preceding block tokens — information the
+        drafter cannot recover from a noised input at any ``t`` — so near
+        ``t = 0`` it is the more informative of the two. Near ``t = 1`` the
+        relation inverts: the input is already close to ``x1`` and the correct
+        answer is nearly deterministic, while the teacher stays diffuse and
+        conditioned on something else, so blending it in biases the diagonal
+        exactly where the consistency term reads it as an expert.
+
+        ``train.ar_kl_t_decay = p`` scales the teacher term by ``(1 - t)^p``,
+        so it leads where the input is uninformative and vanishes where the
+        endpoint target is sharp. ``p = 0`` gives the flat weight.
+        """
+        power = float(self.cfg.train.get("ar_kl_t_decay", 0.0))
+        if power <= 0.0:
+            return None
+        return (1.0 - t).clamp_min(0.0) ** power
+
     def _lambda(self):
         """ECLD weight with optional staging: endpoint inference FIRST, then
         consistency. With ``train.lambda_ramp_steps = N > 0`` the weight ramps
@@ -167,8 +192,13 @@ class FlowDraft(L.LightningModule):
         return lam
 
     @staticmethod
-    def _masked_kl(log_p, log_q, live):
+    def _masked_kl(log_p, log_q, live, sample_weight=None):
         """``KL(p || q)`` per position, averaged over live (non-pad) tokens.
+
+        ``sample_weight`` is an optional per-sequence factor ``[B]`` applied
+        before the average. The normaliser stays the live-token count, so a
+        weight below one genuinely shrinks the term rather than being divided
+        back out.
 
         An empty ``live`` mask yields a graph-connected zero, not NaN
         (``mean()`` over an empty tensor silently poisons the weights).
@@ -176,6 +206,9 @@ class FlowDraft(L.LightningModule):
         if not live.any():
             return log_q.sum() * 0.0
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
+        if sample_weight is not None:
+            kl = kl * sample_weight[:, None].to(kl.dtype)
+            return (kl * live).sum() / live.sum()
         return kl[live].mean()
 
     def _packed_document_layout(self, batch, dtype):

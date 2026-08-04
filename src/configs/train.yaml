@@ -46,7 +46,11 @@ train:
   time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle (uniform on {s<=t}) | sequential (s~U, t~U[s,1])
   lambda: 1.0               # weight of the ECLD part: loss = endpoint_weight*endpoint + ar_kl_weight*AR_KL + lambda*(4*EC + 2*TD)
   endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
-  ar_kl_weight: 0.0         # optional verifier-alignment auxiliary; 0 keeps the CFM objective paper-faithful
+  ar_kl_weight: 0.0         # teacher alignment ON THE DIAGONAL; with endpoint_weight the
+                            # minimiser is their mixture, not a contested target
+  ar_kl_t_decay: 0.0        # scale that term by (1-t)^p: teacher leads near t=0 where the
+                            # input says nothing, vanishes near t=1 where x1 is the sharp
+                            # and correct target; 0 = flat weight
   verify_kl_weight: 0.0     # direct KL(p_AR || pi_{s,1}) on the jump the decode
                             # loop finishes with; packed block-wise preset enables it
   verify_s_uniform: false   # false: s = 0 only -- the exact one-jump map pi_{0,1}(x_0)
@@ -54,6 +58,11 @@ train:
                             #        final jump of a multi-jump schedule is trained too
   verify_s_stratified: true # with verify_s_uniform: one s per equal bin of [0,1) instead
                             # of i.i.d. draws, so a small batch still covers the family
+  prior_disagreement_samples: 0  # >1 logs val/prior_disagreement: JSD between predictions
+                            # from M priors at the same noise level. Must fall to zero as
+                            # s -> 0 (input independent of the endpoint); a near-zero value
+                            # at interior s means the drafter ignores its input entirely.
+                            # Diagnostic only, validation only, M extra forwards
   lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
                             #   (diagonal endpoint inference first, consistency second); 0 = static
   checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern

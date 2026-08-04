@@ -390,12 +390,19 @@ class FlowDraftBlockWise(FlowDraft):
             reduction="none",
         )
         endpoint = endpoint_nll[live].mean()
+        # Teacher alignment on the diagonal. Combined with the endpoint CE this
+        # is not a pair of competing targets: both are forward KLs, which are
+        # linear in the target, so the weighted sum is minimised by the MIXTURE
+        # (w_e * p(x1|x_t) + w_a * p_AR) / (w_e + w_a). What the flat weight
+        # gets wrong is the blend ratio, which should not be constant in t —
+        # see _ar_kl_sample_weight.
         ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
         ar_kl = (
             self._masked_kl(
                 F.log_softmax(teacher_logits.float(), -1),
                 F.log_softmax(diag_logits.float(), -1),
                 live,
+                sample_weight=self._ar_kl_sample_weight(t),
             )
             if ar_kl_weight
             else diag_logits.sum() * 0.0
@@ -528,5 +535,76 @@ class FlowDraftBlockWise(FlowDraft):
                 on_epoch=True,
                 sync_dist=True,
             )
+            self._log_prior_disagreement(rest)
             self._maybe_decode_val(batch, batch_idx)
+
+    def _log_prior_disagreement(self, rest):
+        """How much the drafter's endpoint prediction depends on the noise seed.
+
+        Several priors are drawn for the SAME batch — same clean endpoints,
+        same context, same noise level — and the spread of the resulting
+        predictions is measured as the Jensen-Shannon divergence of the M
+        predictive distributions, ``H(mean) - mean(H)``, averaged over live
+        positions. Zero means the prediction is a function of the data alone;
+        large values mean the seed is moving it.
+
+        Two readings, at the two ends of the noise level:
+
+        * ``s -> 0`` the input is independent of the endpoints, so the optimal
+          prediction cannot depend on the seed and the divergence must fall to
+          zero as training proceeds. If it plateaus above zero, the drafter is
+          reading structure out of the noise.
+        * ``s`` in the interior the input genuinely carries part of the answer,
+          different seeds give different partial evidence, and a NON-zero
+          spread is correct. A value near zero here means the opposite failure:
+          the drafter ignores its input and predicts from context alone, which
+          would make the whole diffusion path decorative.
+
+        Diagnostic only, validation only, no gradient. Enable with
+        ``train.prior_disagreement_samples > 1``.
+        """
+        samples = int(self.cfg.train.get("prior_disagreement_samples", 0))
+        if samples < 2:
+            return
+        (_x_s, _x_t, x1, s, _t, ctx_mask, block_mask, cache, anchor,
+         df_kwargs) = rest
+        live = block_mask.bool()
+        if not live.any():
+            return
+        ones = torch.ones_like(s)
+        preds = []
+        with torch.no_grad():
+            for _ in range(samples):
+                prior = self.sample_prior(x1, block_mask)
+                x_seed = (1.0 - s[:, None, None]) * prior + s[:, None, None] * x1
+                logits = self._df_forward(
+                    x_seed, anchor, ctx_mask, cache, s, ones, df_kwargs
+                )
+                preds.append(F.softmax(logits.float(), -1))
+        stack = torch.stack(preds)                       # [M, B, K, V]
+        mean = stack.mean(0)
+        # JSD = H(mean) - mean(H); both entropies in nats, so the value is
+        # bounded by log(M) and comparable across runs with the same M.
+        entropy = lambda p: -(p.clamp_min(1e-12).log() * p).sum(-1)
+        jsd = entropy(mean) - entropy(stack).mean(0)
+        self.log(
+            "val/prior_disagreement",
+            jsd[live].mean(),
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        # Split by noise level: the two ends carry opposite expectations.
+        low = s < 0.5
+        for name, sel in (("low_s", low), ("high_s", ~low)):
+            rows = sel[:, None] & live
+            if rows.any():
+                self.log(
+                    f"val/prior_disagreement_{name}",
+                    jsd[rows].mean(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
         return loss
