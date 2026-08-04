@@ -101,6 +101,18 @@ train:
                             # probability of reaching it; uniform weighting spends most of the
                             # gradient past position 4, reached on a few percent of blocks.
                             # Normalised to mean 1, so it does not change the effective LR.
+  warm_start_weight: 0.0    # the only term that teaches the map to READ its input.
+                            # At t=1 the transport factor (t-s)/(1-s) is 1 for every s, so
+                            # the final jump returns pi_{s,1}(x_s) and the incoming state
+                            # adds nothing -- all of a multi-jump schedule's value is in
+                            # d pi_{s,1} / d x_s, and nothing else in the objective rewards
+                            # that derivative. Simulates the decode-time warm start: the
+                            # verify pass already yields AR logits at every drafted
+                            # position, so the next cycle can enter from them at zero extra
+                            # forward, and this term trains on that state.
+  warm_start_s: 0.5         # the time LABEL attached to that state. It is off the
+                            # interpolation path, so the value carries no geometric
+                            # meaning; training and decoding only have to agree on it.
   verify_kl_weight: 0.0     # KL(p_AR || pi_{0,1}(x_0)) on the pure prior -- the exact
                             # state the decode loop enters every cycle at; the packed
                             # block-wise preset enables it

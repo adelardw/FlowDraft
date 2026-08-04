@@ -332,10 +332,46 @@ class FlowDraftBlockWise(FlowDraft):
         verify_logits = self._df_forward(
             verify_input, anchor, ctx_mask, cache, verify_s, ones, df_kwargs
         )
+
+        # Warm-start term: the ONLY term that can teach the map to read its
+        # input. At t = 1 the transport factor (t-s)/(1-s) is 1 for every s, so
+        # the last jump returns π_{s,1}(x_s) and the incoming state contributes
+        # nothing additively — all of a multi-jump schedule's value sits in
+        # ∂π_{s,1}/∂x_s. Nothing else in the objective rewards that derivative:
+        # verify_kl is evaluated at s = 0 on a fresh prior, and a map ignoring
+        # x_s minimises it exactly as well.
+        #
+        # At decode the entry state need not be noise. The verify pass already
+        # produces AR logits at every drafted position, so the next cycle can be
+        # seeded with them at no extra forward. Those are a good-but-stale guess
+        # — conditioned partly on tokens that were rejected. This term simulates
+        # that state: mix the clean endpoint with the teacher's own prediction
+        # shifted one position, at a level drawn from [warm_start_s_min, 1),
+        # which sweeps "roughly right" through "exact".
+        warm_weight = float(self.cfg.train.get("warm_start_weight", 0.0))
+        if warm_weight:
+            # The entry state is the teacher's OWN distribution read one
+            # position out of place — informed, on the right manifold, and
+            # wrong in the way a stale prediction is wrong. It must not be
+            # mixed with x1: a convex mix with the clean endpoint puts the
+            # answer at the argmax for any weight above a half, which recreates
+            # the leak the prior change was made to remove.
+            x_w = F.softmax(
+                teacher_logits.roll(1, dims=1).float(), -1
+            ).to(x1.dtype) * block_mask[..., None].to(x1.dtype)
+            # s is a label, not a position on the interpolation path — this
+            # state is off it. Train and decode only have to agree on the value.
+            s_w = torch.full_like(s, float(self.cfg.train.get("warm_start_s", 0.5)))
+            warm_logits = self._df_forward(
+                x_w, anchor, ctx_mask, cache, s_w, ones, df_kwargs
+            )
+        else:
+            warm_logits = None
         return (
             teacher_logits,
             draft_logits,
             verify_logits,
+            warm_logits,
             x_s,
             x_t,
             x1,
@@ -353,6 +389,7 @@ class FlowDraftBlockWise(FlowDraft):
         teacher_logits,
         draft_logits,
         verify_logits,
+        warm_logits,
         x_s,
         x_t,
         x1,
@@ -390,6 +427,12 @@ class FlowDraftBlockWise(FlowDraft):
         pos_w = self._position_weights(teacher_logits, x1, live)
         verify_kl = self._teacher_loss(
             teacher_logits, verify_logits, live, position_weight=pos_w
+        )
+        warm_weight = float(self.cfg.train.get("warm_start_weight", 0.0))
+        warm_kl = (
+            self._teacher_loss(teacher_logits, warm_logits, live, position_weight=pos_w)
+            if warm_logits is not None
+            else draft_logits.sum() * 0.0
         )
 
         # Landing point of the jump — the EC-target input. Detached: the
@@ -449,6 +492,7 @@ class FlowDraftBlockWise(FlowDraft):
         verify_kl_weight = self.cfg.train.get("verify_kl_weight", 0.0)
         loss = (
             verify_kl_weight * verify_kl
+            + warm_weight * warm_kl
             + endpoint_weight * endpoint
             + lam * (4.0 * ec + 2.0 * td)
         )
@@ -456,6 +500,7 @@ class FlowDraftBlockWise(FlowDraft):
             {
                 f"{metric_prefix}/endpoint": endpoint,
                 f"{metric_prefix}/verify_kl": verify_kl,
+                f"{metric_prefix}/warm_kl": warm_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
                 f"{metric_prefix}/lambda": lam,
@@ -482,11 +527,12 @@ class FlowDraftBlockWise(FlowDraft):
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
-            teacher_logits, draft_logits, verify_logits, *rest = self._shared_step(batch)
+            teacher_logits, draft_logits, verify_logits, warm_logits, *rest = self._shared_step(batch)
             loss = self.compute_loss(
                 teacher_logits,
                 draft_logits,
                 verify_logits,
+                warm_logits,
                 *rest,
                 metric_prefix="val/loss",
                 log_on_step=False,
