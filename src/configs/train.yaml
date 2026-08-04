@@ -58,6 +58,19 @@ train:
                             #        final jump of a multi-jump schedule is trained too
   verify_s_stratified: true # with verify_s_uniform: one s per equal bin of [0,1) instead
                             # of i.i.d. draws, so a small batch still covers the family
+  # --- rollout: supervise the drafter on its OWN multi-jump path -------------
+  # Every other term lives on the interpolation path x_s = (1-s) x0 + s x1,
+  # which is built from the answer; decoding starts from the prior and feeds
+  # each step its own previous output. This term closes that gap and is the
+  # only one that sees a composition of jumps end to end.
+  rollout_kl_weight: 0.0    # 0 = off, costs nothing when off
+  rollout_max_jumps: 8      # n ~ U{1..N} per step, so no single schedule is specialised for
+  rollout_grad_jumps: 4     # backprop through the last k jumps only; earlier ones no_grad,
+                            # so memory follows k, not n, and the recurrence is truncated
+  rollout_anytime: true     # supervise every step in the window as "if you stopped here",
+                            # i.e. pi_{s_k,1}; false = terminal jump only (k-1 fewer forwards)
+  rollout_stratified: true  # interior jump times one per equal bin instead of a fixed grid
+
   prior_disagreement_samples: 0  # >1 logs val/prior_disagreement: JSD between predictions
                             # from M priors at the same noise level. Must fall to zero as
                             # s -> 0 (input independent of the endpoint); a near-zero value

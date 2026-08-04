@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from transformers import DynamicCache
@@ -179,6 +181,111 @@ class FlowDraftBlockWise(FlowDraft):
         block_mask = mask[:, p + 1 : p + block_width]
         block_ids = ids[:, p + 1 : p + block_width]
         return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
+
+    def _rollout_schedule(self, jumps, device):
+        """Jump times ``0 = t_0 < ... < t_n = 1`` for one rollout.
+
+        The interior boundaries are drawn one per equal bin of ``(0, 1)``
+        rather than placed on a uniform grid, so successive steps see a
+        different partition and the family is covered rather than sampled at
+        the same n-1 points every time. Both ends are kept strictly inside
+        ``(0, 1)``: the transport factor ``(t - s) / (1 - s)`` is unbounded as
+        ``s -> 1``.
+        """
+        if jumps < 2:
+            return [0.0, 1.0]
+        interior = jumps - 1
+        bins = torch.arange(interior, device=device, dtype=torch.float32)
+        if bool(self.cfg.train.get("rollout_stratified", True)):
+            offsets = torch.rand(interior, device=device)
+        else:
+            offsets = torch.full((interior,), 0.5, device=device)
+        times = ((bins + offsets) / interior).clamp(1e-3, 1.0 - 1e-3)
+        return [0.0] + times.sort().values.tolist() + [1.0]
+
+    def _rollout_kl(self, teacher_logits, x1, block_mask, ctx_mask, cache,
+                    anchor, df_kwargs):
+        """Teacher alignment along the drafter's OWN multi-jump path.
+
+        Every other term is evaluated on the interpolation path
+        ``x_s = (1-s) x_0 + s x_1``, which is built from the answer. Decoding
+        never sees that path: it starts from the prior and each step consumes
+        the previous step's own output. Training on one and running on the
+        other is the same exposure mismatch teacher forcing produces in an AR
+        model, and nothing in the objective addresses it. This term rolls the
+        drafter forward exactly as the decode loop does and supervises what it
+        actually produces.
+
+        It also gives the composition a direct signal. Endpoint consistency
+        relates ``π_{s,t}`` to the diagonal pairwise; a schedule of ``n`` jumps
+        executes a composition that no pairwise term ever evaluates end to end,
+        so accumulated error is unconstrained.
+
+        The target is the frozen AR distribution at every step, asked as "if
+        you had to finish here, what would you emit" — that is ``π_{s_k,1}``,
+        the map a schedule of any length terminates on. Supervising the
+        intermediate horizons themselves would instead drive the family towards
+        independence of ``t``, since the target does not depend on it.
+
+        Gradients flow through the last ``train.rollout_grad_jumps`` steps
+        only. The earlier ones run under ``no_grad``, so memory is bounded by
+        that window rather than by the schedule length, and the recurrence is
+        truncated before its conditioning degrades. Note the transport step is
+        a convex combination with factor below one except at ``t = 1``, so the
+        iteration is damped rather than expansive.
+        """
+        weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
+        if weight <= 0.0:
+            return None
+        live = block_mask.bool()
+        if not live.any():
+            return None
+        max_jumps = max(1, int(self.cfg.train.get("rollout_max_jumps", 8)))
+        window = max(1, int(self.cfg.train.get("rollout_grad_jumps", 4)))
+        anytime = bool(self.cfg.train.get("rollout_anytime", True))
+        jumps = int(torch.randint(1, max_jumps + 1, (1,)))
+        times = self._rollout_schedule(jumps, x1.device)
+        log_teacher = F.log_softmax(teacher_logits.float(), -1)
+        pad = block_mask[..., None].to(x1.dtype)
+
+        x = self.sample_prior(x1, block_mask)
+        ones = x1.new_ones(x1.size(0))
+        terms = []
+        for step, (s_k, t_k) in enumerate(zip(times[:-1], times[1:])):
+            grad_on = step >= jumps - window
+            ctx = contextlib.nullcontext() if grad_on else torch.no_grad()
+            s_vec = x1.new_full((x1.size(0),), s_k)
+            x_in = x
+            with ctx:
+                logits = self._df_forward(
+                    x_in, anchor, ctx_mask, cache,
+                    s_vec, x1.new_full((x1.size(0),), t_k), df_kwargs,
+                )
+                pi = F.softmax(logits.float(), -1).to(x_in.dtype)
+                # Endpoint prediction for this step's own horizon; the state
+                # moves a (t-s)/(1-s) fraction of the way towards it.
+                gamma = (t_k - s_k) / max(1.0 - s_k, 1e-3)
+                x = (x_in + gamma * (pi - x_in)) * pad
+            if not grad_on:
+                continue
+            if t_k >= 1.0:
+                # The last step already asks the t = 1 question, so its own
+                # output IS the "finish here" prediction — no extra forward.
+                finish = logits
+            elif anytime:
+                # Same state, horizon moved to 1: what this step would emit if
+                # the schedule stopped here.
+                finish = self._df_forward(
+                    x_in, anchor, ctx_mask, cache, s_vec, ones, df_kwargs,
+                )
+            else:
+                continue
+            terms.append(
+                self._masked_kl(log_teacher, F.log_softmax(finish.float(), -1), live)
+            )
+        if not terms:
+            return None
+        return torch.stack(terms).mean()
 
     def _sample_verify_s(self, like):
         """Noise levels for the last-jump verifier term, ``s ∈ [0, 1)``.
@@ -436,6 +543,13 @@ class FlowDraftBlockWise(FlowDraft):
             ),
         )
 
+        rollout_kl_weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
+        rollout_kl = self._rollout_kl(
+            teacher_logits, x1, block_mask, ctx_mask, cache, anchor, df_kwargs
+        )
+        if rollout_kl is None:
+            rollout_kl = draft_logits.sum() * 0.0
+
         lam = self._lambda()
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
@@ -443,6 +557,7 @@ class FlowDraftBlockWise(FlowDraft):
         verify_kl_weight = self.cfg.train.get("verify_kl_weight", 0.0)
         loss = (
             verify_kl_weight * verify_kl
+            + rollout_kl_weight * rollout_kl
             + endpoint_weight * endpoint
             + ar_kl_weight * ar_kl
             + lam * (4.0 * ec + 2.0 * td)
@@ -451,6 +566,7 @@ class FlowDraftBlockWise(FlowDraft):
             {
                 f"{metric_prefix}/endpoint": endpoint,
                 f"{metric_prefix}/verify_kl": verify_kl,
+                f"{metric_prefix}/rollout_kl": rollout_kl,
                 f"{metric_prefix}/ar_kl": ar_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
