@@ -325,24 +325,48 @@ distributions; do not read one for the other.
 | checkpoints (FP32 DF head only; frozen backbone restored from HF) | `<output_dir>/last.ckpt`, `snap-*.ckpt` | `on_save_checkpoint` |
 | one JSON row per eval run | `results/eval.jsonl` | `src/eval.py` |
 | per-prompt eval detail | `results/eval-prompts.jsonl` | `src/eval.py` |
-| bench cells (`A`, `tpf`, raw per-cell lists) | `results/{final_ab,longer,six_k,fill}.json` | `bench/measure.py` |
-| figures | `results/figures/*.png` | `bench/figures.py` |
+| bench cells (`A`, `tpf`, raw per-cell lists) | `results/{final_ab,longer,six_k,fill}.json` | the measurement driver |
+| figures | `results/figures/*.png` | the figure script |
 
 ### Reproducing
 
+Every arm is `src/train.py` with a different set of loss weights; nothing else
+differs. Common to all: `model=smollm2_135m train.block_size=8
+train.anchors_per_sequence=1 data.batch_size=2 data.max_length=256
+data.shuffle_buffer=64 trainer.precision=32`.
+
 ```bash
-uv run python bench/final_ab.py              # five arms x 2000 steps
-TARGET=6000 uv run python bench/longer.py    # continue to 6000, snapshots at 4000
-CKPTS="orthrus=<ckpt>,fd_ms=<ckpt>" OUT=results/six_k.json \
-  PROMPTS=24 SEEDS=0,1,2,3,4 uv run python bench/measure.py
-uv run python bench/figures.py
+# masked                 (one component)
+train.variant=orthrus
+# masked + self-corr
+train.variant=orthrus train.selfcorrect_kl_weight=1.0
+# flow                   ([1] only)
+train.variant=flowdraft_block_wise train.prior_type=discunif \
+  train.verify_kl_weight=1.0 train.endpoint_weight=0.0 train.lambda=0.0 \
+  train.terminal_time_fraction=1.0 train.teacher_chain_tail_weight=0.3 \
+  'train.position_weights=[2.32,1.75,1.41,0.87,0.39,0.19,0.07]'
+# flow + self-corr       (add to the above)
+train.selfcorrect_kl_weight=1.0 train.selfcorrect_rounds=2 train.selfcorrect_s_min=0.0
+# flow + self-corr + CFM (instead of the zeros above)
+train.endpoint_weight=0.5 train.lambda=0.25 train.terminal_time_fraction=0.25 \
+  train.lambda_ramp_steps=500
 ```
 
-Two things the harness enforces after losing hours to each: a run counts as
-trained only when `global_step > 0` (Lightning writes `last.ckpt` on teardown
-after an exception too), and readiness is polled from the checkpoint rather than
-from process exit — training finishes and the process then hangs forever in
-pyarrow's thread-pool destructor.
+Longer horizons continue from a checkpoint with
+`resume_from_checkpoint=<path> trainer.max_steps=6000
+train.checkpoint_every_n_steps=2000 "train.checkpoint_name='snap-{step:07d}'"`
+(the quotes matter — Hydra's override grammar rejects a bare `{`).
+
+Acceptance is then read with `src/eval.py` per arm and schedule
+(`decode.jumps=1`, `'decode.jumps=[[0,1],[0.5,1]]'`, `decode.fixed_prior=true`),
+one JSON row per run into `results/eval.jsonl`.
+
+Two things worth carrying into any harness built on this: a run counts as
+trained only when `global_step > 0` — Lightning writes `last.ckpt` on teardown
+after an exception too, so the file's existence proves nothing — and readiness
+is best polled from that checkpoint rather than from process exit, because
+training finishes and the process then hangs indefinitely in pyarrow's
+thread-pool destructor.
 
 ## Background: the decoding bottleneck
 
