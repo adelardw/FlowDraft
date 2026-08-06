@@ -59,10 +59,21 @@ train:
   # own prediction, so a map reading its input would have scored ~2.3 rather
   # than 0. These two supply the missing pairs: the rollout visits the interior
   # nodes of the deployed schedule, the terminal atom the horizon t = 1.
+  # The verdict of the verifier, fed back on-policy. Confirmed positions enter
+  # the next jump clean at t=1, the corrected one clean, the tail after the
+  # break carrying the draft's own rejected guess at onpolicy_s. Under greedy
+  # consensus the verdict costs no forward -- it is an argmax comparison of two
+  # tensors the step already holds.
+  onpolicy_kl_weight: 1.0
+  onpolicy_s: 0.5
+  # Multi-jump needs BOTH of these or the composition is never trained: with
+  # anytime off only the terminal leg gets a target, and with grad_jumps=1 every
+  # earlier leg runs under no_grad. Everything measured at n=2 before this was
+  # measuring a map that had never been shown the composition.
   rollout_kl_weight: 1.0
   rollout_max_jumps: 2
-  rollout_grad_jumps: 1
-  rollout_anytime: false
+  rollout_grad_jumps: 2
+  rollout_anytime: true
   terminal_time_fraction: 0.25
   endpoint_weight: 0.5
   lambda: 0.25

@@ -1,181 +1,109 @@
-# Entrypoint config for src/train.py  →  @hydra.main(config_name="train")
-# Compose: `uv run python src/train.py`
-# Override:  `uv run python src/train.py model=qwen2_0.5b seed=0`
+# Entrypoint for src/train.py.  `uv run python src/train.py [+experiment=...]`
+# Rationale for the objective lives in the model docstrings, not here.
 
 defaults:
   - model: qwen3_1.7b
-  - data: nemotron  # training distribution (см. configs/data/)
-  - _self_          # keep last so values below override the groups above
+  - data: nemotron
+  - _self_
 
 seed: 42
-output_dir: checkpoints     # artifacts live at project root, gitignored
-# Lightning resume checkpoint. Unlike evaluation's `checkpoint`, this restores
-# model, AdamW, scheduler, global step, and callback state.
-resume_from_checkpoint: null
+output_dir: checkpoints
+resume_from_checkpoint: null   # Lightning resume: model + optimizer + step
 
-# TensorBoard is always written locally. Enable W&B to mirror the same
-# Lightning metrics; authenticate with `uv run wandb login` or WANDB_API_KEY.
 wandb:
   enabled: false
   project: flowdraft
-  entity: null              # W&B team/user; null uses the CLI/env default
-  name: null                # run display name; null lets W&B generate one
-  group: null               # optional experiment/ablation group
+  entity: null
+  name: null
+  group: null
   tags: []
-  offline: false            # true writes a local run for a later `wandb sync`
+  offline: false
 
-# --- training (FlowDraft.configure_optimizers) ---
 train:
-  variant: flowdraft        # Canonical variants:
-                            #   flowdraft | flowdraft_block_wise
-                            #   orthrus
-                            # Presets (see configs/experiment/):
-                            #   `+experiment=flowdraft_staged|orthrus|ablate_*`
-                            #   `+experiment=flowdraft_block_wise`
-  block_size: 64            # total K: one clean anchor + K-1 drafted positions
-  anchors_per_sequence: 1   # block-wise FlowDraft can flatten multiple isolated
-                            # width-K blocks into one DF pass; Orthrus uses 256
-  min_prefix: 1             # block-wise only: shortest clean prefix
-  respect_document_boundaries: true  # packed training: isolate DF documents / reject crossing blocks
-  lr: 1e-4                  # peak LR (the Orthrus paper uses 2e-4 at global batch 128x2048)
-  lr_schedule: cosine       # cosine (linear warmup -> cosine decay to 0, needs a finite
-                            #   trainer.max_steps or limit_train_batches+max_epochs) | constant
-  warmup_ratio: 0.05        # cosine only: fraction of total steps spent warming up
+  variant: flowdraft            # flowdraft | flowdraft_block_wise | orthrus
+  block_size: 64                # K = one clean anchor + K-1 drafted positions
+  anchors_per_sequence: 1       # block-wise: isolated blocks per DF pass (Orthrus uses 256)
+  min_prefix: 1
+  respect_document_boundaries: true   # constrains ANCHOR SELECTION only. The
+                                # block-wise attention still reads the whole AR
+                                # prefix through earlier documents, exactly as
+                                # the masked baseline does -- both arms share the
+                                # convention, so it is not a comparison defect
+
+  lr: 1e-4
+  lr_schedule: cosine           # cosine (needs a finite max_steps) | constant
+  warmup_ratio: 0.05
   weight_decay: 0.01
   betas: [0.9, 0.95]
-  prior_type: dirichlet     # x0 in x_s = (1-s) x0 + s x1. Two roles that pull apart:
-                            #   at s = 0 -- the ONLY state the deployed map reads at one
-                            #     jump -- the minimiser is constant in x0, since the target
-                            #     depends on the prefix alone. So the best object there is
-                            #     not a draw from any family but one consistent learned
-                            #     vector the frozen trunk can read as "unknown", which is
-                            #     what the masked baseline trains. Use `learned`.
-                            #   at s > 0 -- where endpoint/EC/TD live -- what matters is
-                            #     whether the input hides the answer. At V=151936 the clean
-                            #     token is the argmax of x_s once s exceeds 7.4e-5 under
-                            #     `dirichlet` (0.007% of samples ambiguous), 0.500 under
-                            #     `discunif` (50%), 0.815 under `gaussian` (81%). The
-                            #     reference implementation uses gaussian or discunif;
-                            #     dirichlet is this project's substitution.
-                            # dirichlet | discunif | gaussian (emitted at 1/sqrt(V), since
-                            # the input projection here is frozen and cannot absorb scale)
-  terminal_time_fraction: 0.0  # share of the batch forced onto t = 1. pi_{s,1} is the only
-                            # map the decode loop executes, and under every continuous
-                            # sampler it has probability zero -- 'paper' puts 1% of draws
-                            # above 0.99 -- so endpoint, EC and TD train t < 1 almost surely
-                            # and reach the deployed pair only through the smoothness of one
-                            # additive time vector. The reference implementation puts 75% of
-                            # its batch on the diagonal for the same reason.
-  gamma_clamp: 1.0e-4       # floor on (1-s) in gamma = (t-s)/(1-s). The reference clamps at
-                            # 0.05; 1e-4 admits gamma values three orders larger, and gamma
-                            # squared weights the drift term.
-  td_min_step: 0.01         # minimum finite-difference probe for the drift term. Below this
-                            # the difference of two bf16 softmaxes divided by the step and
-                            # squared amplifies quantisation noise by about 1e6.
-  time_sampling: paper      # paper: t~U[0,1], s~U[0,t] | triangle | sequential
-  lambda: 1.0               # weight of the ECLD part:
-                            #   loss = verify_kl_weight*verify_kl
-                            #        + endpoint_weight*endpoint
-                            #        + lambda*(4*EC + 2*TD)
-  endpoint_weight: 1.0      # categorical VFM diagonal CE; 0 = consistency-only ablation
-  teacher_target: soft      # how every teacher term matches p_AR. The two verification
-                            # rules read different things, so the metric-matched loss
-                            # differs by decoding mode -- and they disagree: a blurred
-                            # proposal is rejected by greedy yet accepted ~94% of the time
-                            # by sampling, a peaked one the reverse.
-                            #   soft -- KL(p_AR || pi). Surrogate for both, matched to
-                            #           neither; safe default.
-                            #   hard -- CE(argmax p_AR, pi). Greedy accepts iff the modes
-                            #           agree, so this targets the criterion directly. Use
-                            #           when decoding at temperature 0.
-                            #   tv   -- total variation. Speculative sampling accepts with
-                            #           probability sum(min(p, q)) = 1 - TV, so this IS the
-                            #           acceptance rate. Use when decoding with sampling.
-                            # None of them affects output quality: verification makes the
-                            # text identical to the AR model's either way. Only speed moves.
-  teacher_chain_tail_weight: 1.0  # Acceptance is judged against p_AR conditioned on the
-                            # tokens already ACCEPTED, i.e. under greedy verification the
-                            # frozen model's own greedy chain. The single AR pass conditions
-                            # on the CORPUS tokens instead, and the two agree only until the
-                            # model's top-1 first differs from the data -- about two positions
-                            # at ~55% agreement. This scales the teacher terms past that point:
-                            # 1.0 = previous behaviour, 0.0 = hard mask, in between trades bias
-                            # for keeping the deep positions from starving. Costs no forwards.
-  position_weights: null    # per-position weights for the teacher terms, e.g. the measured
-                            # prefix-survival curve [1, 0.882, 0.533, 0.265, 0.153, 0.084, 0.052].
-                            # TPF is a conjunction over the prefix, so position j is worth the
-                            # probability of reaching it; uniform weighting spends most of the
-                            # gradient past position 4, reached on a few percent of blocks.
-                            # Normalised to mean 1, so it does not change the effective LR.
-  # --- rollout: visits (s,t) pairs the deployed schedule uses --------------
-  # Removed once, then restored, and the reason changed on measurement. The
-  # checkpoint trained with the verifier term at (0,1) alone accepts EXACTLY
-  # zero tokens at two and four jumps against 2.34 at one. Freezing the entry
-  # state instead of transporting it recovers nothing distinguishable from
-  # zero, so the state is not the dominant variable -- the LABEL is. At (0.5,1)
-  # the map emits a different constant, and acceptance zero says that constant
-  # is the wrong token rather than an inconsistent one.
-  # The decisive check: under Dirichlet the transported state's argmax IS the
-  # first jump's own prediction (verified, 100% of draws), so a map copying its
-  # input would have returned its own draft and scored ~2.3. It scored 0. The
-  # map does not read its input at any s; it is c(ctx, s, t), trained at one
-  # pair. The rollout is the only term that visits other pairs with a real
-  # target, which is why it is back.
-  rollout_kl_weight: 0.0    # 0 = off, costs nothing when off
-  rollout_max_jumps: 2      # CONCENTRATE on the deployed schedule, do not spread. A uniform
-                            # draw over 1..8 spends most of the term on pairs no schedule
-                            # visits, which is the defect being fixed.
-  rollout_grad_jumps: 1     # terminal leg only. Backpropagating through composed legs lets
-                            # earlier ones optimise later ones' inputs -- a self-referential
-                            # objective on a map already collapsing to constants. Widen it
-                            # as an ablation, not as the starting point.
-  rollout_anytime: false    # supervise the TERMINAL leg against p_AR, not every step.
-                            # "If you stopped here" at every step trains each leg to be a
-                            # complete answer, so pi_{s1,1} approaches pi_{0,1} and the
-                            # schedule becomes an n-fold repetition of one map -- redundancy
-                            # trained in on purpose. Falsifiable: under the previous setting
-                            # n=2 should converge to n=1's draft.
-  rollout_stratified: true  # interior jump times one per equal bin, not a fixed grid
 
-  verify_kl_weight: 0.0     # KL(p_AR || pi_{0,1}(x_0)) on the pure prior -- the exact
-                            # state the decode loop enters every cycle at; the packed
-                            # block-wise preset enables it
+  # --- trajectory ---------------------------------------------------------
+  # prior_type decides whether x_s = (1-s)x0 + s x1 hides the answer. At
+  # V=151936 the clean token becomes the argmax of x_s once s exceeds 7.4e-5
+  # under dirichlet, 0.5 under discunif, 0.815 under gaussian. dirichlet is
+  # this project's substitution and is kept only to reproduce older runs.
+  prior_type: discunif          # discunif | gaussian | dirichlet
+  time_sampling: paper          # paper: t~U[0,1], s~U[0,t] | triangle | sequential
+  terminal_time_fraction: 0.0   # share of the batch forced onto t = 1, the only
+                                # pair the decode loop executes
+  anchor_point: trajectory      # diagonal input: trajectory pi_{t,t}(x_t) | landing
+  gamma_clamp: 1.0e-4           # floor on (1-s) in gamma = (t-s)/(1-s)
+  td_min_step: 0.01             # minimum finite-difference probe for the drift term
 
-  lambda_ramp_steps: 0      # staged CFM training: ramp lambda 0 -> lambda over N steps
-                            #   (diagonal endpoint inference first, consistency second); 0 = static
-  checkpoint_name: flowdraft-{step:07d}   # ModelCheckpoint filename pattern
-  anchor_point: trajectory  # where endpoint inference evaluates the diagonal pi_{t,t}:
-                            #   trajectory --> pi_{t,t}(x_t) | landing (X_{s,t}(x_s)) --> pi_{t,t}(X_{s,t}(x_s))
-  checkpoint_every_n_steps: 1000  # unconditional recovery snapshots; optimizer steps, not batches
-  checkpoint_save_top_k: 2        # number of best validation-metric checkpoints to retain
+  # --- objective ----------------------------------------------------------
+  #   loss = verify_kl_weight   * KL(p_AR || pi_{0,1}(x0))
+  #        + selfcorrect_kl_w   * KL(p_AR(.|draft) || pi_{s,1}(x_s carrying draft))
+  #        + endpoint_weight    * CE(x1, pi_{t,t})
+  #        + lambda * (4*EC + 2*TD)
+  verify_kl_weight: 0.0
+  selfcorrect_kl_weight: 0.0    # the multi-step term: walks the jump schedule, each
+                                # leg supervised by the AR sweep of the leg before it
+  selfcorrect_rounds: 2         # legs after the first; costs r DF + (r-1) AR forwards
+  selfcorrect_s_min: 0.0        # entry times stratified in (s_min, 1). The leg reads
+                                # (1-s)x0' + s q, so s near 1 hands it the draft itself
+                                # -- the Jacobi operator -- and s near 0 buries the draft
+                                # under prior noise at a frozen embedding
+  selfcorrect_tail_weight: 0.5  # trust in positions past the verifier's break
+  endpoint_weight: 1.0
+  lambda: 1.0                   # ECLD weight
+  lambda_ramp_steps: 0          # ramp lambda 0 -> lambda over N steps; 0 = static
+
+  teacher_target: soft          # soft KL | hard CE(argmax) | tv (= sampled acceptance)
+  teacher_source: corpus        # what p_AR is conditioned on. corpus = the packed
+                                # sequence, valid only until the greedy chain diverges
+                                # from the data (~2 positions). onpolicy = the AR sweep
+                                # over the drafter's own block, EXACT up to the verifier's
+                                # break and corpus-conditioned beyond it. Costs one AR
+                                # forward, free once a self-correction term is on.
+  teacher_chain_tail_weight: 1.0  # weight past the first divergence of the greedy
+                                # chain from the corpus; 1.0 = off, 0.0 = hard mask
+  position_weights: null        # per-position dE/da_j, e.g. [2.32, 1.75, 1.41, 0.87,
+                                # 0.39, 0.19, 0.07]; normalised to mean 1
+  log_train_acceptance: false   # exact greedy acceptance every step (free once any
+                                # on-policy term is on, one AR forward otherwise)
+
+  # --- checkpointing / validation ----------------------------------------
+  checkpoint_name: flowdraft-{step:07d}
   best_checkpoint_name: best-tpf-{step:07d}
-  final_checkpoint_name: last.ckpt  # always overwritten with the true terminal state
-  # Target-metric validation: run the real decode loop (single-jump) on a few
-  # val prompts each validation -> val/tpf & val/acceptance_decode curves.
-  val_decode_prompts: 2     # 0 = off; raise (8+) if checkpoint selection looks noisy
+  final_checkpoint_name: last.ckpt
+  checkpoint_every_n_steps: 1000
+  checkpoint_save_top_k: 2
+  monitor: val/tpf              # val/tpf (target metric, noisy) | val/loss + min
+  monitor_mode: max
+  early_stop_patience: 5        # validations without val/loss improvement; 0 = off
+  val_decode_prompts: 2         # real decode loop on N val prompts; 0 = off
   val_decode_max_new: 32
-  val_decode_jumps: 1       # jump schedule the VALIDATION decode uses -- int, or a list like
-                            # [0, 0.85, 1]. monitor: val/tpf selects checkpoints on this, so
-                            # a run targeting multi-step must set it, or it will select and
-                            # early-stop on single-step throughput instead.
-  monitor: val/tpf          # checkpoint selection: val/tpf (beat the baseline on the
-  monitor_mode: max         #   target metric; NOISY early) | val/loss + min (smooth)
-  early_stop_patience: 5    # stop if val/loss fails to improve N validations in a row; 0 = off
+  val_decode_jumps: 1           # schedule validation decodes with; int, [times],
+                                # or [[s,t],...]. monitor: val/tpf selects on THIS
 
-# Lightning Trainer kwargs, passed through verbatim (см. src/train.py)
 trainer:
   accelerator: auto
   devices: auto
-  strategy: auto             # auto selects DDP when multiple GPU devices are requested
+  strategy: auto
   precision: bf16-mixed
-  max_steps: 10000            # -1 = no step bound (then bound by max_epochs)
-  max_epochs: null            # repetitions of the stream; see "Повторение потока" in README
-  limit_train_batches: null   # batches per repetition; null = the whole stream
+  max_steps: 10000
+  max_epochs: null
+  limit_train_batches: null
   val_check_interval: 500
   log_every_n_steps: 10
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
-
-# data.* lives in configs/data/ (defaults: nemotron); override fields inline:
-#   `uv run python src/train.py data.batch_size=8 data.max_length=1024`
-# block_size / jump_count are method knobs (ablated per the slides)

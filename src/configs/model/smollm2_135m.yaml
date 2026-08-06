@@ -1,0 +1,27 @@
+# Fast end-to-end test scale: `model=smollm2_135m`. Llama architecture, so it
+# runs the portable dense DF path -- the Qwen3 sparse dual-pass kernel (and
+# hence train.anchors_per_sequence > 1) is not available here.
+
+name: HuggingFaceTB/SmolLM2-135M-Instruct
+
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: sdpa
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false
+
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right
+  trust_remote_code: false
+
+adapter:
+  # Llama has no per-head Q/K norms; Orthrus still keeps an independent
+  # diffusion output projection alongside Q/K/V.
+  w_names: [q_proj, k_proj, v_proj, o_proj]

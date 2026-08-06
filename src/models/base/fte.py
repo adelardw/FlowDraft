@@ -42,15 +42,31 @@ class FlowTimeEmbedding(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def _sinusoidal(self, x):
-        """``[B]`` times in [0, 1] -> ``[B, freq_dim]`` features (fp32)."""
+        """Times in [0, 1] -> sinusoidal features (fp32), one extra last axis.
+
+        ``[B] -> [B, freq_dim]`` and ``[B, L] -> [B, L, freq_dim]``. The second
+        form is what lets different POSITIONS of the same block carry different
+        times, which is the only way to say "this position is confirmed clean,
+        that one is a rejected guess, that one is fresh" — the state a decode
+        cycle actually hands to the next one.
+        """
         half = self.freq_dim // 2
         freqs = torch.exp(
             -math.log(self.max_period) * torch.arange(half, device=x.device, dtype=torch.float32) / half
         )
-        args = x.to(torch.float32)[:, None] * 1000.0 * freqs[None]
+        args = x.to(torch.float32).unsqueeze(-1) * 1000.0 * freqs
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, s, t):
+        """``(s, t)`` shaped ``[B]`` -> ``[B, hidden]``; ``[B, L]`` -> ``[B, L, hidden]``.
+
+        Scalar-per-sequence times go through unchanged, bit for bit, so every
+        existing checkpoint keeps loading and every existing run keeps its
+        behaviour: the parameters are identical, only the batching of the input
+        differs.
+        """
+        if s.shape != t.shape:
+            raise ValueError(f"s and t must share a shape, got {tuple(s.shape)} and {tuple(t.shape)}")
         second = t if self.parameterisation == "pair" else (t - s).clamp_min(0.0)
         features = torch.cat([self._sinusoidal(s), self._sinusoidal(second)], dim=-1)
         return self.mlp(features.to(self.mlp[0].weight.dtype))

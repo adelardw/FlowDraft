@@ -201,3 +201,9 @@ PROVENANCE.md
 
 # Rejected work kept out of the tree
 bucket/
+
+# Локальные артефакты стенда, которые не должны ехать в репозиторий
+.work/papers/          # PDF источников — не наши, 4.3 МБ
+.work/rollback/        # снимки состояния сессии
+.work/*.trainlog
+results/eval-prompts.jsonl   # построчный дамп eval, гигабайты при полном прогоне

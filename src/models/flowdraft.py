@@ -72,7 +72,11 @@ class FlowDraft(L.LightningModule):
     @contextmanager
     def _frozen_val_rng(self, batch_idx: int):
         """Make stochastic validation inputs repeatable without perturbing training."""
-        devices = None if self.device.type == "cpu" else [self.device]
+        # An EMPTY device list, not None: with None ``fork_rng`` enumerates every
+        # device of the given type and asks each for its RNG state, and
+        # ``torch.cpu`` exposes no ``get_rng_state``. The CPU generator is forked
+        # regardless, which is the one this needs.
+        devices = [] if self.device.type == "cpu" else [self.device]
         with torch.random.fork_rng(devices=devices, device_type=self.device.type):
             torch.manual_seed(int(self.cfg.seed) * 1_000_003 + batch_idx)
             yield
@@ -395,6 +399,33 @@ class FlowDraft(L.LightningModule):
         direction with usable room, shorten the probe at a boundary, and give
         degenerate samples no TD weight.
         """
+        # A finite difference of two softmaxes is only as good as the precision
+        # the logits were computed in. Measured at V = 151936 on realistic
+        # logits, the bf16 rounding alone contributes this much of the term:
+        #
+        #     dt      signal    bf16 noise    SNR
+        #     0.01    0.0019    0.0374        0.05
+        #     0.05    0.0022    0.0084        0.26
+        #     0.10    0.0015    0.0041        0.35
+        #
+        # Under bf16 the term measures rounding, not drift, at EVERY usable
+        # step: the noise scales as 1/dt while the signal does not, so no clamp
+        # rescues it. Refuse rather than train on it silently. The exact fix is
+        # a directional derivative through the time embedding (t is already a
+        # differentiable input, so forward-mode AD gives d_t pi with no
+        # difference at all); until that exists, run this term in fp32.
+        try:
+            precision = str(self.trainer.precision)
+        except RuntimeError:  # not attached to a Trainer (unit tests, probes)
+            precision = "32"
+        if "16" in precision:
+            raise ValueError(
+                f"train.lambda > 0 puts weight on the drift term, but "
+                f"trainer.precision={precision!r} makes it numerically empty: "
+                "the bf16 rounding of the two softmaxes exceeds the drift it is "
+                "differencing by 4-20x at every usable step. Use "
+                "trainer.precision=32, or set train.lambda=0"
+            )
         dt_val = 0.05
         prefer_forward = (t + dt_val <= 1.0) | (1.0 - t >= t - s)
         room = torch.where(prefer_forward, 1.0 - t, t - s)
@@ -495,18 +526,6 @@ class FlowDraft(L.LightningModule):
             if endpoint_live.any()
             else diag_logits.sum() * 0.0
         )
-        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
-        if ar_kl_weight:
-            if teacher_logits is None:
-                raise ValueError("teacher logits are required when train.ar_kl_weight > 0")
-            ar_kl = self._masked_kl(
-                F.log_softmax(teacher_logits[:, :-1].float(), -1),
-                F.log_softmax(diag_logits[:, 1:].float(), -1),
-                live[:, 1:],
-            )
-        else:
-            ar_kl = diag_logits.sum() * 0.0
-
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
         # the jump must agree with the (stop-grad) expert
         # asked at its own landing point X_{s,t}(x_s) — a level-t input.
@@ -548,15 +567,10 @@ class FlowDraft(L.LightningModule):
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
         )
-        loss = (
-            endpoint_weight * endpoint
-            + ar_kl_weight * ar_kl
-            + lam * (4.0 * ec + 2.0 * td)
-        )
+        loss = endpoint_weight * endpoint + lam * (4.0 * ec + 2.0 * td)
         self.log_dict(
             {
                 f"{metric_prefix}/endpoint": endpoint,
-                f"{metric_prefix}/ar_kl": ar_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
                 f"{metric_prefix}/lambda": lam,
@@ -573,11 +587,44 @@ class FlowDraft(L.LightningModule):
 
     @staticmethod
     def _jump_schedule(jumps):
-        """int n -> n equal jumps over linspace(0, 1); list -> validated as-is."""
-        times = torch.linspace(0, 1, jumps + 1).tolist() if isinstance(jumps, int) else list(jumps)
-        if times[0] != 0 or times[-1] != 1 or any(a >= b for a, b in zip(times, times[1:])):
-            raise ValueError(f"jump schedule must increase from 0 to 1, got {times}")
-        return times
+        """Normalise a schedule to a list of ``(s, t)`` legs.
+
+        Three accepted forms:
+
+        * ``int n`` — n equal legs over ``linspace(0, 1)``: ``(0, 1/n),
+          (1/n, 2/n), ...``. Each leg advances the state a little.
+        * ``list of times`` ``[0, u, 1]`` — the same thing written out.
+        * ``list of pairs`` ``[(0, 1), (s, 1)]`` — legs that need NOT chain.
+          ``(s, 1)`` after ``(0, 1)`` means "draft the whole way, then re-enter
+          the family at s carrying that draft", which is a different operation
+          from splitting the interval and the only one the self-correction term
+          trains: it supervises ``π_{s,1}`` on a state built from the model's
+          own completed draft, never on a half-advanced interpolant. A schedule
+          of chained legs asks the map questions at pairs whose inputs it was
+          not shown.
+
+        Every leg must satisfy ``0 <= s < t <= 1``; the first must start at 0
+        and the last must end at 1, so the deployed map is still ``·, 1``.
+        """
+        if isinstance(jumps, int):
+            times = torch.linspace(0, 1, jumps + 1).tolist()
+            legs = list(zip(times[:-1], times[1:]))
+        else:
+            items = list(jumps)
+            if items and isinstance(items[0], (list, tuple)):
+                legs = [(float(a), float(b)) for a, b in items]
+            else:
+                times = [float(x) for x in items]
+                legs = list(zip(times[:-1], times[1:]))
+        if not legs:
+            raise ValueError("jump schedule must contain at least one leg")
+        if any(not 0.0 <= s < t <= 1.0 for s, t in legs):
+            raise ValueError(f"every leg must satisfy 0 <= s < t <= 1, got {legs}")
+        if legs[0][0] != 0.0 or legs[-1][1] != 1.0:
+            raise ValueError(
+                f"a schedule must start at s=0 and finish at t=1, got {legs}"
+            )
+        return legs
 
     @staticmethod
     def verify_greedy(draft_ids, last_logits, verify_logits):
@@ -710,6 +757,20 @@ class FlowDraft(L.LightningModule):
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Dirichlet noise -> jump schedule via :meth:`predict`.
 
+        ``carry`` — ``(q_prev, n_accepted)`` from the cycle that just ended, the
+        decode-side half of ``onpolicy_kl_weight``. Today every cycle throws its
+        rejected tail away and starts from pure noise, which is the one place
+        where a diffusion drafter is strictly worse informed than it needs to
+        be: it already guessed those tokens, and the verifier already told it
+        where the guess went wrong.
+
+        The shift is ``n_accepted + 1``, not one: the verifier consumed the
+        accepted prefix AND replaced the first mismatch with its own token, so
+        the new block's position ``j`` is the old block's ``n_accepted + 1 + j``.
+        Carried positions enter at ``decode.onpolicy_s`` and fresh ones at 0 --
+        different times in the same block, which is why this needs per-position
+        conditioning. It costs no forward: the state is already in hand.
+
         The final simplex point IS the proposal distribution ``q`` (a convex
         mix of distributions stays on the simplex): greedy takes its argmax,
         sampling draws from it. The shared cache stays AR-only: the adapter
@@ -766,15 +827,26 @@ class FlowDraft(L.LightningModule):
             dtype=torch.long,
             device=x.device,
         )
-        # Diagnostic: re-enter every jump from the ORIGINAL prior instead of the
-        # transported state. If acceptance is unchanged, the map is not reading
-        # its input and the two-time family is doing no work — the drafter has
-        # collapsed onto a context-only predictor, which is what a
-        # state-independent teacher target is minimised by.
-        frozen = bool(decode_cfg.get("frozen_state", False))
-        entry = x
-        for s_i, t_i in zip(times[:-1], times[1:]):
-            x = self.predict(entry if frozen else x, mask, s_i, t_i, past_key_values=cache)
+        previous_t = None
+        for leg, (s_i, t_i) in enumerate(times):
+            if previous_t is not None and abs(s_i - previous_t) > 1e-9:
+                # This leg does not continue the previous one: it RE-ENTERS the
+                # family at s_i. The state it should read is the one training
+                # built at that time — a fresh prior draw mixed with the draft
+                # in hand — not the transported point left by the previous leg,
+                # which sits at a different time and would put the map at a pair
+                # it was never shown. Rebuilding it here is what makes a
+                # schedule like [(0,1), (0.5,1)] the operation it reads as.
+                fresh = self.sample_prior(x)
+                x = (1.0 - s_i) * fresh + s_i * x
+                if anchor is not None:
+                    x = torch.cat([anchor, x[:, 1:]], dim=1)
+            previous_t = t_i
+            # One scalar time per leg. A per-position clock existed here for the
+            # carried-tail state; that state is gone (bucket/README.md), and with
+            # it the only caller. Announcing per-position times when the block is
+            # NOT mixed is the conditioning that cost 1.16 TPF when it slipped in.
+            x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
             if anchor is not None:
                 x = torch.cat([anchor, x[:, 1:]], dim=1)  # keep the clean position clean
         fresh = x[:, 1:] if anchor is not None else x
@@ -870,7 +942,7 @@ class FlowDraft(L.LightningModule):
                 cache, block_size, times,
                 sample=temperature > 0 and not coupled, anchor_token=pending,
             )
-            n_forwards += len(times) - 1
+            n_forwards += len(times)
             if temperature > 0 and coupled:
                 # keys = indices of the tokens these positions would emit;
                 # g_all[j] targets generated token (len(emitted) + j)
@@ -1022,8 +1094,19 @@ class FlowDraft(L.LightningModule):
         """
         logits = self(x_s, mask, use_df=True, s=s, t=t, past_key_values=past_key_values).logits
         pi = logits.float().softmax(-1)
-        s = torch.as_tensor(s, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
-        t = torch.as_tensor(t, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
+        s = torch.as_tensor(s, dtype=pi.dtype, device=pi.device)
+        t = torch.as_tensor(t, dtype=pi.dtype, device=pi.device)
+        # gamma follows the shape of the times: one per sequence broadcasts over
+        # the block as before; one per POSITION gives each position its own
+        # transport, which is what a block of mixed stages needs -- a confirmed
+        # token at t = 1 must be left where it is while a fresh slot moves the
+        # whole way.
+        if s.dim() <= 1 and s.numel() <= pi.size(0):
+            s = s.reshape(-1, 1, 1)
+            t = t.reshape(-1, 1, 1)
+        else:
+            s = s.reshape(pi.size(0), -1, 1)
+            t = t.reshape(pi.size(0), -1, 1)
         gamma = (t - s) / (1.0 - s).clamp(min=float(self.cfg.train.get("gamma_clamp", 1e-4)))
         return x_s + gamma * (pi - x_s)
 
@@ -1040,8 +1123,8 @@ class FlowDraft(L.LightningModule):
         )
         teacher_logits = None
         # The frozen teacher is unnecessary for paper-faithful endpoint
-        # training. Keep it for validation metrics and optional AR-KL runs.
-        if not self.training or self.cfg.train.get("ar_kl_weight", 0.0):
+        # training; validation metrics still need it.
+        if not self.training:
             with torch.no_grad(), self._teacher_eval():
                 teacher_logits = self.orthrus(
                     ids,
@@ -1150,9 +1233,10 @@ class FlowDraft(L.LightningModule):
         # Reduce sums and counts instead of averaging rank-local means. This
         # remains correct when the final validation shard is uneven, and all
         # ranks participate even if one rank had no usable prompt.
-        position_hits = self._val_decode_position_hits.to(self.device)
-        cycle_sums = self._val_decode_cycle_sums.to(self.device)
-        cycle_counts = self._val_decode_cycle_counts.to(self.device)
+        accum = self._accum_dtype(self.device)
+        position_hits = self._val_decode_position_hits.to(self.device, accum)
+        cycle_sums = self._val_decode_cycle_sums.to(self.device, accum)
+        cycle_counts = self._val_decode_cycle_counts.to(self.device, accum)
         stats = torch.cat(
             [
                 torch.tensor(
@@ -1163,7 +1247,7 @@ class FlowDraft(L.LightningModule):
                         len(self._val_decode_accs),
                         self._val_decode_cycle_count,
                     ],
-                    dtype=torch.float64,
+                    dtype=accum,
                     device=self.device,
                 ),
                 position_hits,
@@ -1228,6 +1312,18 @@ class FlowDraft(L.LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
+
+    @staticmethod
+    def _accum_dtype(device=None):
+        """Widest accumulator this device actually has.
+
+        Sums of counts and of per-token losses are accumulated in float64 for
+        exactness across a whole validation epoch. MPS has no float64 at all --
+        it raises rather than downcasting -- and every such call sat on a code
+        path that only the masked baseline reaches, so the baseline was simply
+        untrainable on Apple silicon while looking like a stalled process.
+        """
+        return torch.float32 if device is not None and device.type == "mps" else torch.float64
 
     @staticmethod
     def _decode_acceptance_parts(acceptance, drafted, max_cycles):

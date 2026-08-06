@@ -22,6 +22,7 @@
 - [Overview](#overview)
 - [Quickstart](#quickstart)
 - [Experiments (task stages)](#experiments-task-stages)
+- [SmolLM2-135M bench: what the loss terms actually buy](#smollm2-135m-bench-what-the-loss-terms-actually-buy)
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
@@ -141,7 +142,7 @@ The command summary:
 ./hf-auth.sh uv run python src/train.py +experiment=orthrus
 
 # Stages 2-3 — flow-map drafter, staged VFM/ECLD (endpoint first, consistency ramped in)
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_staged
+./hf-auth.sh uv run python src/train.py +experiment=flowdraft_packed_blockwise
 
 # Stage 4 — lossless at sampling: coupled = bitwise; uncoupled = null-calibrated TV test
 ./hf-auth.sh uv run python src/eval.py model=qwen3_1.7b checkpoint=<ckpt> decode.temperature=0.8
@@ -149,8 +150,6 @@ The command summary:
     decode.coupled=false decode.equiv_samples=500
 
 # Stage 5 (ablations) — the contribution of each distillation term
-./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only
-./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only
 
 # Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
 #           (data=nemotron evaluates on the training distribution);
@@ -180,6 +179,170 @@ To mirror the same metrics to Weights & Biases, authenticate once with
 ```
 
 Use `wandb.offline=true` to record locally and upload later with `wandb sync`.
+
+## SmolLM2-135M bench: what the loss terms actually buy
+
+A small stand for settling design questions before they cost a Qwen3 run.
+SmolLM2-135M, nemotron, `block_size=8`, `anchors_per_sequence=1`, decoded on
+**math500** (never seen in training). **Qwen3-1.7B is the next stage; nothing
+here is a headline result.**
+
+Unit of observation is the pair (prompt, seed): 24 prompts x 5 seeds =
+**120 cells** per point, `decode.fixed_prior=true`. Both noise axes are real —
+the same checkpoint on the same prompts drifts by up to 0.16 tokens across prior
+draws — so every contrast is **paired on both**, never a difference of means.
+Each arm is measured at **three training horizons**, because a single horizon
+cannot tell a converging gap from a noisy one, and because between-snapshot
+spread on an unchanged objective reaches 0.5 tokens.
+
+### The objective, term by term
+
+```
+L = w_verify · KL( p_AR ‖ pi_{0,1}(x0) ) · u_j                                [1]
+  + w_self   · (1/r) SUM_k KL( p_AR(· | argmax q_{k-1}) ‖ pi_{s_k,1}(x_k) ) · v_j · u_j
+  + w_end    · CE( x1, pi_{t,t}(x_t) )                                        [2]
+  + lambda   · ( 4 · CE( sg pi_{t,t}(X_{s,t}(x_s)), pi_{s,t}(x_s) ) + 2 · ||d_t pi_{s,t}||^2 · gamma^2 )
+
+x0 ~ prior,  x_s = (1-s) x0 + s x1,  gamma = (t-s)/(1-s),  X_{s,t}(x) = x + gamma (pi - x)
+
+q_0  = pi_{0,1}(x0)                     the jump the decode loop executes
+x_k  = (1-s_k) x0' + s_k q_{k-1}         restart carrying the previous leg's draft
+q_k  = pi_{s_k,1}(x_k),  detached between rounds,  s_1 < ... < s_r in (s_min, 1)
+
+u_j = chain-validity gate x prefix-survival weights dE/da_j
+v_j = 1 on the verifier-confirmed prefix, `selfcorrect_tail_weight` past the break
+```
+
+[1] is the only pair the decode loop runs at `jumps=1`. Its target is
+corpus-conditioned, so the drafter's state cannot change the target's *value*,
+and reading that state cannot lower the loss **at any capacity**. [2] and the
+`lambda` block are the categorical-flow-map structure.
+
+**Self-correction is the only term whose target the state enters.** One frozen AR
+forward over the drafter's own proposal yields `p_AR(· | ctx, draft_{<j})` plus
+the exact greedy verdict; the map is trained to answer, from a state carrying
+that draft, what the verifier would say about it. Writing one Jacobi sweep as
+`T(ctx,d)_j = argmax p_AR(· | ctx, d_{<j})`: if the map realises `T`, then `n`
+composed jumps fix positions `1..n`, so `A_n >= min(n, K-1)` — deterministic
+verifier, no new information. That guarantee alone yields `TPF <= 1`, exactly AR
+speed: the term makes multi-step **meaningful**, not cheap.
+
+The masked baseline gets the same term in the only state masked diffusion can
+express — some positions committed, the rest re-masked
+(`Orthrus._masked_selfcorrect`) — which is precisely its own
+confidence-ordered-unmasking schedule. Running the two against each other
+separates *training for the procedure* from *the state being continuous*.
+
+### The five arms
+
+Named by what their objective contains, not by their script key. All five share
+the data, the schedule, the backbone and the budget; only the terms differ.
+
+| name | terms switched on | script key |
+|---|---|---|
+| **masked** | Orthrus's masked-block KL — one component | `orthrus` |
+| **masked + self-corr** | + `[2]` on the masked state (its own re-masking schedule) | `orthrus_ms` |
+| **flow** | `[1]` only: verify KL on the simplex prior, position weights | `fd_base` |
+| **flow + self-corr** | `[1]` + `[2]`: the jump schedule with the on-policy sweep | `fd_ms` |
+| **flow + self-corr + CFM** | + `[3]` and `[4]`: diagonal anchor, EC, drift | `fd_cfm_ms` |
+
+### Results
+
+Acceptance against training budget, one panel per schedule:
+
+![horizon grid](results/figures/horizon_grid.png)
+
+Best configuration at 6000 steps is **masked + self-corr** — **A@1 / A@2 / A@4 = 1.399 | 1.639 | 2.719**,
+TPF@1 = 1.199.
+
+![acceptance vs jumps](results/figures/acceptance_vs_jumps.png)
+
+![paired contrasts](results/figures/contrasts.png)
+
+### What holds, by strength of evidence
+
+With ~36 contrasts the Bonferroni bar is `|t| > 3.2`. Three findings clear it and
+are also backed by a monotone trend across horizons:
+
+**1. Self-correction is what makes acceptance grow with jumps.** Without it the
+flow-map arm *degrades*: **flow** alone reaches A@4/A@1 = 0.71. With it, `+1.539` tokens at
+`n=4` (t = 11.5). Within-arm growth `A@2 - A@1` is `+0.578` (t = 8.6).
+
+**2. Training the masked drafter for its own multi-step schedule beats it.**
+**masked + self-corr** over **masked** at `n=1` runs `-0.034  +0.095  +0.105` across
+2000/4000/6000 — monotone, t = 3.6 at the end. Orthrus's own paper reports
+multi-step denoising costing 44% of throughput and concludes single-step
+projection is optimal; that conclusion is an artefact of never training for it.
+
+**3. The continuous state pays at two jumps.** **flow + self-corr** over **masked + self-corr** at `n=2` runs
+`-0.020  +0.114  +0.238` — monotone increasing, t = 3.0 at 6000. It
+does *not* pay at one jump (`-0.015  -0.065  -0.099`) or at four
+(`-0.996  -0.050  -0.308`).
+
+**The CFM structure does not pay.** **flow + self-corr + CFM** over **masked + self-corr** at `n=4` runs
+`-1.183  -0.546  -0.631` — negative in all nine cells. The gap
+narrows with budget (it is the slowest arm to converge, and twice the wall-clock
+per step), but at 6000 it is still `-0.63` at t = -6.5. Not supported here.
+
+**TPF stays below 1.0 at every `n > 1`.** Multi-step raises acceptance, not
+throughput; the only configuration faster than plain AR is **masked + self-corr** at `n=1`.
+
+### Budget is a confound, and it bit once
+
+![training horizon](results/figures/training_horizon.png)
+
+At 2000 steps the multi-step contrast was *negative* and the honest reading was
+"multi-step training does not help". At 4000 and 6000 the sign flips and holds.
+The one-component objective plateaus between 2000 and 4000; multi-component ones
+keep improving. **Any ablation of a loss term needs a horizon long enough for
+that term to converge, or it measures convergence speed instead.**
+
+![training curves](results/figures/training_curves.png)
+
+`loss/accepted` — the exact greedy accepted-prefix length, measured on every
+block of every step by the on-policy forward the self-correction term already
+pays for — declines late in the **flow + self-corr** run while its math500 acceptance keeps
+rising. Training-block acceptance and held-out decode acceptance are different
+distributions; do not read one for the other.
+
+### Known limits (what the next stage must fix)
+
+- **One training seed per arm.** The intervals cover decode noise, not
+  training-run variance. Between-snapshot spread on an unchanged objective
+  reaches 0.5 tokens — larger than every contrast in finding 3. Multiple seeds
+  are what would move findings 2-3 from "trend plus t" to settled.
+- **One eval dataset.** math500 only. gsm8k / humaneval / mbpp configs exist.
+- **One scale.** 135M, `anchors_per_sequence=1`, `K=8`.
+- `val_decode_prompts=0` in these runs, so no checkpoint was selected on
+  `val/tpf`. Turn it back on for anything longer.
+
+### Where things are written
+
+| what | where | by |
+|---|---|---|
+| per-step scalars (`train/loss`, `loss/verify_kl`, `loss/selfcorrect_kl`, `loss/ec`, `loss/td`, `loss/accepted`) | `<output_dir>/lightning_logs/version_*/events.out.tfevents.*` | Lightning TensorBoard logger |
+| validation decode (`val/tpf`, `val/acceptance_pos_*`) | same event file | `_maybe_decode_val` |
+| checkpoints (FP32 DF head only; frozen backbone restored from HF) | `<output_dir>/last.ckpt`, `snap-*.ckpt` | `on_save_checkpoint` |
+| one JSON row per eval run | `results/eval.jsonl` | `src/eval.py` |
+| per-prompt eval detail | `results/eval-prompts.jsonl` | `src/eval.py` |
+| bench cells (`A`, `tpf`, raw per-cell lists) | `results/{final_ab,longer,six_k,fill}.json` | `.work/measure.py` |
+| figures | `results/figures/*.png` | `.work/figures.py` |
+
+### Reproducing
+
+```bash
+uv run python .work/final_ab.py              # five arms x 2000 steps
+TARGET=6000 uv run python .work/longer.py    # continue to 6000, snapshots at 4000
+CKPTS="orthrus=<ckpt>,fd_ms=<ckpt>" OUT=.work/six_k.json \
+  PROMPTS=24 SEEDS=0,1,2,3,4 uv run python .work/measure.py
+uv run python .work/figures.py
+```
+
+Two things the harness enforces after losing hours to each: a run counts as
+trained only when `global_step > 0` (Lightning writes `last.ckpt` on teardown
+after an exception too), and readiness is polled from the checkpoint rather than
+from process exit — training finishes and the process then hangs forever in
+pyarrow's thread-pool destructor.
 
 ## Background: the decoding bottleneck
 
@@ -224,7 +387,7 @@ The drafter learns two complementary parts of a categorical flow map:
 - **Endpoint inference — *what endpoint belongs to the trajectory*.** The diagonal predictor is trained by categorical VFM against the clean endpoint used to construct the interpolant.
 - **Self-consistency — *how to jump*.** The reliable diagonal prediction at a transported state teaches the harder long-jump predictor through ECLD.
 
-The ECLD target is stop-gradiented. An AR-verifier KL can be enabled as a separate auxiliary with `train.ar_kl_weight`, but defaults to zero because it is not part of the paper's CFM objective.
+The ECLD target is stop-gradiented. Verifier alignment lives in `train.verify_kl_weight` (the pair the decode loop executes) and `train.selfcorrect_kl_weight` (the same alignment along the drafter's own jump schedule).
 
 The AR model remains frozen throughout. In paper-faithful CFM training it supplies the cached prefix for the block-wise geometry and validation targets; at inference it verifies every proposal, which is what guarantees losslessness.
 
@@ -246,7 +409,7 @@ The AR model remains frozen throughout. In paper-faithful CFM training it suppli
 One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained with VFM endpoint inference plus ECLD. Implemented; large-scale validation pending.
 
 - **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
-- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + endpoint_weight·endpoint + ar_kl_weight·AR_KL + λ·(4·EC + 2·TD)`
+- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL + endpoint_weight·endpoint + λ·(4·EC + 2·TD)`
   - **verify KL** — block-wise inference alignment: `KL(sg(p_AR) ‖ π_{0,1}(x_0))` on the exact one-jump query used by decoding.
   - **endpoint** — `CE(x1, π_{t,t}(x_t))`: the paper's categorical VFM diagonal objective. The paper-faithful evaluation point is `train.anchor_point=trajectory`; `landing` is retained as an experimental option.
   - **AR KL** — optional `KL(sg(p_AR) ‖ π_{t,t})`, separately weighted and off by default because it is not part of the CFM objective.
@@ -278,12 +441,11 @@ FlowDraft/
     ├── configs/                   # hydra configs
     │   ├── train.yaml             # training entrypoint config
     │   ├── eval.yaml              # evaluation entrypoint config
-    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | llama3_3b
+    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | smollm2_135m
     │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
     │   └── experiment/            # one preset per task stage + additions:
-    │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
-    │                              #   ablate_consistency_only | flowdraft_block_wise
-    ├── train.py                   # training entrypoint
+    │                              #   orthrus | flowdraft_packed_blockwise
+    │                                  ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
 ```
@@ -318,7 +480,7 @@ on-device, never in the batch.
 ```bash
 ./hf-auth.sh uv run python src/train.py                            # FlowDraft (the task's recipe)
 ./hf-auth.sh uv run python src/train.py +experiment=orthrus       # task presets: orthrus |
-                                                                   #   flowdraft_staged | ablate_*
+                                                                   #   flowdraft_packed_blockwise
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
@@ -326,7 +488,7 @@ Variants: `flowdraft` is the full-sequence flow-map objective; `orthrus` is the
 paper-style block-causal Orthrus recipe (frozen AR cache plus independently
 anchored masked blocks); and `flowdraft_block_wise` trains the flow-map
 drafter in that inference geometry.
-Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`lambda_ramp_steps`
+Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`selfcorrect_kl_weight`/`lambda_ramp_steps`
 (VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
 curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
@@ -410,8 +572,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `wandb.project` / `entity` / `name` | `flowdraft` / null / null | W&B destination and optional run name; null uses W&B defaults |
 | `wandb.group` / `tags` | null / [] | optional W&B organization metadata |
 | `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
-| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `flowdraft_block_wise` (inference-geometry CFM) \| `orthrus` (block-causal masked drafter) |
-| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
+| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
 | `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; packed block-wise FlowDraft defaults to 4 |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
 | `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
@@ -421,7 +582,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.time_sampling` | `paper` | how (s, t) pairs are drawn: `paper` \| `triangle` \| `sequential` |
 | `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
 | `train.endpoint_weight` | 1.0 | weight of categorical VFM endpoint CE; 0 = endpoint-off ablation |
-| `train.ar_kl_weight` | 0.0 | optional AR-verifier KL auxiliary; 0 keeps the objective paper-faithful |
+| `train.selfcorrect_kl_weight` | 0.0 | the multi-step term: the drafter's own jump schedule, each leg supervised by the frozen AR sweep over the leg before it |
 | `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
 | `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
 | `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
@@ -456,7 +617,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
 | `decode.equiv_samples` | 0 | uncoupled only: N draws for the TV law-equivalence test; 0 = off |
 
-**`model/*` — backbone** (`qwen3_1.7b` default; `qwen2_0.5b` and `llama3_3b` remain available):
+**`model/*` — backbone** (`qwen3_1.7b` default; `qwen2_0.5b` is the brief's scale, `smollm2_135m` the bench):
 `name` (HF id), `backbone.dtype`, `backbone.device_map`,
 `backbone.attn_implementation` (`sdpa` default \| `flex_attention` GPU-only \| `eager`).
 
@@ -473,18 +634,13 @@ overwrite each other:
 | Preset | Sets | Checkpoints |
 | --- | --- | --- |
 | `orthrus` | `variant=orthrus` | `checkpoints/orthrus/orthrus-*.ckpt` |
-| `flowdraft_staged` | `variant=flowdraft`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-staged/flowdraft-staged-*.ckpt` |
-| `ablate_teacher_only` | `variant=flowdraft`, `lambda=0` (endpoint-only; legacy preset name) | `checkpoints/ablate-endpoint/ablate-endpoint-*.ckpt` |
-| `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
-| `flowdraft_block_wise` (addition) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
-| `flowdraft_packed_full` | boundary-aware packed-2048 full-sequence FlowDraft | `checkpoints/flowdraft-packed-full/` |
 | `flowdraft_packed_blockwise` | boundary-aware packed-2048 inference-geometry FlowDraft | `checkpoints/flowdraft-packed-blockwise/` |
 
 Your own experiment (e.g. the `anchor_point` study) — override name and dir
 so it gets its own shelf too:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_staged \
+./hf-auth.sh uv run python src/train.py +experiment=flowdraft_packed_blockwise \
     train.anchor_point=landing \
     output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
 ```

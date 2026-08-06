@@ -68,14 +68,38 @@ class FlowDraftBlockWise(FlowDraft):
         high = max(min_prefix + 1, true_min - block + 1)
         return int(torch.randint(min_prefix, high, (1,)))
 
+    @staticmethod
+    def _interleave_times(times, anchors, drafted):
+        """``[B, A*drafted]`` per-position times -> the DF input's own layout.
+
+        ``_df_forward`` splices a clean anchor row in front of every block, so a
+        per-position time vector has to be spliced the same way. The anchor's
+        slot gets ``1``: it is a token the verifier already committed, and at
+        ``s = t = 1`` the transport factor is zero, so it stays exactly where it
+        is while the drafted positions move.
+        """
+        batch = times.size(0)
+        per_block = times.view(batch, anchors, drafted)
+        head = times.new_ones(batch, anchors, 1)
+        return torch.cat([head, per_block], dim=2).flatten(1, 2)
+
     def _df_forward(
         self, x_block, anchor, ctx_mask, cache, s, t, df_kwargs=None
     ):
         """One DF forward in the decode configuration: the clean anchor rides
         at in-block position 0, its output row is discarded — returned logits
-        cover the K-1 fresh positions only."""
+        cover the K-1 fresh positions only.
+
+        ``s``/``t`` are either one time per sequence (the usual case) or one per
+        drafted position, shaped like ``x_block``; the second form is spliced
+        into the anchor layout before it reaches the adapter.
+        """
         df_kwargs = df_kwargs or {}
         anchors = anchor.size(1)
+        if torch.is_tensor(s) and s.dim() == 2 and s.size(1) == x_block.size(1):
+            drafted_per_anchor = x_block.size(1) // anchors
+            s = self._interleave_times(s, anchors, drafted_per_anchor)
+            t = self._interleave_times(t, anchors, drafted_per_anchor)
         if anchors == 1:
             x_in = torch.cat([anchor, x_block], dim=1)
             logits = self.orthrus(
@@ -180,119 +204,243 @@ class FlowDraftBlockWise(FlowDraft):
         anchor = self.df_processor.to_simplex(ids[:, p : p + 1], attention_mask=mask[:, p : p + 1])
         block_mask = mask[:, p + 1 : p + block_width]
         block_ids = ids[:, p + 1 : p + block_width]
-        return teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor
+        return (
+            teacher_logits, block_ids, ctx_mask, block_mask, cache, anchor,
+            ids[:, p : p + 1],
+        )
 
-    def _rollout_schedule(self, jumps, device):
-        """Jump times ``0 = t_0 < ... < t_n = 1`` for one rollout.
+    def _verifier_response(self, draft_ids, anchor_ids, ctx_mask, cache, df_kwargs):
+        """ONE frozen AR forward over the drafter's OWN proposal.
 
-        The interior boundaries are drawn one per equal bin of ``(0, 1)``
-        rather than placed on a uniform grid, so successive steps see a
-        different partition and the family is covered rather than sampled at
-        the same n-1 points every time. Both ends are kept strictly inside
-        ``(0, 1)``: the transport factor ``(t - s) / (1 - s)`` is unbounded as
-        ``s -> 1``.
+        This is the forward the decode loop already spends on verification,
+        moved into training, and it is the only source in the objective of two
+        things that cannot be obtained any other way:
+
+        * ``p_AR(· | ctx, draft_{<j})`` — a target CONDITIONED ON THE DRAFT.
+          Every other teacher term in this file targets ``p_AR(· | corpus)``,
+          which the drafter's state does not enter, so the state carries no
+          gradient through the target. Here it does.
+        * the EXACT greedy verdict. Acceptance is "the draft token equals what
+          AR would emit given the draft tokens before it" — the conditioning is
+          the draft's own prefix, not the corpus's. The corpus-conditioned
+          teacher agrees with that only at the first drafted position; every
+          deeper position was being judged against the wrong distribution.
+
+        Returns logits aligned to the DRAFTED positions: entry ``j`` is the AR
+        distribution of drafted position ``j`` given the anchor and drafted
+        positions ``< j``. The trailing slot (AR's continuation past the block)
+        is dropped, exactly as :meth:`verify_greedy` drops it.
+
+        Two layouts, one meaning. With a single anchor the block sits directly
+        behind a cache cropped to the split point, so an ordinary causal
+        forward IS the block relation. With several isolated blocks flattened
+        into one sequence the relation needs the dual-pass mask restricted to
+        the past inside each block — ``weights='ar'`` runs the frozen backbone
+        through exactly that geometry.
         """
-        if jumps < 2:
-            return [0.0, 1.0]
-        interior = jumps - 1
-        bins = torch.arange(interior, device=device, dtype=torch.float32)
-        if bool(self.cfg.train.get("rollout_stratified", True)):
-            offsets = torch.rand(interior, device=device)
-        else:
-            offsets = torch.full((interior,), 0.5, device=device)
-        times = ((bins + offsets) / interior).clamp(1e-3, 1.0 - 1e-3)
-        return [0.0] + times.sort().values.tolist() + [1.0]
+        anchors = anchor_ids.size(1)
+        drafted = draft_ids.size(1) // anchors
+        ar_in = torch.cat(
+            [anchor_ids[:, :, None], draft_ids.view(draft_ids.size(0), anchors, drafted)],
+            dim=2,
+        ).flatten(1, 2)
+        committed = cache.get_seq_length()
+        with torch.no_grad(), self._teacher_eval():
+            if df_kwargs:
+                logits = self.orthrus(
+                    ar_in,
+                    ctx_mask,
+                    use_df=True,
+                    weights="ar",
+                    causal_in_block=True,
+                    past_key_values=cache,
+                    **df_kwargs,
+                ).logits
+            else:
+                logits = self.orthrus(
+                    ar_in, ctx_mask, past_key_values=cache
+                ).logits
+                # The AR path appends its K/V; the DF path crops for itself but
+                # this call is not on it. Restore the committed prefix or every
+                # later forward in the step reads a polluted cache.
+                cache.crop(committed)
+        width = drafted + 1
+        return logits.view(logits.size(0), anchors, width, -1)[:, :, :-1].flatten(1, 2)
 
-    def _rollout_kl(self, teacher_logits, x1, block_mask, ctx_mask, cache,
-                    anchor, df_kwargs):
-        """Teacher alignment along the drafter's OWN multi-jump path.
+    def _exact_target(self, teacher_logits, onpolicy_logits, known):
+        """Replace the corpus-conditioned target where the exact one is known.
 
-        Restored after measurement. This term was removed on the argument that
-        its target depends only on the prefix, so a map ignoring its input
-        minimises it — which is true, and beside the point. Decoding a
-        checkpoint trained with the verifier term at (0,1) alone accepts
-        exactly zero tokens at two and four jumps, against 2.34 at one, and
-        re-entering each jump from the original prior instead of the
-        transported state RECOVERS part of the draft. The defect is therefore
-        the input distribution, not the target: the second jump reads a state
-        the drafter never saw in training. This is the only term whose input is
-        a transported state, so it is the only one that can fix that.
+        Greedy acceptance at position j is judged against ``p_AR`` conditioned
+        on the tokens already accepted -- which, under greedy consensus, are the
+        frozen model's own greedy continuation. The single AR pass over the
+        packed sequence conditions on the CORPUS tokens instead, and the two
+        agree only while the model's top-1 matches the data: about two positions
+        at the measured ~55% per-position agreement. Every deeper position is
+        therefore trained against a distribution the verifier is never in.
+        ``teacher_chain_tail_weight`` currently models that with an indicator
+        and a guessed discount.
 
-        Every other term is evaluated on the interpolation path
-        ``x_s = (1-s) x_0 + s x_1``, which is built from the answer. Decoding
-        never sees that path: it starts from the prior and each step consumes
-        the previous step's own output. Training on one and running on the
-        other is the same exposure mismatch teacher forcing produces in an AR
-        model, and nothing in the objective addresses it. This term rolls the
-        drafter forward exactly as the decode loop does and supervises what it
-        actually produces.
+        The on-policy sweep gives the exact thing for free. Up to the break the
+        draft IS the AR argmax, so ``p_AR(· | ctx, draft_{<j})`` is precisely
+        ``p_AR(· | ctx, greedy chain_{<j})``. Past the break the draft diverges
+        and the sweep is conditioned on a rejected token, so the corpus target
+        (with its discount) remains the better of two flawed options.
 
-        It also gives the composition a direct signal. Endpoint consistency
-        relates ``π_{s,t}`` to the diagonal pairwise; a schedule of ``n`` jumps
-        executes a composition that no pairwise term ever evaluates end to end,
-        so accumulated error is unconstrained.
-
-        The target is the frozen AR distribution at every step, asked as "if
-        you had to finish here, what would you emit" — that is ``π_{s_k,1}``,
-        the map a schedule of any length terminates on. Supervising the
-        intermediate horizons themselves would instead drive the family towards
-        independence of ``t``, since the target does not depend on it.
-
-        Gradients flow through the last ``train.rollout_grad_jumps`` steps
-        only. The earlier ones run under ``no_grad``, so memory is bounded by
-        that window rather than by the schedule length, and the recurrence is
-        truncated before its conditioning degrades. Note the transport step is
-        a convex combination with factor below one except at ``t = 1``, so the
-        iteration is damped rather than expansive.
+        This is a defect the masked baseline shares, so fixing it is not a
+        correction -- it is an advantage, and it costs the one AR forward the
+        self-correction terms already pay for. At initialisation the break sits
+        at position zero and almost everything falls back to the corpus; the
+        exact region grows as the drafter improves, which is the curriculum one
+        would have designed by hand.
         """
-        weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
+        source = str(self.cfg.train.get("teacher_source", "corpus"))
+        if source not in ("corpus", "onpolicy"):
+            raise ValueError(f"unknown teacher_source='{source}' (corpus | onpolicy)")
+        if source == "corpus" or onpolicy_logits is None or known is None:
+            return teacher_logits
+        return torch.where(known[..., None], onpolicy_logits, teacher_logits)
+
+    @staticmethod
+    def _greedy_verdict(draft_ids, expected, live, anchors):
+        """What greedy verification does with this draft. Costs no forward.
+
+        Returns ``(accepted, known)``: the accepted-prefix indicator and the
+        set of positions the next cycle receives as settled — the accepted
+        prefix plus the ONE position the verifier overwrites with its own
+        token. Everything past that break is still open, and it was drafted
+        under a prefix that has just been shown to be wrong.
+        """
+        agree = (draft_ids == expected) & live
+        per_block = agree.view(agree.size(0), anchors, -1).to(torch.int32)
+        accepted = per_block.cumprod(dim=2).bool()
+        correction = (~accepted).cumsum(dim=2) == 1
+        shape = draft_ids.shape
+        return accepted.view(shape) & live, (accepted | correction).view(shape) & live
+
+    def _entry_times(self, rounds, device):
+        """Entry times ``s_1 < ... < s_r``, one per equal bin of ``(s_min, 1)``.
+
+        The schedule a multi-jump decode executes is a sequence of RESTARTS,
+        ``[(0,1), (s_1,1), ..., (s_{r-1},1)]``: every leg asks the terminal
+        question from wherever the previous one left the draft. Stratifying
+        rather than using a fixed grid covers the family instead of sampling the
+        same r-1 points every step.
+
+        ``train.selfcorrect_s_min`` decides how much of the draft the leg
+        actually receives, and it is the load-bearing knob. The entry state is
+        ``(1-s) x_0' + s q``, so at ``s = 0.25`` three quarters of the input is
+        prior noise and the draft arrives at a quarter amplitude -- through a
+        FROZEN embedding, with no input projection to rescale it. Pushed towards
+        1 the input becomes the draft itself, and the leg is asked the
+        well-posed question "read these tokens, take one AR step at every
+        position in parallel", which is the Jacobi operator the prefix-fixing
+        induction is stated for. Transport is unaffected either way: at ``t = 1``
+        the factor ``(t-s)/(1-s)`` is 1 for every ``s``.
+        """
+        low = float(self.cfg.train.get("selfcorrect_s_min", 0.0))
+        if not 0.0 <= low < 1.0:
+            raise ValueError(
+                f"train.selfcorrect_s_min must lie in [0, 1), got {low}"
+            )
+        bins = torch.arange(rounds, device=device, dtype=torch.float32)
+        offsets = torch.rand(rounds, device=device)
+        spread = (bins + offsets) / rounds
+        return (low + (1.0 - low) * spread).clamp(1e-3, 1.0 - 1e-3).sort().values
+
+    def _selfcorrect_kl(self, verify_logits, onpolicy_logits, accepted, anchor_ids,
+                        block_mask, ctx_mask, cache, anchor, df_kwargs):
+        """The multi-step term: the drafter walks its OWN jump schedule, and
+        every leg is supervised by the verifier's answer to the leg before it.
+
+        A schedule of ``n`` jumps executes a composition that no pairwise term
+        evaluates end to end. Training one extra pair -- say ``(0.5, 1)`` -- buys
+        two-step decoding at one point and leaves ``n = 3, 4`` exactly as
+        unsupervised as before. So this walks the schedule:
+
+            q_0 = pi_{0,1}(x_0)                            the deployed first jump
+            for k = 1..r:
+                target_k = p_AR(· | ctx, argmax q_{k-1})   ONE frozen AR sweep
+                q_k      = pi_{s_k, 1}((1-s_k) x_0' + s_k q_{k-1})
+                loss    += l(target_k, q_k)
+
+        with ``s_1 < ... < s_r`` stratified in ``(0,1)``, so the entry times a
+        real schedule visits are covered rather than fixed. Round 0's sweep is
+        already in hand -- it is the same forward the verdict comes from -- so
+        ``r`` rounds cost ``r`` DF forwards and ``r-1`` extra AR forwards.
+
+        The fixed point of this recursion is the frozen model's greedy chain:
+        ``q`` is fully accepted iff ``q_j = argmax p_AR(· | ctx, q_{<j})`` for
+        every j. Each round is one Jacobi sweep towards it, so if the map
+        realises the sweep, ``n`` composed jumps fix positions ``1..n``:
+        ``A_n >= min(n, K-1)``, with a deterministic verifier and no new
+        information. What makes reading the input pay is that the input CONTAINS
+        a partial computation of the target -- the target is a sweep applied to
+        the draft, and the draft is the input. Every corpus-conditioned term has
+        an input that is empty in that sense, which is why none of them can
+        reward the derivative a second jump lives on.
+
+        States are detached between rounds. Backpropagating through the
+        composition would let an early leg optimise a later leg's input, a
+        self-referential objective on a map whose failure mode is collapse; the
+        induction above needs each leg to sweep correctly, not the chain to be
+        differentiated.
+
+        The verdict weights, it does not mask, and the weighted set is ``known``
+        -- the accepted prefix PLUS the break. Weighting by ``accepted`` alone
+        gets it exactly backwards: the break is the one position whose target is
+        both valid (its prefix was confirmed) and informative (the draft is
+        wrong there), while the accepted prefix is where the draft is already
+        right and carries little gradient. Past the break the target is
+        conditioned on a token that has just been rejected, and
+        ``train.selfcorrect_tail_weight`` says how far to trust it.
+        """
+        weight = float(self.cfg.train.get("selfcorrect_kl_weight", 0.0))
         if weight <= 0.0:
             return None
         live = block_mask.bool()
         if not live.any():
             return None
-        max_jumps = max(1, int(self.cfg.train.get("rollout_max_jumps", 8)))
-        window = max(1, int(self.cfg.train.get("rollout_grad_jumps", 4)))
-        anytime = bool(self.cfg.train.get("rollout_anytime", True))
-        jumps = int(torch.randint(1, max_jumps + 1, (1,)))
-        times = self._rollout_schedule(jumps, x1.device)
-        pad = block_mask[..., None].to(x1.dtype)
+        rounds = max(1, int(self.cfg.train.get("selfcorrect_rounds", 2)))
+        times = self._entry_times(rounds, block_mask.device).tolist()
+        tail = float(self.cfg.train.get("selfcorrect_tail_weight", 0.5))
+        pad = block_mask[..., None].to(verify_logits.dtype)
+        ones = block_mask.new_ones(block_mask.size(0), dtype=torch.float32)
 
-        x = self.sample_prior(x1, block_mask)
-        ones = x1.new_ones(x1.size(0))
+        q = verify_logits.detach().float().softmax(-1).to(verify_logits.dtype)
+        target, verdict = onpolicy_logits, accepted
         terms = []
-        for step, (s_k, t_k) in enumerate(zip(times[:-1], times[1:])):
-            grad_on = step >= jumps - window
-            ctx = contextlib.nullcontext() if grad_on else torch.no_grad()
-            s_vec = x1.new_full((x1.size(0),), s_k)
-            x_in = x
-            with ctx:
-                logits = self._df_forward(
-                    x_in, anchor, ctx_mask, cache,
-                    s_vec, x1.new_full((x1.size(0),), t_k), df_kwargs,
+        for k, s_k in enumerate(times):
+            prior = self.sample_prior(q, block_mask)
+            x_in = ((1.0 - s_k) * prior + s_k * q) * pad
+            logits = self._df_forward(
+                x_in, anchor, ctx_mask, cache, ones * s_k, ones, df_kwargs
+            )
+            pos_w = torch.where(
+                verdict, torch.ones_like(pad[..., 0]), pad.new_full((), tail)
+            )
+            pos_w = pos_w / pos_w.mean().clamp_min(1e-6)
+            # The prefix-conjunction weight is a property of the metric, not of
+            # any one target, so it multiplies here exactly as it does in
+            # verify_kl. The chain-validity gate does NOT: this term's target is
+            # conditioned on the drafter's own block, so corpus agreement says
+            # nothing about it.
+            survival = self._survival_weights(
+                block_mask.size(1) // anchor.size(1), anchor.size(1), pad
+            )
+            if survival is not None:
+                pos_w = pos_w * survival
+            terms.append(
+                self._teacher_loss(target, logits, live, position_weight=pos_w)
+            )
+            if k + 1 < len(times):
+                q = logits.detach().float().softmax(-1).to(verify_logits.dtype)
+                draft_ids = q.argmax(-1)
+                target = self._verifier_response(
+                    draft_ids, anchor_ids, ctx_mask, cache, df_kwargs
                 )
-                pi = F.softmax(logits.float(), -1).to(x_in.dtype)
-                # Endpoint prediction for this step's own horizon; the state
-                # moves a (t-s)/(1-s) fraction of the way towards it.
-                gamma = (t_k - s_k) / max(1.0 - s_k, 1e-3)
-                x = (x_in + gamma * (pi - x_in)) * pad
-            if not grad_on:
-                continue
-            if t_k >= 1.0:
-                # The last step already asks the t = 1 question, so its own
-                # output IS the "finish here" prediction — no extra forward.
-                finish = logits
-            elif anytime:
-                # Same state, horizon moved to 1: what this step would emit if
-                # the schedule stopped here.
-                finish = self._df_forward(
-                    x_in, anchor, ctx_mask, cache, s_vec, ones, df_kwargs,
+                _, verdict = self._greedy_verdict(
+                    draft_ids, target.argmax(-1), live, anchor.size(1)
                 )
-            else:
-                continue
-            terms.append(self._teacher_loss(teacher_logits, finish, live))
-        if not terms:
-            return None
         return torch.stack(terms).mean()
 
     def _position_weights(self, teacher_logits, x1, live):
@@ -351,19 +499,33 @@ class FlowDraftBlockWise(FlowDraft):
             gate = gate / gate.mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
             weights = gate.flatten(1, 2)
 
-        survival = self.cfg.train.get("position_weights", None)
-        if survival:
-            w = torch.as_tensor(
-                list(survival)[:drafted], device=teacher_logits.device,
-                dtype=teacher_logits.dtype,
-            )
-            if w.numel() < drafted:
-                w = torch.cat([w, w.new_full((drafted - w.numel(),), float(w[-1]))])
-            w = (w / w.mean()).repeat(count)[None]
+        w = self._survival_weights(drafted, count, teacher_logits)
+        if w is not None:
             weights = w if weights is None else weights * w
         if weights is None:
             return None
         return weights * live.to(weights.dtype)
+
+    def _survival_weights(self, drafted, count, like):
+        """``dE/da_j`` alone, without the chain-validity gate.
+
+        Acceptance is a conjunction over the prefix, ``E[len] = sum_j
+        prod_{i<=j} a_i``, so position ``j`` is worth the probability of
+        reaching it at all. That is a property of the METRIC and applies to
+        every term that targets acceptance -- not only to the one whose target
+        happens to be corpus-conditioned. The chain gate is separate: it says
+        whether a corpus-conditioned target is valid at all, which is
+        meaningless for a target conditioned on the drafter's own block.
+        """
+        survival = self.cfg.train.get("position_weights", None)
+        if not survival:
+            return None
+        w = torch.as_tensor(
+            list(survival)[:drafted], device=like.device, dtype=like.dtype,
+        )
+        if w.numel() < drafted:
+            w = torch.cat([w, w.new_full((drafted - w.numel(),), float(w[-1]))])
+        return (w / w.mean()).repeat(count)[None]
 
 
 
@@ -386,7 +548,14 @@ class FlowDraftBlockWise(FlowDraft):
             mask, block_width, count, document_ids=document_ids
         )
         if anchors is None:
-            raise ValueError("no packed document contains anchor + requested block")
+            # Data-dependent and therefore NOT synchronised across ranks: some
+            # packed batches contain no document long enough for one complete
+            # block. Raising here hangs DDP -- the rank that raised leaves the
+            # collective while every other rank waits inside it forever, and the
+            # job dies on a NCCL timeout minutes later with no useful message.
+            # Return None and let the caller emit a graph-connected zero, which
+            # is what the masked baseline already does for the same case.
+            return None
         if self.orthrus.model.config.model_type != "qwen3":
             raise ValueError(
                 "train.anchors_per_sequence > 1 currently requires the Qwen3 "
@@ -428,6 +597,7 @@ class FlowDraftBlockWise(FlowDraft):
             block_mask,
             cache,
             anchor,
+            ids[:, anchors],
             df_kwargs,
         )
 
@@ -435,6 +605,8 @@ class FlowDraftBlockWise(FlowDraft):
         count = int(self.cfg.train.get("anchors_per_sequence", 1))
         if count > 1:
             prepared = self._prepare_blocks(batch)
+            if prepared is None:
+                return None
         else:
             prepared = (*self._prepare_block(batch), {})
         (
@@ -444,6 +616,7 @@ class FlowDraftBlockWise(FlowDraft):
             block_mask,
             cache,
             anchor,
+            anchor_ids,
             df_kwargs,
         ) = prepared
         x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
@@ -461,34 +634,56 @@ class FlowDraftBlockWise(FlowDraft):
             verify_input, anchor, ctx_mask, cache, verify_s, ones, df_kwargs
         )
 
-        # Warm-start term: the ONLY term that can teach the map to read its
-        # input. At t = 1 the transport factor (t-s)/(1-s) is 1 for every s, so
-        # the last jump returns π_{s,1}(x_s) and the incoming state contributes
-        # nothing additively — all of a multi-jump schedule's value sits in
-        # ∂π_{s,1}/∂x_s. Nothing else in the objective rewards that derivative:
-        # verify_kl is evaluated at s = 0 on a fresh prior, and a map ignoring
-        # x_s minimises it exactly as well.
-        #
-        # At decode the entry state need not be noise. The verify pass already
-        # produces AR logits at every drafted position, so the next cycle can be
-        # seeded with them at no extra forward. Those are a good-but-stale guess
-        # — conditioned partly on tokens that were rejected. This term simulates
-        # that state: mix the clean endpoint with the teacher's own prediction
-        # which sweeps "roughly right" through "exact".
+        shared = dict(
+            teacher_logits=teacher_logits,
+            draft_logits=draft_logits,
+            verify_logits=verify_logits,
+            x_s=x_s,
+            x_t=x_t,
+            x1=x1,
+            s=s,
+            t=t,
+            ctx_mask=ctx_mask,
+            block_mask=block_mask,
+            cache=cache,
+            anchor=anchor,
+            anchor_ids=anchor_ids,
+            df_kwargs=df_kwargs,
+            onpolicy_logits=None,
+            expected=None,
+            accepted=None,
+            known=None,
+        )
+
+        # ONE frozen AR forward over the drafter's own proposal, shared by every
+        # term that needs either an on-policy target or the verdict. It is the
+        # forward the decode loop spends on verification, and it is what the
+        # objective has never contained: a target the drafter's state enters,
+        # and the exact accept/reject boundary rather than a corpus-conditioned
+        # guess at it.
+        if self._needs_verifier_response():
+            draft_ids = verify_logits.detach().argmax(-1)
+            onpolicy_logits = self._verifier_response(
+                draft_ids, anchor_ids, ctx_mask, cache, df_kwargs
+            )
+            expected = onpolicy_logits.argmax(-1)
+            accepted, known = self._greedy_verdict(
+                draft_ids, expected, block_mask.bool(), anchor.size(1)
+            )
+            shared.update(
+                onpolicy_logits=onpolicy_logits,
+                expected=expected,
+                accepted=accepted,
+                known=known,
+            )
+        return shared
+
+    def _needs_verifier_response(self):
+        """Is any enabled term paying for the on-policy AR forward?"""
         return (
-            teacher_logits,
-            draft_logits,
-            verify_logits,
-            x_s,
-            x_t,
-            x1,
-            s,
-            t,
-            ctx_mask,
-            block_mask,
-            cache,
-            anchor,
-            df_kwargs,
+            float(self.cfg.train.get("selfcorrect_kl_weight", 0.0)) > 0.0
+            or str(self.cfg.train.get("teacher_source", "corpus")) == "onpolicy"
+            or bool(self.cfg.train.get("log_train_acceptance", False))
         )
 
     def compute_loss(
@@ -505,7 +700,12 @@ class FlowDraftBlockWise(FlowDraft):
         block_mask,
         cache,
         anchor,
+        anchor_ids,
         df_kwargs,
+        onpolicy_logits=None,
+        expected=None,
+        accepted=None,
+        known=None,
         *,
         metric_prefix="loss",
         log_on_step=True,
@@ -532,7 +732,8 @@ class FlowDraftBlockWise(FlowDraft):
         #              same block positions, already aligned in _shared_step.
         pos_w = self._position_weights(teacher_logits, x1, live)
         verify_kl = self._teacher_loss(
-            teacher_logits, verify_logits, live, position_weight=pos_w
+            self._exact_target(teacher_logits, onpolicy_logits, known),
+            verify_logits, live, position_weight=pos_w,
         )
 
         # Landing point of the jump — the EC-target input. Detached: the
@@ -542,76 +743,93 @@ class FlowDraftBlockWise(FlowDraft):
         x_jump = x_s + gamma * (pi - x_s)
         x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
 
-        # --- categorical VFM endpoint likelihood on the diagonal. The
-        # trajectory setting is paper-faithful; landing remains experimental.
-        anchor_point = self.cfg.train.get("anchor_point", "trajectory")
-        anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
-        if anchor_input is None:
-            raise ValueError(f"unknown anchor_point='{anchor_point}' (trajectory | landing)")
-        diag_logits = self._df_forward(
-            anchor_input, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
-        )
-        endpoint_nll = F.cross_entropy(
-            diag_logits.float().transpose(1, 2),
-            x1.argmax(-1),
-            reduction="none",
-        )
-        endpoint = endpoint_nll[live].mean()
-        # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
-        # the jump must agree with the stop-grad expert at its landing point.
-        if anchor_point == "landing":
-            tgt = diag_logits.detach().float().softmax(-1)
-        else:
-            with torch.no_grad():
-                tgt = self._df_forward(
-                    x_jump, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
-                ).float().softmax(-1)
-        ec = -(tgt * log_draft).sum(-1)[live].mean()
-
-        td = self._td_term(
-            pi,
-            gamma,
-            s,
-            t,
-            live,
-            forward_dt=lambda dt: self._df_forward(
-                x_s,
-                anchor,
-                ctx_mask,
-                cache,
-                s=s,
-                t=t + dt,
-                df_kwargs=df_kwargs,
-            ),
-        )
-
-        rollout_kl_weight = float(self.cfg.train.get("rollout_kl_weight", 0.0))
-        rollout_kl = self._rollout_kl(
-            teacher_logits, x1, block_mask, ctx_mask, cache, anchor, df_kwargs
-        )
-        if rollout_kl is None:
-            rollout_kl = draft_logits.sum() * 0.0
-
+        # --- categorical VFM endpoint likelihood on the diagonal, plus the two
+        # consistency terms. Each costs a DF forward, and each was being paid
+        # for unconditionally and then multiplied by a weight that is zero in
+        # the measured working point -- three forwards out of eight spent on
+        # terms that contribute nothing. Skip them when their weight is zero;
+        # the graph-connected zero keeps every parameter in DDP's reduction.
         lam = self._lambda()
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
         )
+        zero = draft_logits.sum() * 0.0
+        endpoint, ec, td = zero, zero, zero
+        anchor_point = self.cfg.train.get("anchor_point", "trajectory")
+        diag_logits = None
+        if endpoint_weight or lam:
+            anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
+            if anchor_input is None:
+                raise ValueError(
+                    f"unknown anchor_point='{anchor_point}' (trajectory | landing)"
+                )
+            diag_logits = self._df_forward(
+                anchor_input, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
+            )
+        if endpoint_weight:
+            endpoint_nll = F.cross_entropy(
+                diag_logits.float().transpose(1, 2),
+                x1.argmax(-1),
+                reduction="none",
+            )
+            endpoint = endpoint_nll[live].mean()
+        if lam:
+            # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
+            # the jump must agree with the stop-grad expert at its landing point.
+            if anchor_point == "landing":
+                tgt = diag_logits.detach().float().softmax(-1)
+            else:
+                with torch.no_grad():
+                    tgt = self._df_forward(
+                        x_jump, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
+                    ).float().softmax(-1)
+            ec = -(tgt * log_draft).sum(-1)[live].mean()
+
+            td = self._td_term(
+                pi, gamma, s, t, live,
+                forward_dt=lambda dt: self._df_forward(
+                    x_s, anchor, ctx_mask, cache, s=s, t=t + dt, df_kwargs=df_kwargs
+                ),
+            )
+
+        selfcorrect_kl = None
+        if onpolicy_logits is not None:
+            selfcorrect_kl = self._selfcorrect_kl(
+                verify_logits, onpolicy_logits, known, anchor_ids,
+                block_mask, ctx_mask, cache, anchor, df_kwargs,
+            )
+        selfcorrect_kl_weight = float(self.cfg.train.get("selfcorrect_kl_weight", 0.0))
+        if selfcorrect_kl is None:
+            selfcorrect_kl = zero
+
         verify_kl_weight = self.cfg.train.get("verify_kl_weight", 0.0)
         loss = (
             verify_kl_weight * verify_kl
-            + rollout_kl_weight * rollout_kl
+            + selfcorrect_kl_weight * selfcorrect_kl
             + endpoint_weight * endpoint
             + lam * (4.0 * ec + 2.0 * td)
         )
+        metrics = {
+            f"{metric_prefix}/endpoint": endpoint,
+            f"{metric_prefix}/verify_kl": verify_kl,
+            f"{metric_prefix}/selfcorrect_kl": selfcorrect_kl,
+            f"{metric_prefix}/ec": ec,
+            f"{metric_prefix}/td": td,
+            f"{metric_prefix}/lambda": lam,
+        }
+        if accepted is not None:
+            # The on-policy forward makes the training-time acceptance curve
+            # free, and it is the metric the project actually optimises. Until
+            # now it existed only as a validation decode over a couple of
+            # prompts; here it is measured on every block of every step, under
+            # the exact greedy rule, and it is what the objective should be
+            # judged against long before a decode run happens.
+            per_block = accepted.view(accepted.size(0), anchor.size(1), -1)
+            metrics[f"{metric_prefix}/accepted"] = (
+                per_block.sum(-1).to(torch.float32).mean()
+            )
         self.log_dict(
-            {
-                f"{metric_prefix}/endpoint": endpoint,
-                f"{metric_prefix}/verify_kl": verify_kl,
-                f"{metric_prefix}/rollout_kl": rollout_kl,
-                f"{metric_prefix}/ec": ec,
-                f"{metric_prefix}/td": td,
-                f"{metric_prefix}/lambda": lam,
-            },
+            metrics,
             on_step=log_on_step,
             on_epoch=log_on_epoch,
             sync_dist=True,
@@ -619,7 +837,12 @@ class FlowDraftBlockWise(FlowDraft):
         return loss
 
     def training_step(self, batch, batch_idx):
-        loss = self.compute_loss(*self._shared_step(batch))
+        shared = self._shared_step(batch)
+        if shared is None:
+            # No usable block in this batch. Every trainable parameter must stay
+            # connected or DDP's reduction hangs on the ranks that did find one.
+            return sum(p.sum() for p in self.orthrus.df_parameters()) * 0.0
+        loss = self.compute_loss(**shared)
         if not torch.isfinite(loss):
             raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
         self.log(
@@ -634,17 +857,18 @@ class FlowDraftBlockWise(FlowDraft):
 
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
-            teacher_logits, draft_logits, verify_logits, *rest = self._shared_step(batch)
+            shared = self._shared_step(batch)
+            if shared is None:
+                return None
+            teacher_logits = shared["teacher_logits"]
+            verify_logits = shared["verify_logits"]
+            block_mask = shared["block_mask"]
             loss = self.compute_loss(
-                teacher_logits,
-                draft_logits,
-                verify_logits,
-                *rest,
+                **shared,
                 metric_prefix="val/loss",
                 log_on_step=False,
                 log_on_epoch=True,
             )
-            block_mask = rest[-4]
             # Exact one-jump training pair, rather than a random off-diagonal pair.
             agree = (verify_logits.argmax(-1) == teacher_logits.argmax(-1))[
                 block_mask.bool()
