@@ -24,7 +24,7 @@ SEEDS = [int(x) for x in os.environ.get("SEEDS", "0,1,2").split(",")]
 MAX_NEW = int(os.environ.get("MAX_NEW", 32))
 MODEL = os.environ.get("MODEL", "smollm2_135m")
 BLOCK = int(os.environ.get("BLOCK", 8))
-OUT = os.environ.get("OUT", ".work/measure.json")
+OUT = os.environ.get("OUT", "results/measure.json")
 # Кривая деградации по числу шагов, одна ось для обеих моделей. Для карты
 # потока это рестарты (s_k, 1); для маскирующего бейзлайна — его собственная
 # абляция multi-step denoising, где используется только ДЛИНА расписания.

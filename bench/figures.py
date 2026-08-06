@@ -50,7 +50,9 @@ SCHED = [("n1", 1), ("n2", 2), ("n4", 4)]
 
 
 def load(name):
-    p = ROOT / ".work" / name
+    # Числа читаются из results/, куда их кладёт measure.py. Раньше здесь был
+    # .work/ — каталог черновиков, и фигуры зависели от того, что в нём лежит.
+    p = ROOT / "results" / name
     return json.load(open(p)) if p.exists() else {}
 
 

@@ -325,17 +325,17 @@ distributions; do not read one for the other.
 | checkpoints (FP32 DF head only; frozen backbone restored from HF) | `<output_dir>/last.ckpt`, `snap-*.ckpt` | `on_save_checkpoint` |
 | one JSON row per eval run | `results/eval.jsonl` | `src/eval.py` |
 | per-prompt eval detail | `results/eval-prompts.jsonl` | `src/eval.py` |
-| bench cells (`A`, `tpf`, raw per-cell lists) | `results/{final_ab,longer,six_k,fill}.json` | `.work/measure.py` |
-| figures | `results/figures/*.png` | `.work/figures.py` |
+| bench cells (`A`, `tpf`, raw per-cell lists) | `results/{final_ab,longer,six_k,fill}.json` | `bench/measure.py` |
+| figures | `results/figures/*.png` | `bench/figures.py` |
 
 ### Reproducing
 
 ```bash
-uv run python .work/final_ab.py              # five arms x 2000 steps
-TARGET=6000 uv run python .work/longer.py    # continue to 6000, snapshots at 4000
-CKPTS="orthrus=<ckpt>,fd_ms=<ckpt>" OUT=.work/six_k.json \
-  PROMPTS=24 SEEDS=0,1,2,3,4 uv run python .work/measure.py
-uv run python .work/figures.py
+uv run python bench/final_ab.py              # five arms x 2000 steps
+TARGET=6000 uv run python bench/longer.py    # continue to 6000, snapshots at 4000
+CKPTS="orthrus=<ckpt>,fd_ms=<ckpt>" OUT=results/six_k.json \
+  PROMPTS=24 SEEDS=0,1,2,3,4 uv run python bench/measure.py
+uv run python bench/figures.py
 ```
 
 Two things the harness enforces after losing hours to each: a run counts as

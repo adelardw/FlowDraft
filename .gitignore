@@ -207,3 +207,6 @@ bucket/
 .work/rollback/        # снимки состояния сессии
 .work/*.trainlog
 results/eval-prompts.jsonl   # построчный дамп eval, гигабайты при полном прогоне
+
+# Черновики сессии: не несущее, воспроизведение живёт в bench/
+.work/
