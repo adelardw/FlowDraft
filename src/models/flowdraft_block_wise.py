@@ -102,6 +102,13 @@ class FlowDraftBlockWise(FlowDraft):
             t = self._interleave_times(t, anchors, drafted_per_anchor)
         if anchors == 1:
             x_in = torch.cat([anchor, x_block], dim=1)
+            # Ширина блока сообщается адаптеру и на одноякорном пути. Без неё
+            # он не знает, какие позиции — якоря, и гейт входа гасил бы якорь
+            # вместе с приором. Раньше здесь шёл литеральный пустой df_kwargs,
+            # поэтому исключение якоря не действовало НИ В ОДНОЙ руке стенда:
+            # у всех anchors_per_sequence = 1.
+            df_kwargs = {**df_kwargs,
+                         "diffusion_block_size": x_in.size(1)}
             logits = self.orthrus(
                 x_in,
                 ctx_mask,
@@ -347,7 +354,7 @@ class FlowDraftBlockWise(FlowDraft):
         spread = (bins + offsets) / rounds
         return (low + (1.0 - low) * spread).clamp(1e-3, 1.0 - 1e-3).sort().values
 
-    def _selfcorrect_kl(self, verify_logits, onpolicy_logits, accepted, anchor_ids,
+    def _selfcorrect_kl(self, verify_logits, onpolicy_logits, accepted, known, anchor_ids,
                         block_mask, ctx_mask, cache, anchor, df_kwargs):
         """The multi-step term: the drafter walks its OWN jump schedule, and
         every leg is supervised by the verifier's answer to the leg before it.
@@ -407,7 +414,7 @@ class FlowDraftBlockWise(FlowDraft):
         ones = block_mask.new_ones(block_mask.size(0), dtype=torch.float32)
 
         q = verify_logits.detach().float().softmax(-1).to(verify_logits.dtype)
-        target, verdict = onpolicy_logits, accepted
+        target, verdict, accepted_k = onpolicy_logits, known, accepted
         terms = []
         for k, s_k in enumerate(times):
             prior = self.sample_prior(q, block_mask)
@@ -415,10 +422,24 @@ class FlowDraftBlockWise(FlowDraft):
             logits = self._df_forward(
                 x_in, anchor, ctx_mask, cache, ones * s_k, ones, df_kwargs
             )
+            # Полный вес — на позицию РАЗРЫВА, а не на весь принятый префикс.
+            # На принятых позициях таргет совпадает с токеном черновика, который
+            # при s > 0.5 доминирует в собственном слоте входа: копирование даёт
+            # там нулевой лосс, учиться нечему, а вес был максимальным. Разрыв —
+            # единственное место, где таргет отличается от входа.
             pos_w = torch.where(
-                verdict, torch.ones_like(pad[..., 0]), pad.new_full((), tail)
+                verdict & ~accepted_k, torch.ones_like(pad[..., 0]),
+                pad.new_full((), tail)
             )
-            pos_w = pos_w / pos_w.mean().clamp_min(1e-6)
+            # Нормируется ПРОИЗВЕДЕНИЕ, и так же в маскирующей ветви.
+            #
+            # На сам лосс порядок не влияет вовсе: `_teacher_loss` делит на
+            # реализованную массу веса, то есть инвариантен к масштабу
+            # `position_weight`, а два порядка отличаются постоянным множителем
+            # (замер: лосс 1.0273889 против 1.0273888, расхождение 1.2e-7 —
+            # шум float32). Выбран тот, у которого средний вес РОВНО 1.000 при
+            # любой приёмке: тогда логируемое число сравнимо между руками и по
+            # ходу обучения, а у обратного порядка оно плывёт (1.057).
             # The prefix-conjunction weight is a property of the metric, not of
             # any one target, so it multiplies here exactly as it does in
             # verify_kl. The chain-validity gate does NOT: this term's target is
@@ -429,6 +450,7 @@ class FlowDraftBlockWise(FlowDraft):
             )
             if survival is not None:
                 pos_w = pos_w * survival
+            pos_w = pos_w / pos_w.mean().clamp_min(1e-6)
             terms.append(
                 self._teacher_loss(target, logits, live, position_weight=pos_w)
             )
@@ -438,12 +460,16 @@ class FlowDraftBlockWise(FlowDraft):
                 target = self._verifier_response(
                     draft_ids, anchor_ids, ctx_mask, cache, df_kwargs
                 )
-                _, verdict = self._greedy_verdict(
+                accepted_k, verdict = self._greedy_verdict(
                     draft_ids, target.argmax(-1), live, anchor.size(1)
                 )
         return torch.stack(terms).mean()
 
     def _position_weights(self, teacher_logits, x1, live):
+        # `x1` принимается и точкой симплекса [.., V], и прямо идентификаторами
+        # [..]: внутри от неё нужен ровно argmax. Маскирующая ветвь строила
+        # one-hot единственно ради этого argmax, а при бумажном пресете
+        # (anchors=256, block=64) он весит ~3.2 ГБ на шаг.
         """Per-position weights for the teacher terms: chain consistency, then
         prefix survival.
 
@@ -478,8 +504,9 @@ class FlowDraftBlockWise(FlowDraft):
 
         tail = self.cfg.train.get("teacher_chain_tail_weight", 1.0)
         if tail is not None and float(tail) != 1.0:
+            target_ids = x1 if x1.dim() == teacher_logits.dim() - 1 else x1.argmax(-1)
             matched = (
-                teacher_logits.argmax(-1) == x1.argmax(-1)
+                teacher_logits.argmax(-1) == target_ids
             ).view(-1, count, drafted)
             keep = torch.ones_like(matched, dtype=teacher_logits.dtype)
             if drafted > 1:
@@ -496,7 +523,35 @@ class FlowDraftBlockWise(FlowDraft):
             # metric gradient, which are the positions a second jump has to earn
             # its cost on. Per-position normalisation makes it a mean-one
             # validity gate and leaves the across-position schedule to u_j alone.
-            gate = gate / gate.mean(dim=(0, 1), keepdim=True).clamp_min(1e-6)
+            # Нормировка по СКОЛЬЗЯЩЕМУ среднему, а не по текущему батчу.
+            # Знаменатель здесь — оценка средней массы гейта на позиции, и
+            # E[1/m] != 1/E[m]: на стенде батч даёт всего batch_size*anchors = 2
+            # наблюдения, и смещение достигает −40% на позиции 4 и −51% на
+            # позиции 7, причём с вероятностью 0.945 в батче нет ни одного
+            # валидного сэмпла и гейт молча становится тождественной единицей.
+            # То есть попозиционная нормировка вдвое резала ровно те глубокие
+            # позиции, которые бралась защищать. Скользящее среднее делает
+            # знаменатель оценкой по тысячам наблюдений. Оно не сохраняется в
+            # чекпоинт и прогревается заново примерно за сотню шагов после
+            # возобновления.
+            batch_mean = gate.mean(dim=(0, 1), keepdim=True).detach()
+            # Среднее хранится ПО ШИРИНЕ БЛОКА. Ширина батча динамическая
+            # (pack_sequences=false), и на коротких строках drafted < K-1;
+            # единственный буфер тогда сбрасывался на каждом таком шаге в
+            # оценку по batch*anchors = 2 наблюдениям -- ровно то смещение до
+            # -51%, ради устранения которого правка и делалась.
+            store = getattr(self, "_gate_mass", None)
+            if store is None:
+                store = {}
+                self._gate_mass = store
+            key = int(batch_mean.shape[-1])
+            prev = store.get(key)
+            if self.training:
+                prev = (batch_mean.clone() if prev is None
+                        else 0.99 * prev.to(batch_mean) + 0.01 * batch_mean)
+                store[key] = prev
+            norm = prev if prev is not None else batch_mean
+            gate = gate / norm.to(gate).clamp_min(1e-6)
             weights = gate.flatten(1, 2)
 
         w = self._survival_weights(drafted, count, teacher_logits)
@@ -516,18 +571,56 @@ class FlowDraftBlockWise(FlowDraft):
         happens to be corpus-conditioned. The chain gate is separate: it says
         whether a corpus-conditioned target is valid at all, which is
         meaningless for a target conditioned on the drafter's own block.
+
+        Предпочтительный вход — `train.acceptance_profile`, то есть ИЗМЕРЕННЫЕ
+        попозиционные приёмки `a_j`, из которых вес считается точно:
+        `dE/da_j = S_{j-1}(1 + R_j)`, `R_j = a_{j+1}(1 + R_{j+1})`, `R_n = 0`.
+        Жёсткий список весов был нормирован на `S_1 = 1`, что молча
+        предполагает `a_1 = 1`: `dE/da_1 = 1 + R_1` вообще не содержит `a_1`,
+        тогда как остальные ему пропорциональны, поэтому самая ценная позиция
+        занижалась ровно в `1/a_1` раз (при измеренном `a_1 = 0.525` — в 1.47).
+        Вывод из приёмки заодно распространяется на любой размер блока:
+        хвост продолжается последней приёмкой, а не последним ВЕСОМ, и
+        выживание там падает геометрически, как ему и положено.
         """
+        acceptance = self.cfg.train.get("acceptance_profile", None)
+        if acceptance:
+            a = list(acceptance)
+            if len(a) < drafted:
+                a = a + [a[-1]] * (drafted - len(a))
+            a = a[:drafted]
+            tail = [0.0] * (drafted + 2)
+            for j in range(drafted - 1, 0, -1):
+                tail[j] = a[j] * (1.0 + tail[j + 1])
+            survival, prefix = [], 1.0
+            for j in range(drafted):
+                survival.append(prefix * (1.0 + tail[j + 1]))
+                prefix *= a[j]
+            w = torch.as_tensor(survival, device=like.device, dtype=torch.float32)
+            return (w / w.mean()).repeat(count)[None]
+
         survival = self.cfg.train.get("position_weights", None)
         if not survival:
             return None
+        # dtype ВСЕГДА fp32, а не `like.dtype`. Маскирующая ветвь передавала
+        # сюда fp32-уверенность, симплексная — bf16-маску, и один и тот же
+        # профиль округлялся по-разному: 2.824245 против 2.828125 на первой
+        # позиции, расхождение до 0.82%. Веса — свойство метрики, они обязаны
+        # быть у ветвей одним числом, а не почти одним.
         w = torch.as_tensor(
-            list(survival)[:drafted], device=like.device, dtype=like.dtype,
+            list(survival)[:drafted], device=like.device, dtype=torch.float32,
         )
         if w.numel() < drafted:
-            w = torch.cat([w, w.new_full((drafted - w.numel(),), float(w[-1]))])
+            # Продолжение ГЕОМЕТРИЧЕСКОЕ, а не повтор последнего значения:
+            # повтор давал хвосту постоянный вес, и при block_size=64 позиции
+            # 8..63 забирали 36% всей массы вместо примерно 2%.
+            ratio = (min(1.0, float(w[-1]) / float(w[-2]))
+                     if w.numel() >= 2 and float(w[-2]) > 0 else 0.5)
+            extra = torch.arange(
+                1, drafted - w.numel() + 1, device=like.device, dtype=torch.float32,
+            )
+            w = torch.cat([w, float(w[-1]) * ratio ** extra])
         return (w / w.mean()).repeat(count)[None]
-
-
 
     def _prepare_blocks(self, batch):
         """Prepare several isolated inference-geometry blocks in one DF pass.
@@ -556,12 +649,6 @@ class FlowDraftBlockWise(FlowDraft):
             # Return None and let the caller emit a graph-connected zero, which
             # is what the masked baseline already does for the same case.
             return None
-        if self.orthrus.model.config.model_type != "qwen3":
-            raise ValueError(
-                "train.anchors_per_sequence > 1 currently requires the Qwen3 "
-                "dual-pass attention path"
-            )
-
         cache = DynamicCache(config=self.orthrus.model.config)
         with torch.no_grad(), self._teacher_eval():
             teacher_full = self.orthrus(
@@ -621,9 +708,18 @@ class FlowDraftBlockWise(FlowDraft):
         ) = prepared
         x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
         x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
-        draft_logits = self._df_forward(
-            x_s, anchor, ctx_mask, cache, s, t, df_kwargs
-        )
+        # Форвард на общей паре (s, t) нужен ТОЛЬКО членам CFM: log_draft входит
+        # в EC, а pi -- в точку приземления x_jump. При endpoint_weight = 0 и
+        # lambda = 0 его выход в лосс не входит вовсе, и градиент по нему ровно
+        # нулевой (проверено retain_grad). Это был мёртвый форвард: 1 из 3 у
+        # руки только с verify_kl и 1 из 7 у рук с самокоррекцией, то есть
+        # 33% и 14% всей работы шага. Заодно он делал число форвардов у ветвей
+        # разным (7 против 6) без всякой причины.
+        draft_logits = None
+        if self._needs_trajectory_forward():
+            draft_logits = self._df_forward(
+                x_s, anchor, ctx_mask, cache, s, t, df_kwargs
+            )
         count = int(self.cfg.train.get("anchors_per_sequence", 1))
         # The decode loop enters every cycle at the pure prior, s = 0, so that
         # is the only state this term should be evaluated at.
@@ -678,6 +774,40 @@ class FlowDraftBlockWise(FlowDraft):
             )
         return shared
 
+    def _guard_compiled_ar(self):
+        """Компилированный AR несовместим с он-полиси таргетом.
+
+        `Orthrus._masked_step` зовёт замороженный ствол с
+        `use_compiled_ar=True`, а `_verifier_response` — без него. Под bf16
+        компилированный и eager пути расходятся на близких значениях, и тогда
+        цель KL и «точный жадный вердикт» приходят из разной арифметики: член
+        учил бы согласию с одной моделью, а приёмку считал бы по другой.
+        Молча это не проходит.
+        """
+        if not self.cfg.model.backbone.get("compile_ar", False):
+            return
+        if self._needs_verifier_response():
+            raise ValueError(
+                "model.backbone.compile_ar=true is incompatible with the "
+                "on-policy target: the teacher would run compiled and the "
+                "verifier eager, and under bf16 the two disagree on near-ties. "
+                "Set compile_ar=false or turn off train.selfcorrect_kl_weight "
+                "and train.log_train_acceptance"
+            )
+
+    def _needs_trajectory_forward(self):
+        """Нужен ли форвард на общей паре (s, t).
+
+        Его выход читают только члены CFM: `log_draft` -> EC, `pi` -> точка
+        приземления `x_jump` -> EC и TD, и `x_t` -> диагональ endpoint. При
+        нулевых `endpoint_weight` и `lambda` в лосс не входит ничего из этого.
+        Условие конфиговое, а не батчевое, поэтому одинаково на всех рангах.
+        """
+        if float(self.cfg.train.get("endpoint_weight",
+                                    self.cfg.train.get("anchor_weight", 1.0))):
+            return True
+        return bool(float(self.cfg.train.get("lambda", 1.0)))
+
     def _needs_verifier_response(self):
         """Is any enabled term paying for the on-policy AR forward?"""
         return (
@@ -722,9 +852,16 @@ class FlowDraftBlockWise(FlowDraft):
         live = block_mask.bool()
         if not live.any():
             # the whole block landed in padding: a zero step wired into the
-            # graph instead of NaN from a mean over an empty tensor
-            return draft_logits.sum() * 0.0
-        log_draft = F.log_softmax(draft_logits.float(), -1)
+            # graph instead of NaN from a mean over an empty tensor. Логи всё
+            # равно выпускаются -- см. _log_zero_terms.
+            self._log_zero_terms(metric_prefix, on_step=log_on_step,
+                                 on_epoch=log_on_epoch)
+            return verify_logits.sum() * 0.0
+        # `verify_logits` считается всегда, поэтому графово связанный ноль
+        # берётся из него: раньше он брался из `draft_logits`, которого при
+        # выключенных членах CFM больше нет.
+        log_draft = (F.log_softmax(draft_logits.float(), -1)
+                     if draft_logits is not None else None)
         # Verifier alignment on the jump the decode loop finishes with.
         #   KL input:  π^θ_{0,1}(x_0) — the pure prior at s = 0, i.e.
         #              the state the decode loop enters every cycle at.
@@ -738,10 +875,12 @@ class FlowDraftBlockWise(FlowDraft):
 
         # Landing point of the jump — the EC-target input. Detached: the
         # jump's single teacher is ECLD.
-        pi = log_draft.exp()
-        gamma = ((t - s) / (1.0 - s).clamp(min=eps))[:, None, None]
-        x_jump = x_s + gamma * (pi - x_s)
-        x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
+        pi = gamma = x_jump = None
+        if log_draft is not None:
+            pi = log_draft.exp()
+            gamma = ((t - s) / (1.0 - s).clamp(min=eps))[:, None, None]
+            x_jump = x_s + gamma * (pi - x_s)
+            x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
 
         # --- categorical VFM endpoint likelihood on the diagonal, plus the two
         # consistency terms. Each costs a DF forward, and each was being paid
@@ -753,8 +892,9 @@ class FlowDraftBlockWise(FlowDraft):
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
         )
-        zero = draft_logits.sum() * 0.0
+        zero = verify_logits.sum() * 0.0
         endpoint, ec, td = zero, zero, zero
+        ec_kl = None
         anchor_point = self.cfg.train.get("anchor_point", "trajectory")
         diag_logits = None
         if endpoint_weight or lam:
@@ -783,7 +923,24 @@ class FlowDraftBlockWise(FlowDraft):
                     tgt = self._df_forward(
                         x_jump, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
                     ).float().softmax(-1)
-            ec = -(tgt * log_draft).sum(-1)[live].mean()
+            # Логируется KL, а не CE: CE = KL + H(tgt) никогда не достигает
+            # нуля, поэтому записанное значение доминируется энтропией таргета
+            # и с verify_kl несравнимо. Градиент тот же -- tgt отцеплен.
+            #
+            # Гейта по гамме здесь НЕТ, и это проверено, а не принято на веру.
+            # При t -> s таргет и предсказание приходят из одного вызова сети,
+            # то есть tgt = sg(p), и градиент CE по логитам равен p - sg(p) =
+            # РОВНО НОЛЬ (замер: |dCE/dlogits|_inf = 1.9e-9). Вырожденные
+            # розыгрыши не портят обучение, они в него просто не входят.
+            # Отбрасывать их означало бы лишь домножить член на 1/P(gamma>eps)
+            # = 1.19 без всякой причины.
+            ce = -(tgt * log_draft).sum(-1)
+            ec = ce[live].mean()
+            # KL = CE - H(tgt). Считается ЗДЕСЬ и подключается к метрикам ниже:
+            # значение раньше присваивалось в атрибут, который никто не читал,
+            # и логировалась всё та же CE. Тензор, не float, — приведение к
+            # питоновскому числу синхронизировало бы хост на каждом шаге.
+            ec_kl = (ce + (tgt * tgt.clamp_min(1e-12).log()).sum(-1))[live].mean().detach()
 
             td = self._td_term(
                 pi, gamma, s, t, live,
@@ -795,7 +952,7 @@ class FlowDraftBlockWise(FlowDraft):
         selfcorrect_kl = None
         if onpolicy_logits is not None:
             selfcorrect_kl = self._selfcorrect_kl(
-                verify_logits, onpolicy_logits, known, anchor_ids,
+                verify_logits, onpolicy_logits, accepted, known, anchor_ids,
                 block_mask, ctx_mask, cache, anchor, df_kwargs,
             )
         selfcorrect_kl_weight = float(self.cfg.train.get("selfcorrect_kl_weight", 0.0))
@@ -813,7 +970,7 @@ class FlowDraftBlockWise(FlowDraft):
             f"{metric_prefix}/endpoint": endpoint,
             f"{metric_prefix}/verify_kl": verify_kl,
             f"{metric_prefix}/selfcorrect_kl": selfcorrect_kl,
-            f"{metric_prefix}/ec": ec,
+            f"{metric_prefix}/ec": ec_kl if ec_kl is not None else ec,
             f"{metric_prefix}/td": td,
             f"{metric_prefix}/lambda": lam,
         }
@@ -836,15 +993,40 @@ class FlowDraftBlockWise(FlowDraft):
         )
         return loss
 
+    def _log_zero_terms(self, metric_prefix, *, on_step, on_epoch):
+        """Тот же набор ключей, что и у полного шага, но нулями.
+
+        `self.log(..., sync_dist=True)` при `on_step=True` выполняет НАСТОЯЩИЙ
+        all_reduce внутри вызова, а NCCL сопоставляет коллективы по порядку их
+        выпуска. Ранний возврат на одном ранге означает, что он выпустил на
+        восемь коллективов меньше, и обучение виснет либо, что хуже, ранги
+        начинают спаривать чужие редукции. Набор ключей обязан совпадать на всех
+        рангах, поэтому наличие `accepted` берётся из конфига
+        (`_needs_verifier_response`), а не из того, что нашлось в этом батче.
+        """
+        zero = torch.zeros((), device=self.device)
+        names = ["endpoint", "verify_kl", "selfcorrect_kl", "ec", "td", "lambda"]
+        if self._needs_verifier_response():
+            names.append("accepted")
+        self.log_dict(
+            {f"{metric_prefix}/{name}": zero for name in names},
+            on_step=on_step, on_epoch=on_epoch, sync_dist=True,
+        )
+
     def training_step(self, batch, batch_idx):
+        if batch_idx == 0:
+            self._guard_compiled_ar()
         shared = self._shared_step(batch)
         if shared is None:
             # No usable block in this batch. Every trainable parameter must stay
-            # connected or DDP's reduction hangs on the ranks that did find one.
+            # connected or DDP's reduction hangs on the ranks that did find one
+            # -- и ровно по той же причине надо выпустить те же логи.
+            self._log_zero_terms("loss", on_step=True, on_epoch=False)
+            self.log("train/loss", torch.zeros((), device=self.device),
+                     prog_bar=True, on_step=True, on_epoch=False, sync_dist=True)
             return sum(p.sum() for p in self.orthrus.df_parameters()) * 0.0
         loss = self.compute_loss(**shared)
-        if not torch.isfinite(loss):
-            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
+        self._assert_finite(loss, batch_idx)
         self.log(
             "train/loss",
             loss,
@@ -859,6 +1041,23 @@ class FlowDraftBlockWise(FlowDraft):
         with self._frozen_val_rng(batch_idx):
             shared = self._shared_step(batch)
             if shared is None:
+                # Тот же набор ключей, что и у полного прохода: `val/loss`,
+                # разложение по членам, попозиционная приёмка и согласие с
+                # учителем. Пропуск любого из них на одном ранге рассинхронит
+                # эпохальную сводку, а `val/loss` вдобавок монитор.
+                zero = torch.zeros((), device=self.device)
+                self._log_zero_terms("val/loss", on_step=False, on_epoch=True)
+                drafted = int(self.cfg.train.get("block_size", 8)) - 1
+                self.log("val/loss", zero, prog_bar=True, on_step=False,
+                         on_epoch=True, sync_dist=True)
+                self.log_dict(
+                    {f"val/acceptance_pos_{i + 1:02d}": zero
+                     for i in range(drafted)},
+                    prog_bar=False, on_step=False, on_epoch=True, sync_dist=True,
+                )
+                self.log("val/teacher_agreement", zero, prog_bar=True,
+                         on_step=False, on_epoch=True, sync_dist=True)
+                self._maybe_decode_val(batch, batch_idx)
                 return None
             teacher_logits = shared["teacher_logits"]
             verify_logits = shared["verify_logits"]

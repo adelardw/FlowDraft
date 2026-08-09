@@ -1,0 +1,17 @@
+# @package _global_
+# Склейка: бейзлайн плюс член самокоррекции в маскирующем состоянии.
+#   L = KL( sg p_AR || pi(маска) ) * pos_w
+#     + (1/r) sum_k l( p_AR(.|ctx, d_{k-1}), pi(состояние_k) ) * v_j * pos_w
+# состояние_k: keep_k позиций зафиксированы своими токенами, остальные под
+# маской; keep_k = round(K*(k+1)/(r+1)), множество монотонно, токены в нём
+# заморожены — та же последовательность, что проходит декод при r+1 прыжках.
+#   uv run python src/train.py +experiment=smollm_masked_selfcorrect
+defaults:
+  - /experiment/smollm_bench
+  - _self_
+
+output_dir: checkpoints/smollm-masked-selfcorrect
+train:
+  variant: orthrus
+  selfcorrect_kl_weight: 1.0
+  selfcorrect_rounds: 2

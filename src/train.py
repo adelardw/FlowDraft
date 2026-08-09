@@ -1,3 +1,6 @@
+import logging
+import os
+import sys
 from pathlib import Path
 
 import hydra
@@ -8,7 +11,7 @@ from loguru import logger
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.nn.parallel import DistributedDataParallel
 
 from src.data import build_dataloaders, quiet_download_logs
@@ -143,7 +146,21 @@ class FinalCheckpoint(L.Callback):
             "unspecified launch failure",
         )
         exception_text = f"{type(exception).__name__}: {exception}".lower()
-        if any(marker in exception_text for marker in cuda_fatal_markers):
+        # Решение обязано быть ОБЩИМ: save_checkpoint коллективен, а маркер
+        # видит только тот ранг, где CUDA действительно упала — остальные
+        # получают уже производный таймаут NCCL, не совпадающий ни с одним
+        # маркером. Разные ветви на разных рангах = гарантированный дедлок в
+        # teardown и отсутствие аварийного чекпоинта вообще.
+        fatal = torch.tensor(
+            float(any(m in exception_text for m in cuda_fatal_markers)),
+            device="cpu",
+        )
+        try:
+            fatal = trainer.strategy.reduce(fatal, reduce_op="max")
+        except Exception:
+            # Группа процессов уже могла развалиться — тогда решаем локально.
+            pass
+        if float(fatal) > 0:
             if trainer.is_global_zero:
                 logger.error(
                     "skipping exception checkpoint because the CUDA context "
@@ -156,6 +173,73 @@ class FinalCheckpoint(L.Callback):
             reason="exception",
             triggering_exception=exception,
         )
+
+
+def _check_validation_cadence(cfg: DictConfig) -> None:
+    """`val_check_interval` считается в БАТЧАХ загрузчика, не в шагах.
+
+    Собственная страховка Lightning (`val_check_interval > num_training_batches`)
+    здесь мертва: поток не сообщает длину, `__len__` бросает TypeError, и
+    `num_training_batches` равно бесконечности — ни одно неверное значение не
+    будет отвергнуто. При накоплении 128 значение 500 означает валидацию каждые
+    3.9 шага оптимизатора, то есть сотни валидаций с настоящим декодом вместо
+    десятков. Считаем и говорим вслух.
+    """
+    interval = cfg.trainer.get("val_check_interval", None)
+    if not isinstance(interval, int):
+        return
+    accum = int(cfg.trainer.get("accumulate_grad_batches", 1) or 1)
+    steps_per_val = interval / accum
+    total = int(cfg.trainer.get("max_steps", 0) or 0)
+    if steps_per_val < 1:
+        raise ValueError(
+            f"trainer.val_check_interval={interval} counts LOADER BATCHES; with "
+            f"accumulate_grad_batches={accum} that is {steps_per_val:.2f} "
+            "optimizer steps per validation. Multiply the interval by the "
+            "accumulation factor"
+        )
+    if total:
+        logger.info(
+            f"validation every {steps_per_val:.0f} optimizer steps "
+            f"({total / steps_per_val:.0f} validations over {total} steps)"
+        )
+
+
+def _skip_consumed_stream(cfg: DictConfig) -> None:
+    """При возобновлении пропустить примеры, уже пройденные до чекпоинта.
+
+    Lightning не перематывает итерируемый датасет, а `current_epoch` внутри
+    одной эпохи не меняется, поэтому и буферный шаффл выдаёт тот же порядок:
+    прогон, продолженный с шага N, снова видит поток с начала. Без пропуска
+    «доучить подольше» означало бы «пройти те же примеры второй раз».
+
+    Считается здесь, а не вызывающим: число уже съеденного выводится из самого
+    чекпоинта, и требовать эту арифметику от того, кто запускает, значит
+    заводить ещё один способ ошибиться. `data.stream_skip`, заданный явно,
+    имеет приоритет.
+    """
+    path = cfg.get("resume_from_checkpoint")
+    if not path or cfg.data.get("stream_skip", None) is not None:
+        return
+    try:
+        step = int(torch.load(path, map_location="cpu", weights_only=False)
+                   .get("global_step", 0))
+    except Exception as error:
+        logger.warning(f"cannot read global_step from {path}: {error}")
+        return
+    # Умножение на world_size обязательно: stream_skip применяется к ГЛОБАЛЬНОМУ
+    # потоку (до шардирования по рангам), а шаг оптимизатора съедает
+    # batch_size * accumulate * world_size примеров. Без него возобновление на
+    # восьми GPU переучивало бы 7/8 уже пройденного.
+    world = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    per_step = int(cfg.data.get("batch_size", 1)) * int(
+        cfg.trainer.get("accumulate_grad_batches", 1) or 1) * world
+    with open_dict(cfg):
+        cfg.data.stream_skip = step * per_step
+    logger.info(
+        f"resuming at step {step}: skipping {cfg.data.stream_skip} already "
+        "consumed training samples"
+    )
 
 
 def build_checkpoint_callbacks(cfg: DictConfig, *, has_validation: bool):
@@ -234,7 +318,15 @@ def build_loggers(cfg: DictConfig):
 @hydra.main(version_base="1.3", config_path="configs", config_name="train")
 def main(cfg: DictConfig) -> None:
     quiet_download_logs()
-    L.seed_everything(cfg.seed, workers=True)
+    # Сид сдвигается рангом. Без сдвига все ранги тянут ПОБИТОВО один поток:
+    # одни и те же пары (s,t), один и тот же розыгрыш приора, одни и те же
+    # страты времён входа. Градиент на восьми GPU тогда — восемь скоррелированных
+    # копий оценки по одному батчу, а не оценка по восьмикратному батчу.
+    # Буферный шаффл потока это не задевает: у него собственный random.Random,
+    # не зависящий от seed_everything, и он ОБЯЗАН совпадать на всех рангах,
+    # иначе круговое шардирование раздаст пересекающиеся куски.
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")) or 0)
+    L.seed_everything(cfg.seed + rank, workers=True)
     configure_training_device_placement(cfg)
     model = build_lit(
         cfg,
@@ -243,6 +335,18 @@ def main(cfg: DictConfig) -> None:
         # checkpoint names, and CLI overrides.
         restore_train_config=False,
     )
+    # Пересев ПОСЛЕ сборки модели. Построение головы тратит глобальный RNG, и
+    # тратит РАЗНОЕ его количество у разных рук: гейт входа — это два nn.Linear
+    # на 627 тысяч параметров, инициализируемых до того, как выходной слой
+    # зануляется. Без пересева гейтованная рука при том же сиде видит другую
+    # позицию якоря, другие времена (s, t) и другой розыгрыш приора, чем
+    # негейтованная (замер: следующий rand после сборки [0.400075, ...] против
+    # [0.889986, ...]). Тогда контраст «гейт против без гейта» смешан с
+    # контрастом «сид A против сида B» стохастического потока, и различие рук
+    # читалось бы как эффект гейта.
+    L.seed_everything(cfg.seed + rank, workers=True)
+    _check_validation_cadence(cfg)
+    _skip_consumed_stream(cfg)
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer, model.df_processor)
 
     if (
@@ -262,7 +366,16 @@ def main(cfg: DictConfig) -> None:
     # validations in a row it may fail to improve); 0 disables.
     patience = cfg.train.get("early_stop_patience", 0)
     if patience > 0 and val_loader is not None:
-        callbacks.append(EarlyStopping(monitor="val/loss", mode="min", patience=patience))
+        # Метрику берём из конфига: жёсткий "val/loss" останавливал прогон по
+        # величине, которая между руками просто не сравнима (у многочленных
+        # лоссов своя шкала), игнорируя cfg.train.monitor из чекпоинтов.
+        callbacks.append(EarlyStopping(
+            # Те же значения по умолчанию, что у ModelCheckpoint выше: иначе
+            # при отсутствии ключа отбор чекпоинтов максимизировал бы val/tpf,
+            # а остановка минимизировала val/loss — две разные цели в одном
+            # прогоне.
+            monitor=cfg.train.get("monitor", "val/tpf"),
+            mode=cfg.train.get("monitor_mode", "max"), patience=patience))
     trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
     configure_ddp_strategy(trainer_kwargs)
     trainer = L.Trainer(
@@ -281,3 +394,16 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     main()
+    # Обучение закончено и последний чекпоинт записан, но процесс на этом не
+    # умирает: интерпретатор уходит в деструктор пула потоков pyarrow (его
+    # держит потоковый датасет) и висит там неограниченно долго -- наблюдалось
+    # 16+ минут после записи last.ckpt. Из-за этого последовательный прогон
+    # нескольких пресетов одной командой вставал на первом же, и приходилось
+    # держать обвязку, которая опрашивала чекпоинт и убивала процесс.
+    # Штатный выход после завершённой работы: всё, что должно быть на диске,
+    # уже на диске.
+    logger.complete()
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

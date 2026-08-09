@@ -1,0 +1,14 @@
+# @package _global_
+# Бейзлайн статьи в геометрии стенда: маскирующий драфтер, один член лосса
+#   L = KL( sg p_AR || pi(маска) ) * pos_w
+# Многошаговость на инференсе возможна (confidence-ordered unmasking), но
+# ничем не обучена — это и есть проверяемое утверждение статьи о том, что
+# одношаговая проекция оптимальна.
+#   uv run python src/train.py +experiment=smollm_masked_baseline
+defaults:
+  - /experiment/smollm_bench
+  - _self_
+
+output_dir: checkpoints/smollm-masked-baseline
+train:
+  variant: orthrus

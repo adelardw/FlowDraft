@@ -213,3 +213,4 @@ results/eval-prompts.jsonl   # построчный дамп eval, гигаба�
 
 # Стенд и корзина — локальные, в репозиторий не идут
 bench/
+results/measure-per-prompt.jsonl

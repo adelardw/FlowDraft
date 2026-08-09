@@ -36,6 +36,8 @@ tokenizer:
 adapter:
   # Official Orthrus maintains a full separate diffusion attention path:
   # Q/K/V/O projections plus the per-head Q/K normalization weights.
+  # Статья обучает ТОЛЬКО Q, K, V. `o_proj`, `q_norm`, `k_norm` — наше
+  # добавление сверх опубликованного набора.
   w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]
   # How the flow-map times reach the DF path.
   #   pair -- encode (s, t)

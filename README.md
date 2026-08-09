@@ -44,6 +44,72 @@
 - [Acknowledgments](#acknowledgments)
 - [License](#license) 🚧
 
+## Кампания 8–9 августа 2026: обучение многошаговости
+
+Десять экспериментов на SmolLM2-135M, 20000 шагов каждый, строгий замер на 460
+задачах шести бенчмарков (56000 попромптовых наблюдений, три горизонта, четыре
+расписания декодирования). Постановка, результаты и сравнение со статьёй —
+[EXPERIMENTS.md](EXPERIMENTS.md).
+
+**Главный результат.** Вывод статьи Orthrus «одношаговая проекция оптимальна»
+верен для маскирующего чернового генератора и неверен для непрерывного
+состояния. У всех маскирующих вариантов приёмка от числа проходов уточнения
+почти не растёт (+0.055…+0.069 от одного прохода к четырём), у непрерывного
+состояния с обучением многошаговости она растёт на **+0.925**. Та же
+архитектура **без** этого обучения теряет 0.337 токена — единственный
+отрицательный рост в наборе.
+
+| контраст (три прохода, 20000 шагов) | Δ принятых токенов | 95% интервал |
+|---|---|---|
+| обучение многошаговости, непрерывное состояние | **+1.175** | [+1.135, +1.215] |
+| итог против воспроизведённого Orthrus | **+0.870** | [+0.828, +0.912] |
+| непрерывное состояние против маскирования при том же члене | +0.640 | [+0.601, +0.679] |
+| наши изменения к воспроизведённому бейзлайну | +0.182 | [+0.161, +0.204] |
+| обучение многошаговости, маскирование | +0.048 | [+0.031, +0.065] |
+
+**Ускорения многошаговость не даёт.** Пропускная способность падает монотонно, и
+ни один вариант при многошаговости не превышает единицу, то есть не быстрее
+обычного декода: цикл стоит `n+1` форвардов, а приёмка растёт медленнее, чем `n`.
+Выше единицы только одношаговое декодирование (1.327 / 1.264 / 1.219).
+
+![приёмка и пропускная способность против числа прыжков](results/figures/jumps.png)
+![кривые обучения](results/figures/training_curves.png)
+![парные контрасты](results/figures/contrasts.png)
+
+**Ограничение:** сид обучения один. Интервалы описывают разброс по задачам, а не
+между прогонами обучения. Утверждение о методе требует нескольких сидов.
+
+### Что изменилось в коде
+
+Дефекты, каждый с измеренным различием до и после:
+
+| | было | стало |
+|---|---|---|
+| доля фиксации в обучении многошаговости | `[16, 31]` — второй проход супервизировал блок без единой маски | `[10, 21]`, совпадает с декодной точно |
+| расписание валидации задавалось числом | две ноги из трёх шли при `t<1`, где градиента нет вовсе | пары рестарта, совпадающие с обучаемыми |
+| веса позиций у двух ветвей | разный dtype, 2.828 против 2.824 | побитово одни |
+| смешанная валидация | падала на вложенной инициализации Hydra | работает |
+| разбор расписания парами | падал на `ListConfig` | все пять форм |
+| мёртвый форвард при нулевых членах согласованности | 3 и 7 форвардов на шаг | 2 и 6, время шага 0.18 → 0.11 с |
+| обусловливание временем тратило глобальный генератор | эксперименты с разной архитектурой видели разные данные при одном сиде | пересев после сборки модели |
+| `eval.py` | мерил на блоке 8 модель, обученную на 32; падал на записи парных расписаний | исправлено |
+| `min_jump_gap` | обоснование было неверным: градиент при `s≈t` не нулевой, а пропорционален `t−s` | оставлен в нуле |
+
+Переносимость: снят запрет на чужие бэкбоны под CUDA (плотный путь маски
+корректен и портативен); коллективные проверка конечности лосса и решение о
+сохранении при аварии; сдвиг сида по рангу; чанкование всех трёх режимов учителя
+(6.09 → 0.75 ГБ на бумажном пресете); `val_check_interval` в пресетах из статьи
+считался в батчах загрузчика — 3.9 шага оптимизатора вместо 250.
+
+Losslessness требует `model.backbone.dtype=float32`: под bf16 арифметика
+проверяющей модели ломает побитовое совпадение на близких значениях (5 из 6
+против 6 из 6). Для сравнения экспериментов безвредно, для утверждения о
+losslessness — нет.
+
+Отвергнутые конфигурации — в [bucket/](bucket/) с числами и обоснованием.
+Посылки целевой функции, которые кодом не устраняются, — в
+[ASSUMPTIONS.md](ASSUMPTIONS.md).
+
 ## Overview
 
 Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens costs *L* forward passes, which is memory-bandwidth bound. Diffusion LMs can draft whole blocks in parallel, but they drift from the AR distribution and lose quality. Speculative-style verification restores quality: draft a block in parallel, then verify it against the AR model in a single pass and keep only the tokens the AR model would have produced — this is **lossless**.
@@ -248,64 +314,101 @@ the data, the schedule, the backbone and the budget; only the terms differ.
 
 ### Results
 
-Acceptance against training budget, one panel per schedule:
+Two independent training seeds, six arms, 6000 steps each, snapshots along the
+way. Unit of observation is the **prompt** (24 of them): the masked drafter's
+decode is deterministic — the prior does not enter it — so its five decode seeds
+are bit-identical copies, and treating 120 cells as independent understated the
+standard error by sqrt(5).
 
-![horizon grid](results/figures/horizon_grid.png)
+| arm | A@1 (s42/s43) | A@2 | A@4 | growth A@4 − A@1 |
+|---|---|---|---|---|
+| `masked` | 1.391 / 1.454 | 1.803 / 1.707 | 2.595 / 3.140 | +1.204 (t=+4.15) / +1.686 (t=+5.24) |
+| `masked + self-corr` | 1.301 / 1.358 | 1.425 / 1.577 | 2.728 / 2.517 | +1.427 (t=+4.34) / +1.159 (t=+5.02) |
+| `flow` | 1.134 / 1.259 | 1.148 / 1.224 | 0.963 / 1.042 | -0.171 (t=-3.51) / -0.217 (t=-2.08) |
+| `flow + self-corr` | 1.310 / 1.339 | 1.826 / 1.779 | 2.218 / 2.136 | +0.909 (t=+4.02) / +0.797 (t=+4.11) |
+| `flow + self-corr + CFM` | 1.163 / 1.401 | 1.748 / 1.782 | 2.006 / 2.085 | +0.843 (t=+3.75) / +0.684 (t=+3.50) |
+| `flow + self-corr, old weighting` | 1.383 / 1.436 | 1.708 / 1.698 | 2.055 / 2.059 | +0.672 (t=+3.35) / +0.622 (t=+3.92) |
 
-Best configuration at 6000 steps is **masked + self-corr** — **A@1 / A@2 / A@4 = 1.399 | 1.639 | 2.719**,
-TPF@1 = 1.199.
+| arm | TPF@1 | TPF@2 | TPF@4 |
+|---|---|---|---|
+| `masked` | 1.211 | 0.918 | 0.773 |
+| `masked + self-corr` | 1.165 | 0.834 | 0.724 |
+| `flow` | 1.098 | 0.729 | 0.401 |
+| `flow + self-corr` | 1.162 | 0.934 | 0.635 |
+| `flow + self-corr + CFM` | 1.141 | 0.922 | 0.609 |
+| `flow + self-corr, old weighting` | 1.205 | 0.901 | 0.611 |
 
-![acceptance vs jumps](results/figures/acceptance_vs_jumps.png)
+### What survived
 
-![paired contrasts](results/figures/contrasts.png)
+**One finding, and it survived everything: clustering, a leak fix, weight
+parity between branches, and a second seed.**
 
-### What holds, by strength of evidence
+Acceptance grows with the number of jumps only when the drafter is trained
+against the verifier's verdict on its own draft. Without that term the flow-map
+arm *degrades* with jumps — `+1.255` and `+1.093` at `n=4`
+(t = +5.09, +4.11) separate the two, and the arm without
+it moves the wrong way on both seeds. At `n=2` the same contrast is
+`+0.678` / `+0.554` (t = +4.27, +4.03).
 
-With ~36 contrasts the Bonferroni bar is `|t| > 3.2`. Three findings clear it and
-are also backed by a monotone trend across horizons:
+The verdict enters the objective three ways, all from one frozen AR forward
+over the drafter's own proposal: as the **target** `p_AR(· | ctx, draft_{<j})`,
+as the **state** the next round reads (confirmed positions settled, the
+corrected one clean, the tail carrying its rejected guess), and as the
+**weighting** across positions.
 
-**1. Self-correction is what makes acceptance grow with jumps.** Without it the
-flow-map arm *degrades*: **flow** alone reaches A@4/A@1 = 0.71. With it, `+1.539` tokens at
-`n=4` (t = 11.5). Within-arm growth `A@2 - A@1` is `+0.578` (t = 8.6).
+### What did not
 
-**2. Training the masked drafter for its own multi-step schedule beats it.**
-**masked + self-corr** over **masked** at `n=1` runs `-0.034  +0.095  +0.105` across
-2000/4000/6000 — monotone, t = 3.6 at the end. Orthrus's own paper reports
-multi-step denoising costing 44% of throughput and concludes single-step
-projection is optimal; that conclusion is an artefact of never training for it.
+- **Training the masked drafter for multi-step.** `-0.090` and
+  `-0.096` at `n=1` — negative on both seeds once the masked branch
+  also got the position weights and the leak in its self-correction forward was
+  removed. An earlier `+0.105` at t = 3.61 was two artefacts stacked: an
+  understated SE, and position weights on one side of the comparison only.
+- **The continuous state over the masked one.** `+0.401` /
+  `+0.202` at `n=2` — same sign, twice the spread, significant on
+  neither seed.
+- **The CFM structure.** `-0.212` / `-0.050` at `n=4`. Effect
+  not detected; the earlier `-0.63` at t = -6.5 did not reproduce once the
+  weight confound and the LR re-warmup were gone.
+- **Multi-step as throughput.** TPF falls with `n` for every arm. Only `n=1`
+  beats plain AR. Multi-step buys acceptance, never speed.
 
-**3. The continuous state pays at two jumps.** **flow + self-corr** over **masked + self-corr** at `n=2` runs
-`-0.020  +0.114  +0.238` — monotone increasing, t = 3.0 at 6000. It
-does *not* pay at one jump (`-0.015  -0.065  -0.099`) or at four
-(`-0.996  -0.050  -0.308`).
+And the masked baseline grows with jumps **without being trained for it at
+all** — confidence-ordered unmasking already does this. Its growth
+(2.595 / 3.140) is at least as large as the flow map's.
 
-**The CFM structure does not pay.** **flow + self-corr + CFM** over **masked + self-corr** at `n=4` runs
-`-1.183  -0.546  -0.631` — negative in all nine cells. The gap
-narrows with budget (it is the slowest arm to converge, and twice the wall-clock
-per step), but at 6000 it is still `-0.63` at t = -6.5. Not supported here.
+### Between-seed spread is the binding constraint
 
-**TPF stays below 1.0 at every `n > 1`.** Multi-step raises acceptance, not
-throughput; the only configuration faster than plain AR is **masked + self-corr** at `n=1`.
+`orthrus` A@4 is 2.595 on one seed and 3.140 on the other, with an unchanged
+objective. That half-token gap is larger than every contrast in the two
+sections above except the self-correction one. Two seeds are enough to show
+this; they are not enough to resolve effects of 0.1–0.4 tokens, and no number
+of prompts fixes that — the variance is in training, not in decoding.
 
-### Budget is a confound, and it bit once
+### What the audit changed
 
-![training horizon](results/figures/training_horizon.png)
+An adversarial review of the design — run blind, before it saw any number —
+predicted most of this correctly and named the defects that produced the rest.
+Four were real and all four inflated the earlier conclusions:
 
-At 2000 steps the multi-step contrast was *negative* and the honest reading was
-"multi-step training does not help". At 4000 and 6000 the sign flips and holds.
-The one-component objective plateaus between 2000 and 4000; multi-component ones
-keep improving. **Any ablation of a loss term needs a horizon long enough for
-that term to converge, or it measures convergence speed instead.**
+| defect | effect |
+|---|---|
+| SE over 120 cells when the masked arms have 24 independent units | three of four "established" findings |
+| position weights on the flow arms only | the claimed parity was partly a weight contrast |
+| `fixed_prior` not covering the restart draw | arms unpaired on second-leg noise at `n>1` |
+| cosine rebuilt on resume, LR back to ~79% of peak | the 4000-step point was systematically handicapped |
 
-![training curves](results/figures/training_curves.png)
+Two more were bugs in the self-correction term itself: the masked branch's
+second forward was bidirectional, so the row predicting position `j` read the
+committed draft token straight out of slot `j` — a copy shortcut on exactly the
+full-weight positions — and training committed `K/2` positions where decoding
+commits `round(K(k+1)/n)`.
 
-`loss/accepted` — the exact greedy accepted-prefix length, measured on every
-block of every step by the on-policy forward the self-correction term already
-pays for — declines late in the **flow + self-corr** run while its math500 acceptance keeps
-rising. Training-block acceptance and held-out decode acceptance are different
-distributions; do not read one for the other.
+An arm trained with the *old* weight profile (`flow + self-corr, old
+weighting`) is kept as a control on the fix itself. It is worse, but only
+slightly and only on one seed: the copy-shortcut argument was right in sign and
+small in size.
 
-### Known limits (what the next stage must fix)
+### Known limits### Known limits (what the next stage must fix)
 
 - **One training seed per arm.** The intervals cover decode noise, not
   training-run variance. Between-snapshot spread on an unchanged objective

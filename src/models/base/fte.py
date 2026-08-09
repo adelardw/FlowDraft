@@ -15,7 +15,7 @@ class FlowTimeEmbedding(nn.Module):
     """
 
     def __init__(self, hidden_size: int, freq_dim: int = 256, max_period: float = 10_000.0,
-                 parameterisation: str = "pair"):
+                 parameterisation: str = "pair", gated: bool = False):
         super().__init__()
         if parameterisation not in ("pair", "jump"):
             raise ValueError(
@@ -40,6 +40,29 @@ class FlowTimeEmbedding(nn.Module):
         )
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
+        # Гейт: множитель на входе, а не слагаемое к нему.
+        #
+        # `verify_kl` считается при s = 0 на случайном розыгрыше приора, и его
+        # таргет от розыгрыша не зависит: минимум требует, чтобы карта вход
+        # ИГНОРИРОВАЛА, то есть d(pi)/dx = 0. Член самокоррекции при s >= 0.5
+        # требует обратного. Различать режимы сеть может только через s, а s
+        # входит ПРИБАВЛЕНИЕМ, и сложение якобиан не гейтит: замер показал, что
+        # отклик на вход гасится лишь сдвигами в 81-325 крат медианной нормы
+        # строки эмбеддинга, а в реальном диапазоне падает только до 0.43.
+        # Умножение обнуляет якобиан по построению.
+        #
+        # `g = 1 + h(s,t)` с zero-init `h`: на старте гейт РОВНО единица, то
+        # есть путь побитово совпадает с негейтованным, и обучение начинается
+        # из той же рабочей точки.
+        self.gate = None
+        if gated:
+            self.gate = nn.Sequential(
+                nn.Linear(2 * freq_dim, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            nn.init.zeros_(self.gate[-1].weight)
+            nn.init.zeros_(self.gate[-1].bias)
 
     def _sinusoidal(self, x):
         """Times in [0, 1] -> sinusoidal features (fp32), one extra last axis.
@@ -67,6 +90,24 @@ class FlowTimeEmbedding(nn.Module):
         """
         if s.shape != t.shape:
             raise ValueError(f"s and t must share a shape, got {tuple(s.shape)} and {tuple(t.shape)}")
+        features = self._features(s, t)
+        return self.mlp(features)
+
+    def _features(self, s, t):
         second = t if self.parameterisation == "pair" else (t - s).clamp_min(0.0)
         features = torch.cat([self._sinusoidal(s), self._sinusoidal(second)], dim=-1)
-        return self.mlp(features.to(self.mlp[0].weight.dtype))
+        return features.to(self.mlp[0].weight.dtype)
+
+    def input_gate(self, s, t):
+        """Множитель на вход, `1 + h(s,t)`. `None`, когда гейт выключен.
+
+        На старте ровно единица (zero-init `h`), поэтому включённый, но ещё не
+        обученный гейт даёт побитово тот же прогон, что и выключенный.
+        """
+        if self.gate is None:
+            return None
+        if s.shape != t.shape:
+            raise ValueError(
+                f"s and t must share a shape, got {tuple(s.shape)} and {tuple(t.shape)}"
+            )
+        return 1.0 + self.gate(self._features(s, t))

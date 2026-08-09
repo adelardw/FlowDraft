@@ -301,7 +301,8 @@ def main(cfg: DictConfig) -> None:
         "train_anchor_point": train_cfg.get("anchor_point", None),
         "train_selfcorrect_kl_weight": train_cfg.get("selfcorrect_kl_weight", None),
         "block_size": dec.block_size,
-        "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),
+        "jumps": dec.jumps if isinstance(dec.jumps, int) else OmegaConf.to_container(dec.jumps, resolve=True)
+        if OmegaConf.is_config(dec.jumps) else list(dec.jumps),
         "fixed_prior": dec.get("fixed_prior", False),
         "temperature": dec.get("temperature", 0.0),
         "coupled": dec.get("coupled", True),

@@ -1,0 +1,29 @@
+# @package _global_
+# Контроль на профиль весов ВНУТРИ члена самокоррекции: tail=1.0 возвращает
+# старое распределение, где полный вес приходится на принятый префикс.
+# Аргумент правки: на принятом префиксе таргет лежит во входе, там член почти
+# всегда прав и градиента несёт мало, а информативна ровно позиция разрыва.
+# Если эта рука не хуже, правка была косметикой — суждение, а не дефект,
+# поэтому оно проверяется рукой, а не декларируется.
+#   uv run python src/train.py +experiment=smollm_flow_selfcorrect_prefixweight
+defaults:
+  - /experiment/smollm_bench
+  - _self_
+
+output_dir: checkpoints/smollm-flow-selfcorrect-prefixweight
+train:
+  variant: flowdraft_block_wise
+  prior_type: discunif
+  verify_kl_weight: 1.0
+  endpoint_weight: 0.0
+  lambda: 0.0
+  terminal_time_fraction: 1.0
+  selfcorrect_kl_weight: 1.0
+  selfcorrect_rounds: 2
+  # Не 0.0: вход ноги есть (1-s)x0' + s*q, и черновик восстановим из него лишь
+  # при s > 1/(1+q_max) — это 0.53 при уверенности 0.9 и 0.83 при 0.2. Нижний
+  # бин стратификации при s_min=0 лежит ЦЕЛИКОМ ниже порога при любом розыгрыше:
+  # там таргет входом не определён, и минимум члена — вход-независимая смесь,
+  # то есть ровно та константная карта, против которой член и введён.
+  selfcorrect_s_min: 0.5
+  selfcorrect_tail_weight: 1.0

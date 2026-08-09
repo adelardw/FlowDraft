@@ -59,10 +59,17 @@ class EpochShuffled(IterableDataset):
         buffer_size: int,
         size: int | None = None,
         shard_by_rank: bool = True,
+        shard_by_worker: bool = True,
     ):
         self.ds, self.seed, self.buffer_size = ds, seed, buffer_size
         self.size = size
         self.shard_by_rank = shard_by_rank
+        # Шардировать по воркерам должен ТОЛЬКО внешний поток. В упакованном
+        # режиме сверху стоит PackedTokenStream, который делает это сам, и
+        # двойное применение выбрасывало (num_workers-1)/num_workers данных
+        # молча -- при num_workers=0 это спит, а поднять их и есть первое, что
+        # делают с узким загрузчиком.
+        self.shard_by_worker = shard_by_worker
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -97,7 +104,7 @@ class EpochShuffled(IterableDataset):
         stream = self._shuffled()
         if self.shard_by_rank:
             stream = _round_robin_rank_shard(stream)
-        yield from _worker_shard(stream)
+        yield from _worker_shard(stream) if self.shard_by_worker else stream
 
 
 class PackedTokenStream(IterableDataset):
@@ -307,6 +314,15 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # Keep validation genuinely held out while preserving exactly
     # ``train_size`` training rows after it.
     train_ds = ds.skip(val_size) if val_size else ds
+    # Возобновление перезапускает поток с начала: Lightning не перематывает
+    # итерируемый датасет, а `current_epoch` внутри одной эпохи не меняется, так
+    # что и буферный шаффл выдаёт тот же порядок. Без пропуска этап, начатый с
+    # шага 6000, переучивался бы ровно на тех же примерах, и «дольше» означало
+    # бы «больше эпох», а не «больше данных». `data.stream_skip` — сколько
+    # обучающих примеров уже съедено к моменту возобновления.
+    consumed = int(d.get("stream_skip", 0) or 0)
+    if consumed:
+        train_ds = train_ds.skip(consumed)
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
     # sense) — still streaming, nothing is downloaded ahead. null/0 = the
@@ -347,6 +363,11 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         # make a second full streaming/tokenization pass just to count its
         # packed output; the paper-reported optimizer horizon lives in the
         # baseline preset instead.
+        # Внутренний поток отдаёт всё: шардирование и по рангам, и по воркерам
+        # делает PackedTokenStream, чтобы упаковка не зависела от того, кто
+        # читает.
+        train_ds.shard_by_rank = False
+        train_ds.shard_by_worker = False
         train_ds = PackedTokenStream(train_ds, tokenize_for_pack, max_length=d.max_length)
     return make_loader(train_ds, packed=pack_sequences), (
         make_loader(val_ds) if val_ds is not None else None

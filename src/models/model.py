@@ -54,6 +54,7 @@ def build_model(cfg: DictConfig):
             "flex_attention_backend", "triton"
         ),
         time_parameterisation=cfg.adapter.get("time_parameterisation", "pair"),
+        conditioning_gate=cfg.adapter.get("conditioning_gate", False),
     )
     if compile_ar:
         model.enable_ar_compile(mode=compile_mode, dynamic=compile_dynamic)

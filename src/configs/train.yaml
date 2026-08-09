@@ -38,16 +38,36 @@ train:
 
   # --- trajectory ---------------------------------------------------------
   # prior_type decides whether x_s = (1-s)x0 + s x1 hides the answer. At
-  # V=151936 the clean token becomes the argmax of x_s once s exceeds 7.4e-5
-  # under dirichlet, 0.5 under discunif, 0.815 under gaussian. dirichlet is
+  # V=151936 the clean token becomes the argmax of x_s once s exceeds 8.2e-5
+  # under dirichlet, 0.5 under discunif, 1.1e-2 under gaussian. The gaussian
+  # figure is for the IMPLEMENTED prior, which divides by sqrt(V); the 0.815
+  # once quoted here is the unscaled variant and never applied. dirichlet is
   # this project's substitution and is kept only to reproduce older runs.
+  # For the self-correction state the second argument is a softmax, not a
+  # one-hot, so the discunif threshold there is 1/(1 + q_max), not 0.5.
   prior_type: discunif          # discunif | gaussian | dirichlet
   time_sampling: paper          # paper: t~U[0,1], s~U[0,t] | triangle | sequential
   terminal_time_fraction: 0.0   # share of the batch forced onto t = 1, the only
                                 # pair the decode loop executes
   anchor_point: trajectory      # diagonal input: trajectory pi_{t,t}(x_t) | landing
-  gamma_clamp: 1.0e-4           # floor on (1-s) in gamma = (t-s)/(1-s)
+  gamma_clamp: 1.0e-4           # floor on (1-s) in gamma = (t-s)/(1-s), bounding
+                                # gamma at 1e4 as s -> 1. NOT a precision guard:
+                                # s comes from fp32 rand, and by Sterbenz 1-s is
+                                # exact for s in [0.5,1] in any binary format. A
+                                # coarser floor would break gamma = 1 at t = 1:
+                                # at 1e-2 that identity already fails for s > 0.99
   td_min_step: 0.01             # minimum finite-difference probe for the drift term
+  min_jump_gap: 0.0             # floor on t - s. Affects exactly ONE arm --
+                                # the only one with endpoint_weight or lambda
+                                # non-zero; elsewhere the (s,t) forward is not
+                                # computed at all (measured: loss identical at
+                                # gap 0 / 0.05 / 0.2 for nine of ten arms,
+                                # 11.564 / 11.530 / 11.286 for the tenth).
+                                # Kept at 0: the gradient at s ~ t is NOT zero,
+                                # it is O(t - s), so those pairs are weak rather
+                                # than useless, and there is no evidence that
+                                # excluding them helps. Raising it changes what
+                                # that arm means and needs its own control
 
   # --- objective ----------------------------------------------------------
   #   loss = verify_kl_weight   * KL(p_AR || pi_{0,1}(x0))
@@ -76,8 +96,11 @@ train:
                                 # forward, free once a self-correction term is on.
   teacher_chain_tail_weight: 1.0  # weight past the first divergence of the greedy
                                 # chain from the corpus; 1.0 = off, 0.0 = hard mask
-  position_weights: null        # per-position dE/da_j, e.g. [2.32, 1.75, 1.41, 0.87,
-                                # 0.39, 0.19, 0.07]; normalised to mean 1
+  acceptance_profile: null      # MEASURED per-position acceptance a_j; dE/da_j is
+                                # derived from it exactly. Prefer this: a hand-written
+                                # weight list normalised to S_1 = 1 silently assumes
+                                # a_1 = 1 and understates position 1 by 1/a_1
+  position_weights: null        # explicit dE/da_j override, normalised to mean 1
   log_train_acceptance: false   # exact greedy acceptance every step (free once any
                                 # on-policy term is on, one AR forward otherwise)
 
@@ -89,8 +112,12 @@ train:
   checkpoint_save_top_k: 2
   monitor: val/tpf              # val/tpf (target metric, noisy) | val/loss + min
   monitor_mode: max
-  early_stop_patience: 5        # validations without val/loss improvement; 0 = off
+  early_stop_patience: 5        # validations without `monitor` improving; 0 = off
   val_decode_prompts: 2         # real decode loop on N val prompts; 0 = off
+  val_decode_datasets: []       # benchmarks to draw those prompts from, evenly.
+                                # Empty = the training stream's val slice, which
+                                # selects checkpoints on the training
+                                # distribution rather than on what is reported
   val_decode_max_new: 32
   val_decode_jumps: 1           # schedule validation decodes with; int, [times],
                                 # or [[s,t],...]. monitor: val/tpf selects on THIS

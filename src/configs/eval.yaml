@@ -13,6 +13,15 @@ run_id: null
 experiment_id: null          # stable configuration ID shared across training seeds
 split_label: null
 lossless_policy: assert       # assert (canonical) | diagnose (throughput audit) | ignore
+# Losslessness требует float32 СТВОЛА, а не только trainer.precision. У обеих
+# моделей `backbone.dtype: bfloat16`, и 32-битный плагин Lightning параметры
+# модуля не поднимает, так что логиты приходят в bf16 при любом значении
+# precision. Замерено при K=32, temperature=0: bf16 даёт 5 lossless из 6,
+# float32 — 6 из 6, и расхождения у ДВУХ разных драфтеров приходятся на одни
+# позиции, то есть это арифметика верификатора на близких значениях, а не
+# логика приёмки. Для сравнения рук безвредно (ствол один и тот же у всех), для
+# утверждения «декод lossless» — нет. Мерить так:
+#   uv run python src/eval.py checkpoint=... model.backbone.dtype=float32
 variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint
 
 # Eager is the canonical bitwise-correctness backend. SDPA throughput audits
@@ -32,7 +41,10 @@ data:
 # K is total width (one anchor + K-1 drafts). Grid example:
 # `uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4`
 decode:
-  block_size: 8
+  # 32, как в обучении. Было 8: чекпоинт восстанавливает train.block_size, а
+  # замер берёт decode.block_size, и карту, обученную на блоке 32, мерили бы на
+  # блоке 8 — молча, без единого предупреждения.
+  block_size: 32
   fixed_prior: false        # true: start each cycle from the uniform simplex point instead
                             # of a fresh Dirichlet draw -- greedy verification has no
                             # randomness in it, so the draw only adds variance
