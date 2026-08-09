@@ -44,70 +44,74 @@
 - [Acknowledgments](#acknowledgments)
 - [License](#license) 🚧
 
-## Кампания 8–9 августа 2026: обучение многошаговости
+## Multi-step drafting study (August 8-9, 2026)
 
-Десять экспериментов на SmolLM2-135M, 20000 шагов каждый, строгий замер на 460
-задачах шести бенчмарков (56000 попромптовых наблюдений, три горизонта, четыре
-расписания декодирования). Постановка, результаты и сравнение со статьёй —
-[EXPERIMENTS.md](EXPERIMENTS.md).
+Ten training runs on SmolLM2-135M, 20k steps each, measured on 460 tasks drawn
+from six benchmarks — 56,000 per-prompt observations across three training
+horizons and four decode schedules. Setup, results and the comparison against
+the paper: [EXPERIMENTS.md](EXPERIMENTS.md).
 
-**Главный результат.** Вывод статьи Orthrus «одношаговая проекция оптимальна»
-верен для маскирующего чернового генератора и неверен для непрерывного
-состояния. У всех маскирующих вариантов приёмка от числа проходов уточнения
-почти не растёт (+0.055…+0.069 от одного прохода к четырём), у непрерывного
-состояния с обучением многошаговости она растёт на **+0.925**. Та же
-архитектура **без** этого обучения теряет 0.337 токена — единственный
-отрицательный рост в наборе.
+**Headline.** Orthrus concludes that single-step projection is optimal. That
+holds for a masked drafter and fails for a continuous state. Every masked
+variant gains almost nothing from extra refinement passes (+0.055 to +0.069
+going from one pass to four), whether or not it was trained on them. A
+continuous state trained on its own refinement procedure gains **+0.925**. The
+same architecture *without* that training **loses** 0.337 tokens — the only
+negative slope in the set.
 
-| контраст (три прохода, 20000 шагов) | Δ принятых токенов | 95% интервал |
+| contrast (three passes, 20k steps) | Δ accepted tokens | 95% CI |
 |---|---|---|
-| обучение многошаговости, непрерывное состояние | **+1.175** | [+1.135, +1.215] |
-| итог против воспроизведённого Orthrus | **+0.870** | [+0.828, +0.912] |
-| непрерывное состояние против маскирования при том же члене | +0.640 | [+0.601, +0.679] |
-| наши изменения к воспроизведённому бейзлайну | +0.182 | [+0.161, +0.204] |
-| обучение многошаговости, маскирование | +0.048 | [+0.031, +0.065] |
+| multi-step training, continuous state | **+1.175** | [+1.135, +1.215] |
+| best run vs reproduced Orthrus | **+0.870** | [+0.828, +0.912] |
+| continuous state vs masking, same objective | +0.640 | [+0.601, +0.679] |
+| our changes to the reproduced baseline | +0.182 | [+0.161, +0.204] |
+| multi-step training, masking | +0.048 | [+0.031, +0.065] |
 
-**Ускорения многошаговость не даёт.** Пропускная способность падает монотонно, и
-ни один вариант при многошаговости не превышает единицу, то есть не быстрее
-обычного декода: цикл стоит `n+1` форвардов, а приёмка растёт медленнее, чем `n`.
-Выше единицы только одношаговое декодирование (1.327 / 1.264 / 1.219).
+**Multi-step buys quality, not speed.** Throughput falls monotonically and no
+multi-step variant exceeds 1.0 tokens per forward, i.e. none beats plain
+autoregressive decoding: a cycle costs `n+1` forwards while acceptance grows
+slower than `n`. Only single-pass decoding clears 1.0 (1.327 / 1.264 / 1.219).
+This is exactly what the prefix-fixing lemma predicts — it gives `TPF = 1` as a
+floor, not as a speedup mechanism.
 
-![приёмка и пропускная способность против числа прыжков](results/figures/jumps.png)
-![кривые обучения](results/figures/training_curves.png)
-![парные контрасты](results/figures/contrasts.png)
+![acceptance and throughput vs refinement passes](results/figures/multistep.png)
+![training curves](results/figures/training_curves.png)
+![paired contrasts](results/figures/contrasts.png)
+![per-benchmark breakdown](results/figures/per_benchmark.png)
+![measured horizon](results/figures/horizon.png)
 
-**Ограничение:** сид обучения один. Интервалы описывают разброс по задачам, а не
-между прогонами обучения. Утверждение о методе требует нескольких сидов.
+**Caveat.** One training seed. The intervals describe spread over tasks, not
+across training runs. A claim about the *method* needs several seeds; seed
+replication is in progress.
 
-### Что изменилось в коде
+### What changed in the code
 
-Дефекты, каждый с измеренным различием до и после:
+Defects found and fixed, each with a measured before/after:
 
-| | было | стало |
+| | before | after |
 |---|---|---|
-| доля фиксации в обучении многошаговости | `[16, 31]` — второй проход супервизировал блок без единой маски | `[10, 21]`, совпадает с декодной точно |
-| расписание валидации задавалось числом | две ноги из трёх шли при `t<1`, где градиента нет вовсе | пары рестарта, совпадающие с обучаемыми |
-| веса позиций у двух ветвей | разный dtype, 2.828 против 2.824 | побитово одни |
-| смешанная валидация | падала на вложенной инициализации Hydra | работает |
-| разбор расписания парами | падал на `ListConfig` | все пять форм |
-| мёртвый форвард при нулевых членах согласованности | 3 и 7 форвардов на шаг | 2 и 6, время шага 0.18 → 0.11 с |
-| обусловливание временем тратило глобальный генератор | эксперименты с разной архитектурой видели разные данные при одном сиде | пересев после сборки модели |
-| `eval.py` | мерил на блоке 8 модель, обученную на 32; падал на записи парных расписаний | исправлено |
-| `min_jump_gap` | обоснование было неверным: градиент при `s≈t` не нулевой, а пропорционален `t−s` | оставлен в нуле |
+| commit widths in multi-step training | `[16, 31]` — the second pass supervised a block with no masks left | `[10, 21]`, matching decode exactly |
+| validation schedule given as an integer | two legs of three ran at `t<1`, where no term provides gradient | restart pairs matching what is trained |
+| position weights across the two branches | different dtype, 2.828 vs 2.824 | bitwise identical |
+| mixed-benchmark validation | crashed on nested Hydra initialisation | works |
+| schedule parsing for pair form | crashed on `ListConfig` | all five input forms |
+| dead forward when consistency terms are off | 3 and 7 backbone forwards per step | 2 and 6; step time 0.18 s → 0.11 s |
+| time conditioning consumed the global RNG | one architecture saw different data at the same seed | reseed after model construction |
+| `eval.py` | measured a block-32 model at block 8; crashed writing paired schedules | fixed |
+| `min_jump_gap` | justification was wrong: the gradient at `s≈t` is `O(t−s)`, not zero | left at 0 |
 
-Переносимость: снят запрет на чужие бэкбоны под CUDA (плотный путь маски
-корректен и портативен); коллективные проверка конечности лосса и решение о
-сохранении при аварии; сдвиг сида по рангу; чанкование всех трёх режимов учителя
-(6.09 → 0.75 ГБ на бумажном пресете); `val_check_interval` в пресетах из статьи
-считался в батчах загрузчика — 3.9 шага оптимизатора вместо 250.
+Portability: the CUDA path no longer refuses non-Qwen3 backbones (the dense
+mask is correct and portable); the finite-loss check and the crash-checkpoint
+decision are now collective; the seed is offset by rank; all three teacher
+modes are chunked (6.09 GB → 0.75 GB at the paper preset); `val_check_interval`
+in the paper presets counted loader batches — 3.9 optimizer steps instead of 250.
 
-Losslessness требует `model.backbone.dtype=float32`: под bf16 арифметика
-проверяющей модели ломает побитовое совпадение на близких значениях (5 из 6
-против 6 из 6). Для сравнения экспериментов безвредно, для утверждения о
-losslessness — нет.
+Losslessness needs `model.backbone.dtype=float32`: under bf16 the verifier's
+arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6). Harmless
+for comparing runs, not harmless for the losslessness claim.
 
-Отвергнутые конфигурации — в [bucket/](bucket/) с числами и обоснованием.
-Посылки целевой функции, которые кодом не устраняются, — в
+Rejected configurations live in [bucket/](bucket/) with their numbers.
+Objective assumptions that code cannot remove are in
 [ASSUMPTIONS.md](ASSUMPTIONS.md).
 
 ## Overview
