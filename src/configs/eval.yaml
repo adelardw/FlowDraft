@@ -44,6 +44,7 @@ decode:
   top_p: null               # sampling only
   coupled: true             # temperature>0: true = Gumbel-coupled sampling — BIT-exact vs AR
                             #   (per the task PDF); false = Leviathan — lossless in distribution
+  verifier_diagnostics: false # opt-in: compare used batched-verifier rows with sequential AR
   equiv_samples: 0          # uncoupled sampling only: null-calibrated TV equivalence check
                             #   on the first prompt (e.g. 500 draws); 0 = off
 

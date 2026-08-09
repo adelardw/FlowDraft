@@ -445,6 +445,21 @@ class FlowDraft(L.LightningModule):
             next_token = expected[:, n_accepted]  # correction: what AR wanted instead
         return n_accepted, next_token
 
+    def _clone_generation_cache(self, cache):
+        """Clone committed K/V for the opt-in verifier diagnostic."""
+        return DynamicCache(
+            ddp_cache_data=(
+                (layer.keys.detach().clone(), layer.values.detach().clone())
+                for layer in cache.layers
+            ),
+            config=self.orthrus.model.config,
+        )
+
+    @staticmethod
+    def _top_two_margin(logits):
+        top = logits.float().topk(2, dim=-1).values
+        return top[..., 0] - top[..., 1]
+
     def _generation_device(self):
         """Device of the token embedding stage under HF device-map dispatch.
 
@@ -605,6 +620,7 @@ class FlowDraft(L.LightningModule):
         top_p: float | None = None,
         coupled: bool = True,
         sampling_seed: int = 0,
+        verifier_diagnostics: bool = False,
         **tokenizer_kwargs,
     ):
         """FULL lossless generation: draft -> verify -> commit, until done.
@@ -631,6 +647,8 @@ class FlowDraft(L.LightningModule):
         ``n_forwards``, ``seconds``.
         """
         input_ids = self._encode(text, input_ids, **tokenizer_kwargs)
+        if verifier_diagnostics and temperature != 0:
+            raise ValueError("verifier_diagnostics currently supports greedy decoding only")
         times = self._jump_schedule(jumps)
         if eos_token_id is None and self.tokenizer is not None:
             eos_token_id = self.tokenizer.eos_token_id
@@ -641,6 +659,10 @@ class FlowDraft(L.LightningModule):
         last_logits = out.logits[:, -1]
         n_forwards = 1
         emitted, acceptance = [], []
+        verifier_diagnostic = None
+        reference_cache = (
+            self._clone_generation_cache(cache) if verifier_diagnostics else None
+        )
         # The correction/bonus token is NOT committed by its own 1-token pass
         # (that would make the cycle jumps+2 forwards and depress TPF).
         # Instead it stays "pending": the drafter sees it as a clean in-block
@@ -673,11 +695,27 @@ class FlowDraft(L.LightningModule):
                 )
 
         while len(emitted) < max_new_tokens:
+            draft_cache_snapshot = (
+                self._clone_generation_cache(cache)
+                if verifier_diagnostics and verifier_diagnostic is None
+                else None
+            )
             draft_ids, q = self._draft_block(
                 cache, block_size, times,
                 sample=temperature > 0 and not coupled, anchor_token=pending,
             )
             n_forwards += len(times) - 1
+            draft_cache_unchanged = None
+            if draft_cache_snapshot is not None:
+                draft_cache_unchanged = (
+                    cache.get_seq_length() == draft_cache_snapshot.get_seq_length()
+                    and len(cache.layers) == len(draft_cache_snapshot.layers)
+                    and all(
+                        torch.equal(actual.keys, saved.keys)
+                        and torch.equal(actual.values, saved.values)
+                        for actual, saved in zip(cache.layers, draft_cache_snapshot.layers)
+                    )
+                )
             if temperature > 0 and coupled:
                 # keys = indices of the tokens these positions would emit;
                 # g_all[j] targets generated token (len(emitted) + j)
@@ -727,6 +765,74 @@ class FlowDraft(L.LightningModule):
                 )
             else:
                 n_accepted, next_token = self.verify_greedy(draft_ids, last_logits, verify_logits)
+
+            # Multi-token and token-at-a-time causal forwards are
+            # mathematically equivalent, but their finite-precision kernels
+            # can produce different logits. Only inspect verifier rows that
+            # actually determined an accepted token or correction/bonus.
+            if reference_cache is not None and verifier_diagnostic is None:
+                reference_committed = reference_cache.get_seq_length()
+                cache_delta = max(
+                    max(
+                        float((
+                            actual.keys[:, :, : reference.keys.size(2)].float()
+                            - reference.keys.float()
+                        ).abs().max()),
+                        float((
+                            actual.values[:, :, : reference.values.size(2)].float()
+                            - reference.values.float()
+                        ).abs().max()),
+                    )
+                    for actual, reference in zip(cache.layers, reference_cache.layers)
+                )
+                sequential_rows = []
+                for j in range(verify_in.size(1)):
+                    shadow_mask = torch.ones(
+                        1,
+                        reference_cache.get_seq_length() + 1,
+                        dtype=torch.long,
+                        device=verify_in.device,
+                    )
+                    shadow_out = self.orthrus(
+                        verify_in[:, j : j + 1],
+                        shadow_mask,
+                        past_key_values=reference_cache,
+                    )
+                    sequential_rows.append(shadow_out.logits[:, -1])
+                sequential_logits = torch.stack(sequential_rows, dim=1)
+                batched_ids = logits.argmax(-1)
+                sequential_ids = sequential_logits.argmax(-1)
+                used_rows = min(n_accepted + 1, verify_in.size(1))
+                mismatches = torch.nonzero(
+                    batched_ids[:, :used_rows] != sequential_ids[:, :used_rows],
+                    as_tuple=False,
+                )
+                if mismatches.numel():
+                    row = int(mismatches[0, 1])
+                    delta = (
+                        logits[:, row].float() - sequential_logits[:, row].float()
+                    ).abs()
+                    verifier_diagnostic = {
+                        "generated_position": len(emitted) + row,
+                        "verifier_row": row,
+                        "committed_cache_length": committed,
+                        "draft_cache_unchanged": draft_cache_unchanged,
+                        "cache_max_abs_delta": cache_delta,
+                        "batched_token": int(batched_ids[0, row]),
+                        "sequential_token": int(sequential_ids[0, row]),
+                        "max_abs_logit_delta": float(delta.max()),
+                        "batched_top2_margin": float(
+                            self._top_two_margin(logits[:, row])[0]
+                        ),
+                        "sequential_top2_margin": float(
+                            self._top_two_margin(sequential_logits[:, row])[0]
+                        ),
+                    }
+                reference_cache.crop(
+                    reference_committed
+                    + (0 if pending is None else 1)
+                    + n_accepted
+                )
             # keep the (now committed) pending token + the accepted prefix;
             # rejected draft K/V never pollute the cache
             cache.crop(committed + (0 if pending is None else 1) + n_accepted)
@@ -737,8 +843,12 @@ class FlowDraft(L.LightningModule):
             if eos_token_id is not None and eos_token_id in new:
                 break
 
-        return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                              acceptance=acceptance)
+        result = self._finalize(
+            input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
+            acceptance=acceptance,
+        )
+        result["verifier_diagnostic"] = verifier_diagnostic
+        return result
 
     @torch.no_grad()
     def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,

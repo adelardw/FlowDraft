@@ -41,7 +41,7 @@ def continuation_nll(model, prompt_ids, new_tokens):
 @torch.no_grad()
 def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
                     temperature=0.0, top_k=None, top_p=None, coupled=True,
-                    eos_token_id=None):
+                    eos_token_id=None, verifier_diagnostics=False):
     """model.generate vs model.ar_generate on one prompt -> metrics.
 
     ``lossless`` is checked bitwise at ``temperature=0`` AND at
@@ -53,7 +53,8 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
     sampling = dict(temperature=temperature, top_k=top_k, top_p=top_p, coupled=coupled)
     fd = model.generate(
         input_ids=prompt_ids, block_size=block_size, jumps=jumps,
-        max_new_tokens=max_new_tokens, eos_token_id=eos_token_id, **sampling,
+        max_new_tokens=max_new_tokens, eos_token_id=eos_token_id,
+        verifier_diagnostics=verifier_diagnostics, **sampling,
     )
     ar = model.ar_generate(
         input_ids=prompt_ids, max_new_tokens=max_new_tokens,
@@ -104,6 +105,7 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
             ),
             "flowdraft_length": len(fd["new_tokens"]),
             "ar_length": len(ar["new_tokens"]),
+            "verifier": fd.get("verifier_diagnostic"),
         },
     }
 
@@ -239,6 +241,7 @@ def main(cfg: DictConfig) -> None:
             top_p=dec.get("top_p", None),
             coupled=dec.get("coupled", True),
             eos_token_id=model.tokenizer.eos_token_id,
+            verifier_diagnostics=dec.get("verifier_diagnostics", False),
         )
         logger.info(f"{label!r}: {metrics}")
         results.append(metrics)
