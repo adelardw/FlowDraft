@@ -102,16 +102,16 @@ gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 
 ```bash
 # reference point: Orthrus verbatim — W_Q, W_K, W_V only
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
 
 # masked drafter trained on its own refinement procedure
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_multistep
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep
 
 # continuous state, verifier alignment only — the ablation
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_baseline
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft
 
 # continuous state trained on its own refinement procedure — the main result
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep
 ```
 
 Measure a checkpoint. `model.backbone.dtype=float32` is required for the
@@ -255,27 +255,27 @@ clipping 1.0, global batch 128.
 ```bash
 # Orthrus verbatim: the diffusion attention trains W_Q, W_K, W_V and nothing
 # else — no output projection, no per-head norms, no position weights.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper \
-    output_dir=checkpoints/qwen_masked_paper \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
+    output_dir=checkpoints/qwen_orthrus \
     model.adapter.flex_attention_backend=flash
 
 # Masked drafter trained on the state sequence its own decoding visits:
 # propose, freeze the most confident positions, re-mask the rest, repeat.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_multistep \
-    output_dir=checkpoints/qwen_masked_multistep \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep \
+    output_dir=checkpoints/qwen_orthrus_multistep \
     model.adapter.flex_attention_backend=flash
 
 # Continuous state, verifier alignment ONLY. The ablation that makes the
 # multi-step claim testable: this target does not depend on the drafter.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_baseline \
-    output_dir=checkpoints/qwen_flow_baseline \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft \
+    output_dir=checkpoints/qwen_flowdraft \
     model.adapter.flex_attention_backend=flash
 
 # THE MAIN RESULT. Continuous state trained on its own refinement procedure:
 # the drafter proposes, one frozen forward over that proposal supplies both
 # the target and the greedy verdict.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep \
-    output_dir=checkpoints/qwen_flow_multistep \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
+    output_dir=checkpoints/qwen_flowdraft_multistep \
     model.adapter.flex_attention_backend=flash
 ```
 
@@ -288,29 +288,29 @@ seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
 ```bash
 # Orthrus EXACTLY as published — not one of our additions is present. This is
 # the only point at which the reproduction is compared with the paper.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_paper \
-    output_dir=checkpoints/smollm_masked_paper
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
+    output_dir=checkpoints/smollm_orthrus
 
 # Baseline plus the multi-step term, in the MASKED state. Against the line
 # above this is the multi-step effect where the state cannot carry a draft.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_selfcorrect \
-    output_dir=checkpoints/smollm_masked_selfcorrect
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus_multistep \
+    output_dir=checkpoints/smollm_orthrus_multistep
 
 
 # Flow map WITHOUT multi-step: only the alignment on the jump that ends a
 # decode cycle. The ablation the main claim is measured against.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_flow_verify \
-    output_dir=checkpoints/smollm_flow_verify
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft \
+    output_dir=checkpoints/smollm_flowdraft
 
 # THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
 # procedure.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_flow_selfcorrect \
-    output_dir=checkpoints/smollm_flow_selfcorrect
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
+    output_dir=checkpoints/smollm_flowdraft_multistep
 
 ```
 
 
-**Two presets are bases, not experiments.** `smollm_bench` and `qwen_bench` hold
+**Two presets are bases, not experiments.** `smollm_base` and `qwen_base` hold
 what every configuration must agree on for a contrast to be readable, and are
 meant to be inherited rather than run. They *do* compose and start — which is
 the trap — but with none of the weights that define a contrast, so the run falls
@@ -326,8 +326,8 @@ memory and the timings stop being comparable. The loop resumes anything already
 started.
 
 ```bash
-EXPERIMENTS="smollm_masked_paper smollm_masked_selfcorrect \
-      smollm_flow_verify smollm_flow_selfcorrect"
+EXPERIMENTS="smollm_orthrus smollm_orthrus_multistep \
+      smollm_flowdraft smollm_flowdraft_multistep"
 
 for seed in 42 43 44; do
   out=checkpoints; [ $seed = 42 ] || out=checkpoints/s$seed
@@ -345,7 +345,7 @@ hold the FP32 drafter head and its Adam moments; the frozen backbone is not
 stored. For multi-GPU, hand the run to Lightning's DDP:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
     trainer.accelerator=gpu trainer.devices=8 trainer.strategy=ddp
 ```
 
@@ -364,7 +364,7 @@ without it only means are written, and no interval, contrast or ANOVA can be
 built from means alone.
 
 ```bash
-CKPT=checkpoints/qwen_flow_multistep/last.ckpt
+CKPT=checkpoints/qwen_flowdraft_multistep/last.ckpt
 
 for ds in gsm8k:100 math500:100 humaneval:100 mbpp:100 aime24:30 aime25:30; do
   ./hf-auth.sh uv run python src/eval.py \
@@ -434,12 +434,12 @@ them are in [step 3 of the Quickstart](#3-train-every-experiment).
 
 | experiment | SmolLM2-135M | Qwen3-1.7B |
 |---|---|---|
-| Orthrus, reproduced | `smollm_masked_paper` | `qwen_masked_paper` |
-| masked + multi-step | `smollm_masked_selfcorrect` | `qwen_masked_multistep` |
-| continuous state, ablation | `smollm_flow_verify` | `qwen_flow_baseline` |
-| continuous state + multi-step | `smollm_flow_selfcorrect` | `qwen_flow_multistep` |
+| Orthrus, reproduced | `smollm_orthrus` | `qwen_orthrus` |
+| masked + multi-step | `smollm_orthrus_multistep` | `qwen_orthrus_multistep` |
+| continuous state, ablation | `smollm_flowdraft` | `qwen_flowdraft` |
+| continuous state + multi-step | `smollm_flowdraft_multistep` | `qwen_flowdraft_multistep` |
 
-`smollm_bench` and `qwen_bench` are the shared bases these inherit, not
+`smollm_base` and `qwen_base` are the shared bases these inherit, not
 experiments. Presets that were measured and rejected — the trajectory-structure
 objective, the input gate, the Q/K/O projection set, the weight-profile controls
 — live in `bucket/` with their numbers, and are deliberately not shipped.
@@ -579,8 +579,8 @@ on-device, never in the batch.
 
 ```bash
 ./hf-auth.sh uv run python src/train.py                            # FlowDraft (the task's recipe)
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper       # presets: qwen_masked_paper |
-                                                                   #   qwen_flow_multistep | ...
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus       # presets: qwen_orthrus |
+                                                                   #   qwen_flowdraft_multistep | ...
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
@@ -614,8 +614,8 @@ Lightning state—DF weights, AdamW, cosine schedule, global step, and
 callbacks—with:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper \
-    resume_from_checkpoint=checkpoints/qwen_masked_paper/last.ckpt \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
+    resume_from_checkpoint=checkpoints/qwen_orthrus/last.ckpt \
     trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
     trainer.accumulate_grad_batches=64
 ```
@@ -628,7 +628,7 @@ shuffle, so it never leaks into training). Two ways to bound a repetition:
 ```bash
 # Orthrus paper preset: 600K packed sequences, 2 epochs, Qwen3-1.7B.
 # On 8 GPUs it uses micro-batch 1 and accumulation 16 (global batch 128):
-uv run python src/train.py +experiment=qwen_masked_paper trainer.devices=8
+uv run python src/train.py +experiment=qwen_orthrus trainer.devices=8
 # or bound by steps per repetition instead of samples:
 uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=3 trainer.limit_train_batches=2000
 ```
@@ -648,7 +648,7 @@ The Orthrus paper preset uses 2 epochs over 600K packed 2048-token sequences,
 accumulation steps:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
     trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
     trainer.accumulate_grad_batches=64
 ```
@@ -732,16 +732,16 @@ overwrite each other:
 
 | Preset | Sets | Checkpoints |
 | --- | --- | --- |
-| `*_masked_paper` | `variant=orthrus`, no additions | `checkpoints/<name>/` |
-| `*_masked_multistep` / `*_masked_selfcorrect` | `variant=orthrus` + multi-step term | `checkpoints/<name>/` |
-| `*_flow_baseline` / `*_flow_verify` | `variant=flowdraft_block_wise`, verifier alignment only | `checkpoints/<name>/` |
-| `*_flow_multistep` / `*_flow_selfcorrect` | `variant=flowdraft_block_wise` + multi-step term | `checkpoints/<name>/` |
+| `*_orthrus` | `variant=orthrus`, no additions — the published baseline | `checkpoints/<name>/` |
+| `*_orthrus_multistep` | `variant=orthrus` + the multi-step term | `checkpoints/<name>/` |
+| `*_flowdraft` | `variant=flowdraft_block_wise`, verifier alignment only — the ablation | `checkpoints/<name>/` |
+| `*_flowdraft_multistep` | `variant=flowdraft_block_wise` + the multi-step term | `checkpoints/<name>/` |
 
 Your own experiment (e.g. the `anchor_point` study) — override name and dir
 so it gets its own shelf too:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
     train.anchor_point=landing \
     output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
 ```

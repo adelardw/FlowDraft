@@ -5,12 +5,12 @@
 # состояние_k: keep_k позиций зафиксированы своими токенами, остальные под
 # маской; keep_k = round(K*(k+1)/(r+1)), множество монотонно, токены в нём
 # заморожены — та же последовательность, что проходит декод при r+1 прыжках.
-#   uv run python src/train.py +experiment=smollm_masked_selfcorrect
+#   uv run python src/train.py +experiment=smollm_orthrus_multistep
 defaults:
-  - /experiment/smollm_bench
+  - /experiment/smollm_base
   - _self_
 
-output_dir: checkpoints/smollm-masked-selfcorrect
+output_dir: checkpoints/smollm_orthrus_multistep
 train:
   variant: orthrus
   selfcorrect_kl_weight: 1.0

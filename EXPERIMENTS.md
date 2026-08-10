@@ -34,19 +34,21 @@ one forward, so rising quality fights rising cost.
   interpolating a prior draw and the answer, so an unfinished position expresses
   *how settled it is* rather than merely "unknown". Section 2 makes this precise.
 
-Every experiment is named `<backbone>_<parameterisation>_<what is added>`, so
-`qwen_flow_multistep` is the continuous state with multi-step training on
-Qwen3-1.7B. Config-to-experiment mapping:
+Every experiment is named `<backbone>_<method>` with `_multistep` added when
+the drafter is trained on its own refinement procedure, so
+`qwen_flowdraft_multistep` is the continuous state with multi-step training on
+Qwen3-1.7B. The same experiment carries the same name on both backbones:
 
 | experiment | SmolLM2-135M config | Qwen3-1.7B config |
 |---|---|---|
-| Orthrus, reproduced | `smollm_masked_paper` | `qwen_masked_paper` |
-| masked + multi-step | `smollm_masked_selfcorrect` | `qwen_masked_multistep` |
-| continuous, ablation | `smollm_flow_verify` | `qwen_flow_baseline` |
-| continuous + multi-step | `smollm_flow_selfcorrect` | `qwen_flow_multistep` |
+| Orthrus, reproduced | `smollm_orthrus` | `qwen_orthrus` |
+| masked + multi-step | `smollm_orthrus_multistep` | `qwen_orthrus_multistep` |
+| continuous, ablation | `smollm_flowdraft` | `qwen_flowdraft` |
+| continuous + multi-step | `smollm_flowdraft_multistep` | `qwen_flowdraft_multistep` |
 
-The SmolLM names predate the campaign and are kept so the published checkpoints
-and result files stay addressable; the Qwen names say what the experiment is.
+No name says "baseline": there is exactly one baseline here and it is Orthrus.
+`*_flowdraft` is an **ablation** — FlowDraft with the multi-step term switched
+off — and calling it a baseline would have asserted something untrue.
 
 ---
 
@@ -172,7 +174,7 @@ Shared symbols:
 
 ---
 
-### 3.1 Orthrus, reproduced — `*_masked_paper`
+### 3.1 Orthrus, reproduced — `*_orthrus`
 
 One term. Every drafted slot holds the mask vector, so the state is $M_0$ — all
 slots unknown. **No indices anywhere**: a single map, a single target.
@@ -207,7 +209,7 @@ At small $K$ the same gap would matter and the comparison would need redoing.
 
 ---
 
-### 3.2 Masked plus multi-step training — `*_masked_multistep`
+### 3.2 Masked plus multi-step training — `*_orthrus_multistep`
 
 Still $d_\theta$, still no $(s,t)$. What changes is the **state argument**: the
 second term feeds block states the decoder actually visits.
@@ -246,7 +248,7 @@ express.
 
 ---
 
-### 3.3 Continuous state, ablation — `*_flow_baseline`
+### 3.3 Continuous state, ablation — `*_flowdraft`
 
 Now the indices appear. Only one pair is ever used: $(s,t) = (0,1)$ — from a
 pure prior draw to the answer.
@@ -263,7 +265,7 @@ receives no gradient from this term at all.
 
 ---
 
-### 3.4 Continuous state plus multi-step training — `*_flow_multistep`
+### 3.4 Continuous state plus multi-step training — `*_flowdraft_multistep`
 
 The main result. The second term reaches **into the family**: it trains
 $\pi^\theta_{\,s_k,\,1}$ at several interior $s_k$, which is precisely what the

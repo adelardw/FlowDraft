@@ -3,12 +3,12 @@
 # W_Q, W_K, W_V and nothing else — no output projection, no per-head norms, no
 # position weights, no chain gate. The reference point every other configuration is
 # measured against, and the only place our numbers meet the paper's directly.
-#   ./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper
+#   ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
 defaults:
-  - /experiment/qwen_bench
+  - /experiment/qwen_base
   - _self_
 
-output_dir: checkpoints/qwen-masked-paper
+output_dir: checkpoints/qwen_orthrus
 model:
   adapter:
     w_names: [q_proj, k_proj, v_proj]

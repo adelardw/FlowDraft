@@ -5,12 +5,12 @@
 # Абляция: у таргета этого члена ЗНАЧЕНИЕ не зависит от состояния драфтера,
 # поэтому чтение состояния здесь не окупается ни при какой ёмкости, и с ростом
 # числа прыжков конфигурация обязана деградировать.
-#   uv run python src/train.py +experiment=smollm_flow_verify
+#   uv run python src/train.py +experiment=smollm_flowdraft
 defaults:
-  - /experiment/smollm_bench
+  - /experiment/smollm_base
   - _self_
 
-output_dir: checkpoints/smollm-flow-verify
+output_dir: checkpoints/smollm_flowdraft
 train:
   variant: flowdraft_block_wise
   prior_type: discunif
