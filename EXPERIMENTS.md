@@ -196,16 +196,26 @@ two clauses — causal AR context $\mathbf 1[k \lt L]\cdot\mathbf 1[k\le a_b-1]$
 bidirectional-within-block $\mathbf 1[k\ge L]\cdot\mathbf 1[\lfloor q/K\rfloor=\lfloor (k-L)/K\rfloor]$ —
 appear verbatim in both the sparse FlexAttention path and the dense fallback.
 
-One deviation, deliberate and worth stating. The paper's objective sums over
-$k=1,\dots,K$, supervising $K$ rows per block; the final mask row's target lies
-one token *past* the clean block. We supervise $K-1$, dropping that row. The
-same offset carries into decode, so **our `block_size=32` proposes 31 tokens
-where the paper's $K=32$ proposes 32**. The cost is one extra draft slot at the
-very deepest position, whose contribution to expected accepted length is the
-product of all 31 preceding per-position acceptance rates. Measured over the
-full campaign the mean accepted length is 1.63 and the single best block ever
-observed reached 5, so that product is not distinguishable from zero at this $K$.
-At small $K$ the same gap would matter and the comparison would need redoing.
+Every hyperparameter in the paper's Table 4 is reproduced exactly: $L = 2048$,
+256 anchor blocks per sequence, $K = 32$, two epochs over 600K examples, peak LR
+$2\times10^{-4}$ cosine with 5% warmup, gradient clipping 1.0, micro-batch 1,
+global batch 128, bfloat16, a 1:1:1 chat/math/code split. The paper's own
+parameter count corroborates the projection set independently: it states the
+trainable module is "approximately 16% of the full model", and for Qwen3-1.7B
+the $W_Q, W_K, W_V$ set over 28 layers is 234.9M — 15.8% of the frozen
+remainder. Adding $W_O$ would make it 352.3M, or 20.5%, which does not match.
+
+**The block yields $K$ tokens per cycle, of which the drafter supplies $K-1$.**
+The paper builds its block "by taking the current anchor token $x_t$ and
+concatenating it with $K-1$ `<mask>` tokens", and supervises the objective "over
+all masked positions" — of which there are $K-1$, the anchor not being masked.
+The anchor is itself a generated token, emitted by the AR head on the previous
+cycle, so a cycle produces one AR token plus up to $K-1$ drafted ones and costs
+"exactly two forward passes". Our implementation is the same object: `drafted =
+block_size - 1`, the anchor is the pending AR token, and verification is the one
+AR forward. The bound $k=1,\dots,K$ written on the sum in the objective reads as
+$K$ terms, but the prose fixes the meaning twice, and the inference construction
+agrees with the prose.
 
 ---
 
@@ -460,11 +470,18 @@ examples, forward KL as the objective. Table 4 hyperparameters are reproduced
 here exactly: sequence length 2048, 256 anchor blocks per sequence, block size
 32, two epochs, peak LR 2·10⁻⁴ with cosine schedule and 5% warmup, gradient
 clipping 1.0, global batch 128. The backbone differs — SmolLM2-135M instead of
-Qwen3-8B — so absolute numbers are not comparable to theirs; contrasts within
-this set are, which is why experiment 1 exists.
+Qwen3 — so absolute numbers are not comparable to theirs; contrasts within this
+set are, which is why experiment 1 exists. The size of that gap is worth naming:
+the paper reports an average TPF of 3.89 on Qwen3-1.7B under greedy decoding,
+about 6.8 accepted tokens per cycle, where this bench runs at 1.22 and 1.53. The
+weaker regime is the one that *favours* multi-step, since a pass pays only when
+it adds more accepted tokens than the current TPF.
 
 Their Table 3 reports that multi-step refinement **drops** throughput from 6.35
-to 3.53 tokens per forward, concluding that single-step projection is optimal.
+to 3.53 tokens per forward — a factor of 1.8 — "confirming that single-step
+projection is optimal for our approach". **Our measurements agree with that
+conclusion on its own metric**: extra decode passes lower tokens per forward for
+every configuration in this study, including the one that wins on acceptance.
 
 **The detail that matters:** their multi-step variant is trained by *randomly
 masking 50% of block positions*, adapted from Fast-dLLM-v2 — not on the state

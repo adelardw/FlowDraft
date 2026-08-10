@@ -50,10 +50,24 @@ observations at one seed, plus 144 further measurements across seeds at the
 common horizon. Full write-up, objective and mathematics:
 [EXPERIMENTS.md](EXPERIMENTS.md).
 
-**Headline.** Orthrus concludes that single-step projection is optimal. That
-holds for a masked drafter and fails for a continuous state. Intervals below use
-the **training seed** as the unit of observation (three seeds, df = 2), so they
-describe the method rather than one trained model.
+**Headline.** Orthrus concludes that single-step projection is optimal, and
+measures it in tokens per forward: its Table 3 puts a two-pass variant at 3.53
+against 6.35 for one pass. **On that metric our measurements agree with the
+paper, for every configuration including our own** — extra decode passes always
+cost more than they return. What a continuous state changes is *acceptance*:
+trained on its own refinement, it keeps gaining as passes are added (1.58 → 2.51
+from one pass to four) where the masked drafter is flat (1.72 → 1.79) and an
+untrained continuous state collapses (1.56 → 1.23). Separately, the multi-step
+*training* term raises throughput at a single pass, by +8.8% on the masked
+drafter. Intervals below use the **training seed** as the unit of observation
+(three seeds, df = 2), so they describe the method rather than one trained model.
+
+**Scale, stated plainly.** The paper reports an average TPF of 3.89 on
+Qwen3-1.7B greedy — roughly 6.8 accepted tokens per cycle. This bench, on
+SmolLM2-135M, sits at 1.22 and 1.53. That is a different operating regime, and
+it is the *favourable* one for multi-step: an extra pass pays only when it adds
+more accepted tokens than the current TPF, which is a far higher bar at their
+point than at ours. Multi-step still fails to pay here.
 
 | contrast (three refinement passes, 20k steps) | Δ accepted tokens | 95% CI | p |
 |---|---|---|---|
@@ -148,12 +162,27 @@ terms are off.
 uv run python bench/analyze.py --data results   # CIs, Holm, RM-ANOVA, bootstrap
 ```
 
-**Memory, single device, micro-batch 1:** ~12.8 GB for the paper projection set
-and ~14.5 GB for ours, plus attention activations — comfortable on an 80 GB
-A100, worth measuring on a 40 GB card. The paper used 8 GPUs for throughput,
-not because a single device cannot hold it: global batch 128 is micro-batch 1
-with accumulation 128 on one device or 16 on eight, and the per-device
-footprint is identical.
+**Hardware the paper used, and what changes on an A100.** Orthrus trained on a
+single node of **8×H200** with FSDP-2, micro-batch 1 and 16 accumulation steps,
+using FlexAttention with the **FlashAttention-4** backend for its custom masks.
+FA4 needs Hopper or newer, so on an A100 it is simply unavailable — and this
+repository already defaults to `flex_attention_backend=triton`, which is the
+correct choice there. That is a speed and availability difference, not a
+fidelity one: the sparse and dense masks were checked against each other over
+4,981 (query, key) pairs with zero disagreement.
+
+Global batch 128 is micro-batch 1 with accumulation 128 on one device or 16 on
+eight, and the per-device footprint is identical, so a single A100 can hold the
+run — it simply takes eight times as long.
+
+**Memory, single device, micro-batch 1.** Weights and optimizer state come to
+**6.2 GiB**: 3.17 for the frozen bf16 backbone, 0.44 for the 235M trainable
+projections, and 2.62 for the fp32 master copy plus AdamW's two moments. What
+the arithmetic does not cover is activations, and there the diffusion path is
+**four times the length of the autoregressive one** — 256 blocks × 32 = 8,192
+rows against 2,048 tokens. That, not the weights, decides whether a 40 GB card
+is enough, and it should be measured rather than argued: run 20 steps with
+`trainer.accumulate_grad_batches=1` and read the peak.
 
 **One knob does not transfer.** `acceptance_profile` states the acceptance
 regime the position weights aim at. It is 0.8 on the 135M bench and 0.93 in the
