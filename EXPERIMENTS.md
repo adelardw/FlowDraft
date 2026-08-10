@@ -101,7 +101,7 @@ and the network parameterises a **flow map** — the distribution the slot shoul
 reach by time `t`:
 
 ```math
-\pi_{s,t}(x_s) \;=\; \operatorname{softmax}\big(f_\theta(x_s,\,s,\,t)\big),
+\pi_{s,t}(x_s) \;=\; \mathrm{softmax}\big(f_\theta(x_s,\,s,\,t)\big),
 \qquad
 X_{s,t}(x) \;=\; x + \gamma\,(\pi_{s,t}(x) - x),
 \qquad
@@ -127,7 +127,7 @@ Position `j` is accepted only if every earlier position was accepted too:
 
 This derivative is the per-position weight `u_j`. At `a ≈ 0.8` it runs from 6.2
 at the first position to 0.0015 at the thirty-first — a factor of four thousand.
-Verified against central differences to `1.4\cdot10^{-7}`.
+Verified against central differences to $1.4 \times 10^{-7}$.
 
 ---
 
@@ -172,7 +172,7 @@ State `k` freezes the most confident `keep_k` slots at their chosen tokens and
 re-masks the rest:
 
 ```math
-\mathrm{keep}_k \;=\; \operatorname{round}\!\Big((K-1)\cdot\frac{k+1}{r+1}\Big)
+\mathrm{keep}_k \;=\; \mathrm{round}\!\Big((K-1)\cdot\frac{k+1}{r+1}\Big)
 ```
 
 ```
@@ -264,7 +264,7 @@ These make the family a trajectory rather than a set of unrelated maps. Measured
 at `−0.114` accepted tokens `[−0.150, −0.078]` — significantly harmful — and
 moved to `bucket/`. Note the `4:2` ratio is only dimensionless for a unit time
 parameterisation: `EC` is in nats and invariant to reparameterising `t`, while
-`TD` carries `1/\text{time}^2`.
+`TD` carries $1/\mathrm{time}^2$.
 
 ### What the theory predicts about speed
 
@@ -277,7 +277,7 @@ exactly, `n` chained passes would fix positions `1 … n`, giving
 ```
 
 gives **exactly 1**. The lemma is a **floor**, not a speedup mechanism:
-acceleration needs `A_n > n` strictly, and the bound only gives `A_n \ge n`.
+acceleration needs `A_n > n` strictly, and the bound only gives $A_n \ge n$.
 The measurements confirm it — nothing multi-step clears 1.
 
 ---
