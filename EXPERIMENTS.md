@@ -101,9 +101,9 @@ and the network parameterises a **flow map** — the distribution the slot shoul
 reach by time `t`:
 
 ```math
-\pi_{s,t}(x_s) \;=\; \mathrm{softmax}\big(f_\theta(x_s,\,s,\,t)\big),
+\pi^\theta_{s,t}(x_s) \;=\; \mathrm{softmax}\big(f_\theta(x_s,\,s,\,t)\big),
 \qquad
-X_{s,t}(x) \;=\; x + \gamma\,(\pi_{s,t}(x) - x),
+X_{s,t}(x) \;=\; x + \gamma\,(\pi^\theta_{s,t}(x) - x),
 \qquad
 \gamma = \frac{t-s}{1-s}
 ```
@@ -185,6 +185,26 @@ No position weights, no chain gate, projections $W_Q, W_K, W_V$ only. Nothing
 depends on the drafter's own output, so multi-step refinement is available at
 decode time but is never trained.
 
+**Fidelity to the paper.** Checked against the published training design line by
+line. What matches: $B$ sampled anchor positions per batch with contiguous blocks
+of width $K$; the corruption rule (anchor kept visible, remaining $K-1$ slots
+replaced by `<mask>`); forward KL against the frozen AR head's full distribution;
+gradients confined to the diffusion module; and the dual-pass block mask, whose
+two clauses — causal AR context $\mathbf 1[k<L]\cdot\mathbf 1[k\le a_b-1]$ and
+bidirectional-within-block $\mathbf 1[k\ge L]\cdot\mathbf 1[\lfloor q/K\rfloor=\lfloor (k-L)/K\rfloor]$ —
+appear verbatim in both the sparse FlexAttention path and the dense fallback.
+
+One deviation, deliberate and worth stating. The paper's objective sums over
+$k=1,\dots,K$, supervising $K$ rows per block; the final mask row's target lies
+one token *past* the clean block. We supervise $K-1$, dropping that row. The
+same offset carries into decode, so **our `block_size=32` proposes 31 tokens
+where the paper's $K=32$ proposes 32**. The cost is one extra draft slot at the
+very deepest position, whose contribution to expected accepted length is the
+product of all 31 preceding per-position acceptance rates. Measured over the
+full campaign the mean accepted length is 1.63 and the single best block ever
+observed reached 5, so that product is not distinguishable from zero at this $K$.
+At small $K$ the same gap would matter and the comparison would need redoing.
+
 ---
 
 ### 3.2 Masked plus multi-step training — `*_masked_multistep`
@@ -238,7 +258,7 @@ pure prior draw to the answer.
 
 Read the subscripts: input at time $s = 0$ (pure noise, no information about the
 answer), output aimed at time $t = 1$ (the answer itself). This is the first leg
-of every decode cycle. The rest of the family — every $\pi_{s,t}$ with $s > 0$ —
+of every decode cycle. The rest of the family — every $\pi^\theta_{s,t}$ with $s > 0$ —
 receives no gradient from this term at all.
 
 ---
@@ -246,8 +266,8 @@ receives no gradient from this term at all.
 ### 3.4 Continuous state plus multi-step training — `*_flow_multistep`
 
 The main result. The second term reaches **into the family**: it trains
-$\pi_{s_k,1}$ at several interior $s_k$, which is precisely what the masked
-parameterisation cannot express.
+$\pi^\theta_{\,s_k,\,1}$ at several interior $s_k$, which is precisely what the
+masked parameterisation cannot express.
 
 ```math
 \mathcal{L} \;=\; w_{\text{verify}}\cdot
@@ -258,21 +278,31 @@ w_{\text{self}}\cdot
 \ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,\arg\max q_{k-1}\big),\;\; \pi^\theta_{\,s_k,\,1}(x_k)\Big)\cdot v_j\, u_j}_{\text{trains members at } s_1,\dots,s_r}
 ```
 
-with
+where the draft fed to the next round is defined by **one recursion**, run for
+$k = 0, 1, \dots, r$:
 
 ```math
-q_0 = \pi^\theta_{\,0,\,1}(x_0),
+x_k \;=\; (1-s_k)\,x_0^{(k)} \;+\; s_k\,q_{k-1},
 \qquad
-x_k = (1-s_k)\,x_0' + s_k\,q_{k-1},
+q_k \;=\; \mathrm{sg}\;\pi^\theta_{\,s_k,\,1}(x_k),
+\qquad
+s_0 = 0,
 \qquad
 s_1 < \dots < s_r \ \text{stratified in } (s_{\min}, 1)
 ```
 
+Reading it at $k=0$ gives $x_0 = x_0^{(0)}$ and $q_0 = \mathrm{sg}\,\pi^\theta_{\,0,\,1}(x_0)$ —
+so the **first term of the loss and $q_0$ are the same forward pass**, scored
+once with gradient and reused once detached. Each $x_0^{(k)}$ is an
+*independent* prior draw, and the $\mathrm{sg}$ is why round $k+1$ receives the
+previous draft as **data rather than as a gradient path**: without it the
+$r$ rounds would collapse into one long chain through $\theta$.
+
 Note that $t = 1$ in **every** term: the drafter is always asked for the answer,
 never for an intermediate distribution. What varies is $s$ — how far along the
-input already is. The restart $x_k$ mixes a *fresh* prior draw $x_0'$ with the
-previous pass's output $q_{k-1}$, so $s_k$ literally sets how much of the
-previous draft survives into the next input.
+input already is. Since $x_k$ mixes a fresh prior draw with $q_{k-1}$, the value
+of $s_k$ literally sets how much of the previous draft survives into the next
+input.
 
 ```
   pass 0   │ anchor │  x₀  │  x₀  │  x₀  │ ... │  x₀  │   s = 0,   pure prior
@@ -305,13 +335,13 @@ the term exists to prevent.
 ### 3.5 Trajectory-structure terms — measured, rejected
 
 ```math
-\mathcal{L}_{\mathrm{CFM}} \;=\; w_{\text{end}}\cdot \mathrm{CE}\big(x_1,\,\pi_{t,t}(x_t)\big)
+\mathcal{L}_{\mathrm{CFM}} \;=\; w_{\text{end}}\cdot \mathrm{CE}\big(x_1,\,\pi^\theta_{t,t}(x_t)\big)
 \;+\; \lambda\Big(4\,\mathrm{EC} + 2\,\mathrm{TD}\Big),
 ```
 ```math
-\mathrm{EC} = \mathrm{CE}\Big(\mathrm{sg}\,\pi_{t,t}\big(X_{s,t}(x_s)\big),\;\pi_{s,t}(x_s)\Big),
+\mathrm{EC} = \mathrm{CE}\Big(\mathrm{sg}\,\pi^\theta_{t,t}\big(X_{s,t}(x_s)\big),\;\pi^\theta_{s,t}(x_s)\Big),
 \qquad
-\mathrm{TD} = \big\|\partial_t \pi_{s,t}\big\|^2\,\gamma^2
+\mathrm{TD} = \big\|\partial_t \pi^\theta_{s,t}\big\|^2\,\gamma^2
 ```
 
 These make the family a trajectory rather than a set of unrelated maps. Measured
