@@ -346,6 +346,74 @@ stratification bin lies entirely below that threshold for any draw, and there
 the term's minimiser is an input-independent mixture — precisely the degeneracy
 the term exists to prevent.
 
+#### Where this term came from
+
+It is not lifted from a paper. It was derived here, and the order matters: the
+**negative** result came first.
+
+**1 — Multi-step cannot come from the noise.** With a deterministic verifier, a
+mean-field endpoint parameterisation and $x_0 \perp x_1 \mid \mathrm{ctx}$, the
+Bayes-optimal $\pi^\theta_{0,1}$ is **constant in $x_0$**. Worse, that constant
+manifold lies in the joint minimiser set of the endpoint, EC and TD terms at
+$s = 0$, so no reweighting of them can exclude it. This was measured, not only
+argued: eight different prior seeds at one pass produced the *same* draft — 32
+generations without a single variation. Whatever a schedule with $n > 1$ buys,
+it buys with **self-generated** information: the drafter's own previous output.
+
+**2 — So what should the map be trained to compute?** If each pass is to improve
+on the last, the object to imitate is one **Jacobi sweep** of the greedy AR
+chain,
+
+```math
+T(\mathrm{ctx}, d)_j \;=\; \arg\max\; p_{\mathrm{AR}}\big(\cdot \mid \mathrm{ctx},\, d_{<j}\big)
+```
+
+— "take the whole current draft and advance every position by one AR step, in
+parallel."
+
+**3 — What composition then buys.** If $\pi^\theta_{s,1}$ realises $T$, then
+induction over positions gives $A_n \ge \min(n,\,K-1)$: strictly above $A_1$
+while $A_1 < K-1$, with a deterministic verifier and **without a single new
+bit**. The exact map from context to chain does not lie in the class of a
+fixed-depth mean-field head; it lies in that head's *composition*.
+
+**4 — Why the objective as it stood could never get there.** Every teacher term
+aimed at $p_{\mathrm{AR}}(\cdot\mid\mathrm{corpus})$, which $x_s$ does not enter
+— the objective never once asked the map to read its own input. So the second
+term's target has to be conditioned on the drafter's own draft,
+$p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx},\ \arg\max q_{k-1})$, which is exactly
+$T$ applied to the current draft and evaluated by the frozen verifier — at the
+cost of one forward the decode loop already spends on verification.
+
+**5 — And the states have to be generated.** Fitting $T$ on the states the
+decoder actually visits requires producing those states, which is what the
+restart $x_k$ does. Training on the model's own state distribution with an
+expert relabelling it is **DAgger** (Ross, Gordon and Bagnell, 2011); the
+operator being imitated is the same Jacobi sweep that consistency-style parallel
+decoders target. *No literature search was run to establish exact prior art for
+the combination — that check is outstanding.*
+
+**The argument that does *not* work.** "The target depends on the state,
+therefore the degenerate minimiser is gone" is **false**, and worth stating
+because it is the natural thing to claim. The pointwise problem
+$\min_q \ell\big(T(\arg\max q),\, q\big)$ is the same for every $x_0$, and its
+infimum of 0 is attained by AR's greedy continuation, which does not read the
+input at all: at unbounded capacity the constant map is not merely admissible
+but **optimal**. The defensible argument is about capacity — the input
+*contains a partial computation of the target*, since the target is one AR sweep
+applied to the draft and the draft is the input. Under `verify_kl` the input is
+empty of relevant content and reading it never pays at any capacity; here it
+pays at **bounded** capacity. That is the claim to defend, not identifiability.
+
+**What stays empirical.** The guarantee above is empty as a speed claim:
+$\mathrm{TPF}_n = (\min(n, K-1)+1)/(n+1) \le 1$, exactly AR speed, so a pass
+pays for itself only when $A_{n+1} - A_n > \mathrm{TPF}_n$. Everything measured
+above 1 comes from how far the learned operator exceeds its own guarantee, and
+nothing derives that. Neither is convergence implied — `argmax` kills the
+gradient through the target and the stop-gradient kills it through the input, so
+this is a DAgger step, not descent on a potential. $s_{\min}$, $r = 2$ and the
+term weights were chosen, not derived.
+
 ---
 
 ### 3.5 Trajectory-structure terms — measured, rejected
