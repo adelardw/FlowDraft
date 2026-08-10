@@ -14,6 +14,17 @@
 defaults:
   - override /model: qwen3_1.7b
 
+model:
+  adapter:
+    # The paper trains with FlexAttention on a FlashAttention-4 backend. FLASH
+    # here needs Hopper or newer (compute capability >= 9): on H100/H200 set
+    # `flash` to match them, on an A100 it raises and `triton` is the only
+    # option. Triton is the stable sparse kernel and the default; FLASH has
+    # higher peak throughput but irregular block masks have been observed to
+    # trigger fatal CUDA illegal-memory-access errors, which is why it stays an
+    # explicit opt-in rather than the default.
+    flex_attention_backend: triton
+
 train:
   block_size: 32                # K: one clean anchor + 31 drafted positions
   anchors_per_sequence: 256

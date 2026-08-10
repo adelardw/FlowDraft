@@ -26,102 +26,259 @@ The drafter may take several **refinement passes** per cycle: propose, freeze th
 positions it is most confident about, rewrite the rest, repeat. Each pass costs
 one forward, so rising quality fights rising cost.
 
-### Why acceptance is a conjunction
-
-Position `j` is accepted only if every position before it was also accepted:
-the verifier conditions on the tokens it has already committed. Hence
-
-```
-E[A] = Σ_{j=1..K−1} Π_{i≤j} a_i
-```
-
-where `a_i` is the per-position agreement probability. The derivative
-
-```
-∂E[A]/∂a_j = S_{j−1} · (1 + R_j),   S_j = Π_{i≤j} a_i,   R_j = a_{j+1}(1 + R_{j+1}),  R_{K−1} = 0
-```
-
-says what an improvement at position `j` is worth: the probability of ever
-reaching it. At `a ≈ 0.8` the first position is worth 6.2 and the thirty-first
-0.0015 — a factor of four thousand. This derivative is used to weight the loss
-per position; it is verified against central differences to `1.4·10⁻⁷`.
-
 ### Two drafter parameterisations
 
 - **Masking** — unpredicted positions carry a trainable placeholder vector.
   This is the Orthrus construction.
 - **Continuous state** — a position carries a point on the vocabulary simplex,
-  `x_s = (1−s)·x₀ + s·x₁`, interpolating a prior draw `x₀` and the answer `x₁`.
-  The network parameterises a **flow map** `π_{s,t}(x_s)`: the distribution the
-  state should reach by time `t`. The transport is
-  `X_{s,t}(x) = x + γ·(π − x)` with `γ = (t−s)/(1−s)`.
-  An intermediate position then carries a **graded** notion of "how settled this
-  position is", which a placeholder cannot express.
+  interpolating a prior draw and the answer, so an unfinished position expresses
+  *how settled it is* rather than merely "unknown". Section 2 makes this precise.
+
+Every experiment is named `<backbone>_<parameterisation>_<what is added>`, so
+`qwen_flow_multistep` is the continuous state with multi-step training on
+Qwen3-1.7B. Config-to-experiment mapping:
+
+| experiment | SmolLM2-135M config | Qwen3-1.7B config |
+|---|---|---|
+| Orthrus, reproduced | `smollm_masked_paper` | `qwen_masked_paper` |
+| masked + multi-step | `smollm_masked_selfcorrect` | `qwen_masked_multistep` |
+| continuous, ablation | `smollm_flow_verify` | `qwen_flow_baseline` |
+| continuous + multi-step | `smollm_flow_selfcorrect` | `qwen_flow_multistep` |
+
+The SmolLM names predate the campaign and are kept so the published checkpoints
+and result files stay addressable; the Qwen names say what the experiment is.
 
 ---
 
-## 2. The objective
+## 2. Notation: what K is, and where the simplex lives
 
-### Continuous state
+**`K` is the block width in tokens**, and nothing else. One decoding cycle emits
+a block of `K` positions: position 0 is a **clean anchor** — a real token the
+verifier already committed — and positions `1 … K−1` are **drafted**. With
+`K = 32` the drafter proposes 31 tokens per forward pass. `K` is a property of
+the decoding geometry; it is not a parameter of the flow-matching formulation
+and does not appear in any loss term.
+
+The flow map itself is **per position**: each drafted slot carries its own point
+on the vocabulary simplex and its own map. There is no "block-size" notion
+inside categorical flow matching — the block is how many independent slots are
+run in parallel through the same forward pass. `K` sets the acceptance ceiling
+(you cannot accept more than `K−1` tokens per cycle) and the cost of a cycle,
+not the shape of the objective.
+
+### What the drafter is fed, position by position
+
+Both parameterisations receive the same block layout. They differ only in what
+occupies the drafted slots.
 
 ```
-L = w_verify · KL( sg p_AR( · | ctx ) ‖ π_{0,1}(x₀) ) · u_j
-  + w_self   · (1/r) Σ_{k=1..r} l( p_AR( · | ctx, argmax q_{k−1} ) , π_{s_k,1}(x_k) ) · v_j · u_j
-  + w_end    · CE( x₁ , π_{t,t}(x_t) )
-  + λ        · ( 4·EC + 2·TD )
+                 slot 0      slot 1      slot 2     ...    slot K-1
+                ┌────────┬───────────┬───────────┬─────┬───────────┐
+  masking       │ anchor │  [MASK]   │  [MASK]   │ ... │  [MASK]   │
+                │ token  │  vector   │  vector   │     │  vector   │
+                └────────┴───────────┴───────────┴─────┴───────────┘
+                ┌────────┬───────────┬───────────┬─────┬───────────┐
+  continuous    │ anchor │   x_s     │   x_s     │ ... │   x_s     │
+  state         │ token  │  simplex  │  simplex  │     │  simplex  │
+                └────────┴───────────┴───────────┴─────┴───────────┘
+                    ↑          └──── these are the drafted positions ────┘
+              real token,
+              never masked,
+              never gated
+```
+
+The anchor is the only clean token in the block: the KV cache is cropped before
+the block, so that token exists **only** in the anchor row. Attention is
+bidirectional inside the block and causal into the cached prefix.
+
+The simplex point interpolates a prior draw and the answer,
+
+```math
+x_s \;=\; (1-s)\,x_0 \;+\; s\,x_1 ,\qquad x_0 \sim \text{prior},\quad x_1 = \text{one-hot answer}
+```
+
+and the network parameterises a **flow map** — the distribution the slot should
+reach by time `t`:
+
+```math
+\pi_{s,t}(x_s) \;=\; \operatorname{softmax}\big(f_\theta(x_s,\,s,\,t)\big),
+\qquad
+X_{s,t}(x) \;=\; x + \gamma\,(\pi_{s,t}(x) - x),
+\qquad
+\gamma = \frac{t-s}{1-s}
+```
+
+At `(s,t) = (0,1)` we get `γ = 1` and the jump is `π` itself — that is the
+single pair the decode loop executes. A masked slot has no `s`: it is either
+"unknown" or "committed", with nothing in between. That difference is the whole
+subject of this study.
+
+### Why acceptance is a conjunction, and what the weights are
+
+Position `j` is accepted only if every earlier position was accepted too:
+
+```math
+\mathbb{E}[A] \;=\; \sum_{j=1}^{K-1} \prod_{i \le j} a_i ,
+\qquad
+\frac{\partial \mathbb{E}[A]}{\partial a_j} \;=\; S_{j-1}\,(1 + R_j),
+\quad S_j = \prod_{i\le j} a_i,
+\quad R_j = a_{j+1}(1+R_{j+1}),\; R_{K-1}=0
+```
+
+This derivative is the per-position weight `u_j`. At `a ≈ 0.8` it runs from 6.2
+at the first position to 0.0015 at the thirty-first — a factor of four thousand.
+Verified against central differences to `1.4\cdot10^{-7}`.
+
+---
+
+## 3. The loss, experiment by experiment
+
+Shared symbols:
+
+| symbol | meaning |
+|---|---|
+| `p_AR(·\|ctx)` | frozen verifier's distribution, stop-gradient throughout |
+| `u_j` | `∂E[A]/∂a_j` times the chain-validity gate |
+| `v_j` | 1 at the verifier's break position, `tail` elsewhere |
+| `r` | refinement passes trained per step (2 here) |
+| `sg` | stop-gradient |
+
+### 3.1 Orthrus, reproduced — `*_masked_paper`
+
+One term. Every drafted slot holds the mask vector; the target is the frozen
+model's distribution conditioned on the corpus prefix.
+
+```math
+\mathcal{L} \;=\; \mathrm{KL}\Big(\,\mathrm{sg}\;p_{\mathrm{AR}}(\cdot\mid \mathrm{ctx})\;\Big\|\;\pi(\mathrm{mask})\Big)
+```
+
+No position weights, no chain gate, projections `W_Q, W_K, W_V` only. Nothing
+here depends on the drafter's own output, so multi-step refinement is available
+at decode time but is never trained.
+
+### 3.2 Masked plus multi-step training — `*_masked_multistep`
+
+Adds a term that trains the drafter on the state sequence its own decoding
+visits.
+
+```math
+\mathcal{L} \;=\; \underbrace{\mathrm{KL}\big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\big\|\, \pi(\mathrm{mask})\big)\cdot u_j}_{\text{verifier alignment}}
+\;+\;
+w_{\text{self}}\cdot\underbrace{\frac{1}{r}\sum_{k=1}^{r}
+\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,d_{k-1}\big),\;\pi(\mathrm{state}_k)\Big)\cdot v_j\, u_j}_{\text{multi-step}}
+```
+
+State `k` freezes the most confident `keep_k` slots at their chosen tokens and
+re-masks the rest:
+
+```math
+\mathrm{keep}_k \;=\; \operatorname{round}\!\Big((K-1)\cdot\frac{k+1}{r+1}\Big)
+```
+
+```
+  pass 0   │ anchor │ MASK │ MASK │ MASK │ ... │ MASK │   propose all 31
+  pass 1   │ anchor │  t₄  │ MASK │  t₉  │ ... │ MASK │   10 slots frozen
+  pass 2   │ anchor │  t₄  │  t₇  │  t₉  │ ... │ MASK │   21 slots frozen
+```
+
+The committed set is monotone and frozen tokens never change — the same
+sequence the decoder walks at `r+1` passes. At `K = 32, r = 2` this is
+`[10, 21]` on both sides, verified by instrumenting both paths.
+
+### 3.3 Continuous state, ablation — `*_flow_baseline`
+
+Simplex slots, but only the verifier-alignment term. **This is the ablation
+that makes the multi-step claim testable**: the target does not depend on the
+drafter's state, so nothing teaches the map to read its own draft.
+
+```math
+\mathcal{L} \;=\; w_{\text{verify}}\cdot
+\mathrm{KL}\Big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx})\;\Big\|\;\pi_{0,1}(x_0)\Big)\cdot u_j
+```
+
+Evaluated at `s = 0` on a fresh prior draw, so the input carries no information
+about the answer at all. The name was `flow_verify`; it is now `flow_baseline`,
+because "verify" reads as the verification pass rather than as "trained on the
+verifier-alignment term only".
+
+### 3.4 Continuous state plus multi-step training — `*_flow_multistep`
+
+The main result.
+
+```math
+\mathcal{L} \;=\; w_{\text{verify}}\cdot
+\mathrm{KL}\big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\big\|\, \pi_{0,1}(x_0)\big)\cdot u_j
+\;+\;
+w_{\text{self}}\cdot\frac{1}{r}\sum_{k=1}^{r}
+\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,\arg\max q_{k-1}\big),\;\pi_{s_k,1}(x_k)\Big)\cdot v_j\, u_j
 ```
 
 with
 
-```
-q₀   = π_{0,1}(x₀)                        the jump the decode loop actually executes
-x_k  = (1−s_k)·x₀′ + s_k·q_{k−1}          restart carrying the previous pass's draft
-s_k  stratified in (s_min, 1), detached between passes
-u_j  = ∂E[A]/∂a_j  ×  chain-validity gate
-v_j  = 1 at the verifier's break position, `tail` elsewhere
-EC   = CE( sg π_{t,t}(X_{s,t}(x_s)) , π_{s,t}(x_s) )
-TD   = ‖∂_t π_{s,t}‖² · γ²
+```math
+q_0 = \pi_{0,1}(x_0),
+\qquad
+x_k = (1-s_k)\,x_0' + s_k\,q_{k-1},
+\qquad
+s_1 < \dots < s_r \ \text{stratified in } (s_{\min}, 1)
 ```
 
-**First term — verifier alignment.** Match the frozen model's distribution on the
-jump that ends every decode cycle. Its target does not depend on the drafter's
-state, so this term alone cannot teach the drafter to *read* its input.
-
-**Second term — multi-step training.** This is the addition under test. The
-drafter proposes; one frozen forward over that proposal yields both a target
-`p_AR(·|ctx, draft)` and the exact greedy verdict; the next pass is trained on
-the state the decode loop actually visits. States are detached between passes:
-the term asks for per-jump stationarity, not for a differentiable composition.
-
-**Third and fourth — trajectory structure.** Endpoint likelihood on the diagonal
-plus two consistency terms that make the family a trajectory rather than a set
-of unrelated maps.
-
-### Masking
-
 ```
-L = KL( sg p_AR( · | ctx ) ‖ π(mask) ) · u_j
-  + w_self · (1/r) Σ_{k=1..r} l( p_AR( · | ctx, d_{k−1} ) , π(state_k) ) · v_j · u_j
+  pass 0   │ anchor │  x₀  │  x₀  │  x₀  │ ... │  x₀  │   pure prior, s = 0
+  pass 1   │ anchor │  x₁  │  x₁  │  x₁  │ ... │  x₁  │   x₁ = (1-s₁)x₀' + s₁q₀
+  pass 2   │ anchor │  x₂  │  x₂  │  x₂  │ ... │  x₂  │   x₂ = (1-s₂)x₀' + s₂q₁
 ```
 
-`state_k` freezes `keep_k = round((K−1)·(k+1)/(r+1))` positions at their chosen
-tokens and re-masks the rest. The set is monotone and the frozen tokens never
-change — the same sequence the decoder walks at `r+1` passes. At `K = 32, r = 2`
-this is `[10, 21]` on both sides, verified by instrumenting both paths.
+Every slot moves at every pass — nothing is frozen, because a simplex point can
+express "mostly settled" without being committed. That is the structural
+difference from 3.2, where a slot is either masked or fixed.
 
-**Asymmetry worth naming.** In the continuous branch the restart times `s_k` are
-*distributed*; in the masked branch the commit schedule is *fixed*. That is not
-an oversight: a continuous state admits a distribution over entry points, a
-placeholder does not.
+States are detached between passes: the term asks for per-jump stationarity,
+not for a differentiable composition through `r` passes.
+
+**`s_min = 0.5`, not 0.** The draft is recoverable from `x_k` only when its
+component dominates the prior's, i.e.
+
+```math
+s \;>\; \frac{1}{1 + q_{\max} - q_{r}} \;\approx\; \frac{1}{1+q_{\max}}
+```
+
+which is 0.53 at confidence 0.9 and 0.83 at 0.2. With `s_min = 0` the lower
+stratification bin lies entirely below that threshold for any draw, and there
+the term's minimiser is an input-independent mixture — precisely the degeneracy
+the term exists to prevent.
+
+### 3.5 Trajectory-structure terms — measured, rejected
+
+```math
+\mathcal{L}_{\mathrm{CFM}} \;=\; w_{\text{end}}\cdot \mathrm{CE}\big(x_1,\,\pi_{t,t}(x_t)\big)
+\;+\; \lambda\Big(4\,\mathrm{EC} + 2\,\mathrm{TD}\Big),
+```
+```math
+\mathrm{EC} = \mathrm{CE}\Big(\mathrm{sg}\,\pi_{t,t}\big(X_{s,t}(x_s)\big),\;\pi_{s,t}(x_s)\Big),
+\qquad
+\mathrm{TD} = \big\|\partial_t \pi_{s,t}\big\|^2\,\gamma^2
+```
+
+These make the family a trajectory rather than a set of unrelated maps. Measured
+at `−0.114` accepted tokens `[−0.150, −0.078]` — significantly harmful — and
+moved to `bucket/`. Note the `4:2` ratio is only dimensionless for a unit time
+parameterisation: `EC` is in nats and invariant to reparameterising `t`, while
+`TD` carries `1/\text{time}^2`.
 
 ### What the theory predicts about speed
 
 If the map realised the Jacobi sweep `T(ctx,d)_j = argmax p_AR(·|ctx, d_{<j})`
-exactly, then `n` chained passes would fix positions `1..n`, giving
-`A_n ≥ min(n, K−1)`. Substituting into `TPF = (A+1)/(n+1)` gives **exactly 1**.
-The lemma is therefore a **floor**, not a speedup mechanism: acceleration needs
-`A_n > n` strictly, and the bound only gives `A_n ≥ n`. The measurements below
-confirm this — no multi-step variant exceeds 1.
+exactly, `n` chained passes would fix positions `1 … n`, giving
+`A_n ≥ min(n, K−1)`. Substituting into
+
+```math
+\mathrm{TPF} \;=\; \frac{A_n + 1}{n + 1}
+```
+
+gives **exactly 1**. The lemma is a **floor**, not a speedup mechanism:
+acceleration needs `A_n > n` strictly, and the bound only gives `A_n \ge n`.
+The measurements confirm it — nothing multi-step clears 1.
 
 ---
 

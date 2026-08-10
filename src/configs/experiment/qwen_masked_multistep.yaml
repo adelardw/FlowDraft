@@ -6,12 +6,12 @@
 # On the 135M bench this was worth +0.223 +/- 0.021 accepted tokens over the
 # reproduced baseline (three seeds, df=2). Growth from one refinement pass to
 # four stayed at +0.070 — masking gains almost nothing from extra passes.
-#   ./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_selfcorrect
+#   ./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_multistep
 defaults:
   - /experiment/qwen_bench
   - _self_
 
-output_dir: checkpoints/qwen-masked-selfcorrect
+output_dir: checkpoints/qwen-masked-multistep
 train:
   variant: orthrus
   selfcorrect_kl_weight: 1.0

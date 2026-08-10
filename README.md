@@ -102,13 +102,13 @@ gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper
 
 # masked drafter trained on its own refinement procedure
-./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_selfcorrect
+./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_multistep
 
 # continuous state, verifier alignment only — the ablation
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_verify
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_baseline
 
 # continuous state trained on its own refinement procedure — the main result
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_selfcorrect
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep
 ```
 
 Measure a checkpoint. `model.backbone.dtype=float32` is required for the
