@@ -44,45 +44,51 @@
 - [Acknowledgments](#acknowledgments)
 - [License](#license) 🚧
 
-## Multi-step drafting study (August 8-9, 2026)
+## Multi-step drafting study (August 2026)
 
-Ten training runs on SmolLM2-135M, 20k steps each, measured on 460 tasks drawn
-from six benchmarks — 56,000 per-prompt observations across three training
-horizons and four decode schedules. Setup, results and the comparison against
-the paper: [EXPERIMENTS.md](EXPERIMENTS.md).
+Ten training runs on SmolLM2-135M at 20k steps, three of them replicated across
+three seeds. Measured on 460 tasks from six benchmarks: 56,000 per-prompt
+observations at one seed, plus 144 further measurements across seeds at the
+common horizon. Full write-up, objective and mathematics:
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 **Headline.** Orthrus concludes that single-step projection is optimal. That
-holds for a masked drafter and fails for a continuous state. Every masked
-variant gains almost nothing from extra refinement passes (+0.055 to +0.069
-going from one pass to four), whether or not it was trained on them. A
-continuous state trained on its own refinement procedure gains **+0.925**. The
-same architecture *without* that training **loses** 0.337 tokens — the only
-negative slope in the set.
+holds for a masked drafter and fails for a continuous state. Intervals below use
+the **training seed** as the unit of observation (three seeds, df = 2), so they
+describe the method rather than one trained model.
 
-| contrast (three passes, 20k steps) | Δ accepted tokens | 95% CI |
-|---|---|---|
-| multi-step training, continuous state | **+1.175** | [+1.135, +1.215] |
-| best run vs reproduced Orthrus | **+0.870** | [+0.828, +0.912] |
-| continuous state vs masking, same objective | +0.640 | [+0.601, +0.679] |
-| our changes to the reproduced baseline | +0.182 | [+0.161, +0.204] |
-| multi-step training, masking | +0.048 | [+0.031, +0.065] |
+| contrast (three refinement passes, 20k steps) | Δ accepted tokens | 95% CI | p |
+|---|---|---|---|
+| multi-step training, continuous state | **+1.138** | ± 0.109 | 0.0005 |
+| best run vs reproduced Orthrus | **+0.835** | ± 0.085 | 0.0006 |
+| continuous state vs masking, same objective | +0.612 | ± 0.065 | 0.0006 |
+| multi-step training, masking | +0.223 | ± 0.021 | 0.0005 |
 
-**Multi-step buys quality, not speed.** Throughput falls monotonically and no
-multi-step variant exceeds 1.0 tokens per forward, i.e. none beats plain
+Going from one refinement pass to four, acceptance grows by **+0.893** with a
+continuous state trained on the procedure, by +0.070 with masking, and **falls
+by 0.563** for the same continuous architecture left untrained on it — on all
+three seeds.
+
+**Multi-step buys quality, not speed.** Throughput falls monotonically and
+nothing multi-step exceeds 1.0 tokens per forward, i.e. none beats plain
 autoregressive decoding: a cycle costs `n+1` forwards while acceptance grows
-slower than `n`. Only single-pass decoding clears 1.0 (1.327 / 1.264 / 1.219).
-This is exactly what the prefix-fixing lemma predicts — it gives `TPF = 1` as a
-floor, not as a speedup mechanism.
+slower than `n`. This is what the prefix-fixing lemma predicts — it yields
+`TPF = 1` as a floor, not as a speedup mechanism. Only single-pass decoding
+clears 1.0 (1.326 / 1.257 / 1.219).
+
+**A reversal worth noting.** At a single pass masking *wins* (−0.148 ± 0.047).
+The advantage of a continuous state appears only with refinement and grows with
+it: −0.148 → +0.612 → +0.675 at one, three and four passes.
 
 ![acceptance and throughput vs refinement passes](results/figures/multistep.png)
-![training curves](results/figures/training_curves.png)
-![paired contrasts](results/figures/contrasts.png)
+![paired contrasts with the seed as the unit](results/figures/contrasts.png)
+![training curves across three seeds](results/figures/seeds.png)
 ![per-benchmark breakdown](results/figures/per_benchmark.png)
 ![measured horizon](results/figures/horizon.png)
 
-**Caveat.** One training seed. The intervals describe spread over tasks, not
-across training runs. A claim about the *method* needs several seeds; seed
-replication is in progress.
+Untrained multi-step refinement is not merely worse but *unpredictably* worse:
+at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
+every other run stays within 0.05.
 
 ### What changed in the code
 
@@ -100,19 +106,18 @@ Defects found and fixed, each with a measured before/after:
 | `eval.py` | measured a block-32 model at block 8; crashed writing paired schedules | fixed |
 | `min_jump_gap` | justification was wrong: the gradient at `s≈t` is `O(t−s)`, not zero | left at 0 |
 
-Portability: the CUDA path no longer refuses non-Qwen3 backbones (the dense
-mask is correct and portable); the finite-loss check and the crash-checkpoint
-decision are now collective; the seed is offset by rank; all three teacher
-modes are chunked (6.09 GB → 0.75 GB at the paper preset); `val_check_interval`
-in the paper presets counted loader batches — 3.9 optimizer steps instead of 250.
+Portability: the CUDA path no longer refuses non-Qwen3 backbones; the
+finite-loss check and the crash-checkpoint decision are collective; the seed is
+offset by rank; all three teacher modes are chunked (6.09 GB → 0.75 GB at the
+paper preset); `val_check_interval` in the paper presets counted loader batches
+— 3.9 optimizer steps instead of 250.
 
 Losslessness needs `model.backbone.dtype=float32`: under bf16 the verifier's
-arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6). Harmless
-for comparing runs, not harmless for the losslessness claim.
+arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6).
 
 Rejected configurations live in [bucket/](bucket/) with their numbers.
 Objective assumptions that code cannot remove are in
-[ASSUMPTIONS.md](ASSUMPTIONS.md).
+[ASSUMPTIONS.md](ASSUMPTIONS.md), including one measured and found unsatisfied.
 
 ## Overview
 

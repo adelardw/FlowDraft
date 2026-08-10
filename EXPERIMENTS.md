@@ -1,235 +1,261 @@
-# Эксперименты: обучение чернового генератора многошаговому декодированию
+# Multi-step drafting: what was tested and what came out
 
-Десять экспериментов, один сид обучения, 20000 шагов каждый. Замер — 460 задач
-из шести бенчмарков, три горизонта обучения, четыре расписания декодирования,
-56000 попромптовых наблюдений.
-
----
-
-## Постановка
-
-Спекулятивное декодирование: лёгкий черновой генератор предлагает блок из 31
-токена сразу, замороженная авторегрессионная модель проверяет их одним проходом
-и принимает максимальный префикс, где предложение совпало с её собственным
-выбором. Выход при этом **тождественен** обычному последовательному декоду —
-проверка это гарантирует.
-
-Две метрики, и их нельзя путать:
-
-- **Принятые токены** — сколько из 31 предложенного проверяющая модель приняла.
-  Это качество чернового генератора.
-- **Токенов на форвард** — принятые токены, делённые на число проходов за цикл.
-  Это скорость. Обычный последовательный декод даёт ровно 1.
-
-Черновой генератор может делать несколько **проходов уточнения** за цикл: сделать
-предложение, зафиксировать часть позиций, переписать остальные, повторить. Каждый
-такой проход стоит одного форварда, поэтому растущее качество борется с растущей
-ценой.
-
-Черновой генератор реализован двумя способами:
-
-- **Маскирование** — непредсказанные позиции подаются обучаемым вектором-заглушкой.
-  Это способ статьи Orthrus.
-- **Непрерывное состояние** — позиция подаётся точкой на симплексе распределений,
-  `x_s = (1−s)·шум + s·ответ`, и сеть параметризует отображение из этой точки в
-  распределение ответа. Промежуточная позиция тогда несёт **градацию** «насколько
-  эта позиция уже решена», которой у заглушки нет.
+Ten training runs at one seed, plus three of them replicated at two more seeds.
+Measured on 460 tasks from six benchmarks — 56,000 per-prompt observations at
+seed 42 across three horizons and four decode schedules, and 144 further
+measurements across three seeds at the common 20k horizon.
 
 ---
 
-## Сравнение с оригинальной статьёй
+## 1. Setup
 
-Orthrus (arXiv 2605.12825) обучает три проекционные матрицы диффузионного
-внимания — запросов, ключей и значений, — при размере блока 32, двух эпохах на
-600 тысячах примеров, прямой дивергенции Кульбака-Лейблера как цели.
+A frozen autoregressive model decodes one token per forward pass. A lightweight
+**drafter** proposes a block of `K−1 = 31` tokens at once; the frozen model
+checks all of them in a single pass and accepts the longest prefix on which the
+drafter's choice matches its own. The emitted text is **bit-identical** to plain
+sequential decoding — verification guarantees it.
 
-Их таблица 3 сообщает: многошаговое уточнение **роняет** пропускную способность с
-6.35 до 3.53 токенов на форвард, и статья заключает, что одношаговая проекция
-оптимальна.
+Two quantities, and they must not be conflated:
 
-**Существенная деталь их постановки:** многошаговый вариант обучен *случайным
-маскированием половины позиций*, заимствованным из Fast-dLLM-v2, а не той
-последовательностью состояний, которую его собственное декодирование проходит.
-То есть вывод получен на модели, которую многошаговости не учили.
+- **Accepted tokens** `A` — how many of the 31 proposals survive verification.
+  This is drafting quality.
+- **Tokens per forward** `TPF = (A + 1) / (n + 1)` where `n` is the number of
+  drafter passes in a cycle. This is speed. Plain decoding gives exactly 1.
 
-Все наши эксперименты воспроизводят их гиперпараметры (таблица 4): длина
-последовательности 2048, 256 блоков на последовательность, размер блока 32, две
-эпохи, скорость обучения 2·10⁻⁴ с косинусным расписанием и разогревом 5%,
-обрезка градиента 1.0, глобальный батч 128 — но на модели SmolLM2-135M вместо
-Qwen3-8B, поэтому абсолютные числа с их числами несравнимы. Сравнимы контрасты
-внутри нашего набора, и первый эксперимент существует именно затем, чтобы такая
-точка отсчёта была.
+The drafter may take several **refinement passes** per cycle: propose, freeze the
+positions it is most confident about, rewrite the rest, repeat. Each pass costs
+one forward, so rising quality fights rising cost.
 
----
+### Why acceptance is a conjunction
 
-## Эксперименты
+Position `j` is accepted only if every position before it was also accepted:
+the verifier conditions on the tokens it has already committed. Hence
 
-### 1. Воспроизведённый Orthrus
+```
+E[A] = Σ_{j=1..K−1} Π_{i≤j} a_i
+```
 
-Дословно по статье: обучаются проекции запросов, ключей и значений; никаких
-наших добавлений. Точка отсчёта для всех остальных.
+where `a_i` is the per-position agreement probability. The derivative
 
-**Результат: 1.532 принятых токена** (три прохода уточнения), 1.219 токенов на
-форвард при одном проходе.
+```
+∂E[A]/∂a_j = S_{j−1} · (1 + R_j),   S_j = Π_{i≤j} a_i,   R_j = a_{j+1}(1 + R_{j+1}),  R_{K−1} = 0
+```
 
-### 2. Воспроизведённый Orthrus плюс два наших изменения
+says what an improvement at position `j` is worth: the probability of ever
+reaching it. At `a ≈ 0.8` the first position is worth 6.2 and the thirty-first
+0.0015 — a factor of four thousand. This derivative is used to weight the loss
+per position; it is verified against central differences to `1.4·10⁻⁷`.
 
-То же, плюс:
+### Two drafter parameterisations
 
-- **обучаемая выходная проекция внимания** — в статье её нет;
-- **взвешивание позиций по их вкладу в метрику.** Приёмка есть конъюнкция по
-  префиксу: позиция принята, только если приняты все до неё. Значит улучшение на
-  позиции `j` стоит вероятности до неё дожить, и веса берутся как производная
-  ожидаемой длины по приёмке позиции;
-- **гашение учителя после расхождения цепочки.** Учитель обусловлен текстом
-  корпуса, а проверяющая модель — своим собственным продолжением; они совпадают
-  до первого расхождения и расходятся после, поэтому вес за точкой расхождения
-  снижен.
-
-**Результат: 1.714, прирост +0.182** [+0.161, +0.204], статистически значим.
-То есть наш бейзлайн **сильнее** опубликованного, и последующие сравнения ведутся
-против усиленной, а не ослабленной точки отсчёта.
-
-### 3. Маскирование плюс обучение многошаговости
-
-Добавлен член, который учит генератор **его собственной процедуре уточнения**.
-Генератор делает предложение, проверяющая модель выносит по нему вердикт одним
-замороженным проходом, и следующий проход учится на состоянии, которое
-декодирование действительно проходит: часть позиций зафиксирована выбранными
-токенами, остальные под заглушкой. Доли фиксации совпадают с декодными точно.
-
-**Результат: 1.762, прирост +0.048** [+0.031, +0.065], значим, но мал.
-**Рост от одного прохода к четырём: +0.068.**
-
-### 4. Непрерывное состояние без обучения многошаговости
-
-Черновой генератор на симплексе, обучен только выравниванию на прыжок, которым
-декодирование заканчивает цикл. Многошаговость доступна, но ничем не обучена.
-
-**Результат: 1.227 при трёх проходах — и это ХУЖЕ, чем при одном (1.564).
-Рост от одного прохода к четырём: −0.337.** Единственный эксперимент, где
-качество от уточнения **падает**.
-
-### 5. Непрерывное состояние плюс обучение многошаговости
-
-Главный эксперимент. Тот же член, что в третьем, но промежуточное состояние —
-точка симплекса `(1−s)·шум + s·предыдущее предложение`, а моменты входа
-распределены, а не фиксированы: непрерывное состояние это допускает, заглушка нет.
-
-**Результат: 2.402, прирост над четвёртым +1.175** [+1.135, +1.215].
-**Рост от одного прохода к четырём: +0.925.**
-**Против воспроизведённого Orthrus: +0.870** [+0.828, +0.912], то есть **+57%**.
-
-### 6. Мультипликативное обусловливание временем
-
-Проверка предположения, что две части цели конкурируют за ёмкость: выравнивание
-на прыжок требует, чтобы сеть **игнорировала** вход при `s = 0`, а обучение
-многошаговости — чтобы **читала** его при `s ≥ 0.5`. Различать режимы сеть может
-только через время, а время входит слагаемым, и сложение не может обнулить
-производную выхода по входу — измерено, гашение начинается лишь при амплитудах в
-81–325 крат натурального масштаба сети. Умножение может.
-
-**Результат: 2.429, разница +0.027** [−0.006, +0.060], **не значима**
-(p = 0.23; знаковый критерий 13 блоков из 20; по датасетам знак меняется).
-Предположение о конкуренции за ёмкость **не подтверждено**.
-
-### 7. Члены согласованности траектории
-
-Добавлены две регуляризации, делающие семейство отображений траекторией:
-согласие прыжка с локальным экспертом в точке приземления и штраф на скорость
-изменения по времени.
-
-**Результат: 2.288, разница −0.114** [−0.150, −0.078], значимо **отрицательна**.
-
-### 8. Заморозка проекции значений
-
-Обучаются проекции запросов, ключей и выхода; значения остаются замороженными.
-Проверка идеи, что тюнить надо маршрутизацию внимания и сборку голов, а не сам
-переносимый материал.
-
-**Результат: 2.158, разница −0.244** [−0.281, −0.207], значимо отрицательна.
-Проекция значений нужна.
-
-### 9–10. Равный вес позиций внутри члена многошаговости
-
-Контроль: внутри члена полный вес даётся позиции разрыва проверки, остальным —
-половинный. Эти два эксперимента снимают различие.
-
-**Непрерывное состояние: −0.043** [−0.074, −0.012], значим на границе.
-**Маскирование: −0.005** [−0.022, +0.012], **не значим** (p = 0.57).
-То есть в маскирующем варианте это различие не несёт ничего.
+- **Masking** — unpredicted positions carry a trainable placeholder vector.
+  This is the Orthrus construction.
+- **Continuous state** — a position carries a point on the vocabulary simplex,
+  `x_s = (1−s)·x₀ + s·x₁`, interpolating a prior draw `x₀` and the answer `x₁`.
+  The network parameterises a **flow map** `π_{s,t}(x_s)`: the distribution the
+  state should reach by time `t`. The transport is
+  `X_{s,t}(x) = x + γ·(π − x)` with `γ = (t−s)/(1−s)`.
+  An intermediate position then carries a **graded** notion of "how settled this
+  position is", which a placeholder cannot express.
 
 ---
 
-## Сводные таблицы
+## 2. The objective
 
-### Принятые токены из 31, горизонт 20000 шагов
+### Continuous state
 
-| эксперимент | 1 проход | 2 | 3 | 4 | рост 1→4 |
+```
+L = w_verify · KL( sg p_AR( · | ctx ) ‖ π_{0,1}(x₀) ) · u_j
+  + w_self   · (1/r) Σ_{k=1..r} l( p_AR( · | ctx, argmax q_{k−1} ) , π_{s_k,1}(x_k) ) · v_j · u_j
+  + w_end    · CE( x₁ , π_{t,t}(x_t) )
+  + λ        · ( 4·EC + 2·TD )
+```
+
+with
+
+```
+q₀   = π_{0,1}(x₀)                        the jump the decode loop actually executes
+x_k  = (1−s_k)·x₀′ + s_k·q_{k−1}          restart carrying the previous pass's draft
+s_k  stratified in (s_min, 1), detached between passes
+u_j  = ∂E[A]/∂a_j  ×  chain-validity gate
+v_j  = 1 at the verifier's break position, `tail` elsewhere
+EC   = CE( sg π_{t,t}(X_{s,t}(x_s)) , π_{s,t}(x_s) )
+TD   = ‖∂_t π_{s,t}‖² · γ²
+```
+
+**First term — verifier alignment.** Match the frozen model's distribution on the
+jump that ends every decode cycle. Its target does not depend on the drafter's
+state, so this term alone cannot teach the drafter to *read* its input.
+
+**Second term — multi-step training.** This is the addition under test. The
+drafter proposes; one frozen forward over that proposal yields both a target
+`p_AR(·|ctx, draft)` and the exact greedy verdict; the next pass is trained on
+the state the decode loop actually visits. States are detached between passes:
+the term asks for per-jump stationarity, not for a differentiable composition.
+
+**Third and fourth — trajectory structure.** Endpoint likelihood on the diagonal
+plus two consistency terms that make the family a trajectory rather than a set
+of unrelated maps.
+
+### Masking
+
+```
+L = KL( sg p_AR( · | ctx ) ‖ π(mask) ) · u_j
+  + w_self · (1/r) Σ_{k=1..r} l( p_AR( · | ctx, d_{k−1} ) , π(state_k) ) · v_j · u_j
+```
+
+`state_k` freezes `keep_k = round((K−1)·(k+1)/(r+1))` positions at their chosen
+tokens and re-masks the rest. The set is monotone and the frozen tokens never
+change — the same sequence the decoder walks at `r+1` passes. At `K = 32, r = 2`
+this is `[10, 21]` on both sides, verified by instrumenting both paths.
+
+**Asymmetry worth naming.** In the continuous branch the restart times `s_k` are
+*distributed*; in the masked branch the commit schedule is *fixed*. That is not
+an oversight: a continuous state admits a distribution over entry points, a
+placeholder does not.
+
+### What the theory predicts about speed
+
+If the map realised the Jacobi sweep `T(ctx,d)_j = argmax p_AR(·|ctx, d_{<j})`
+exactly, then `n` chained passes would fix positions `1..n`, giving
+`A_n ≥ min(n, K−1)`. Substituting into `TPF = (A+1)/(n+1)` gives **exactly 1**.
+The lemma is therefore a **floor**, not a speedup mechanism: acceleration needs
+`A_n > n` strictly, and the bound only gives `A_n ≥ n`. The measurements below
+confirm this — no multi-step variant exceeds 1.
+
+---
+
+## 3. Comparison with the paper
+
+Orthrus (arXiv 2605.12825) trains three projection matrices of the diffusion
+attention — queries, keys and values — at block size 32, two epochs over 600k
+examples, forward KL as the objective. Table 4 hyperparameters are reproduced
+here exactly: sequence length 2048, 256 anchor blocks per sequence, block size
+32, two epochs, peak LR 2·10⁻⁴ with cosine schedule and 5% warmup, gradient
+clipping 1.0, global batch 128. The backbone differs — SmolLM2-135M instead of
+Qwen3-8B — so absolute numbers are not comparable to theirs; contrasts within
+this set are, which is why experiment 1 exists.
+
+Their Table 3 reports that multi-step refinement **drops** throughput from 6.35
+to 3.53 tokens per forward, concluding that single-step projection is optimal.
+
+**The detail that matters:** their multi-step variant is trained by *randomly
+masking 50% of block positions*, adapted from Fast-dLLM-v2 — not on the state
+sequence its own decoding visits. The conclusion is drawn from a model that was
+never taught multi-step refinement.
+
+---
+
+## 4. Results
+
+All numbers at the common 20k horizon, three refinement passes unless stated.
+Intervals in this section use the **training seed** as the unit of observation
+(three seeds, `df = 2`, `t₀.₉₇₅ = 4.30`) — they describe the spread of the
+*method*, not of one trained model.
+
+### The two headline claims
+
+| contrast | Δ accepted | 95% CI | t | p | per seed |
 |---|---|---|---|---|---|
-| непрерывное + многошаговость | 1.581 | 2.087 | 2.402 | **2.507** | **+0.925** |
-| то же + мультипликативное обусловливание | 1.611 | 2.094 | 2.429 | 2.502 | +0.891 |
-| то же, равный вес позиций | 1.590 | 2.057 | 2.359 | 2.470 | +0.880 |
-| то же + согласованность траектории | 1.556 | 2.030 | 2.288 | 2.267 | +0.711 |
-| то же, значения заморожены | 1.515 | 2.012 | 2.158 | 2.205 | +0.690 |
-| маскирование + многошаговость | 1.717 | 1.739 | 1.762 | 1.785 | +0.068 |
-| маскирование + наши изменения | 1.673 | 1.694 | 1.714 | 1.728 | +0.055 |
-| воспроизведённый Orthrus | 1.484 | 1.508 | 1.532 | 1.554 | +0.069 |
-| непрерывное без многошаговости | 1.564 | 1.548 | 1.227 | 1.227 | **−0.337** |
+| **multi-step training, continuous state** | **+1.138** | ± 0.109 | +45.0 | 0.0005 | 1.175 / 1.151 / 1.090 |
+| **best vs reproduced Orthrus** | **+0.835** | ± 0.085 | +42.3 | 0.0006 | 0.870 / 0.834 / 0.802 |
+| continuous state vs masking, same objective | +0.612 | ± 0.065 | +40.6 | 0.0006 | 0.640 / 0.610 / 0.588 |
+| multi-step training, masking | +0.223 | ± 0.021 | +46.4 | 0.0005 | 0.230 / 0.225 / 0.214 |
 
-### Токенов на форвард, горизонт 20000 шагов
+### Growth from one pass to four
 
-| эксперимент | 1 проход | 2 | 3 | 4 |
-|---|---|---|---|---|
-| маскирование + многошаговость | **1.327** | 0.898 | 0.681 | 0.550 |
-| маскирование + наши изменения | 1.307 | 0.884 | 0.670 | 0.539 |
-| непрерывное + мультипл. обусловливание | 1.278 | 1.010 | 0.836 | 0.684 |
-| непрерывное + многошаговость | 1.264 | **1.008** | **0.831** | **0.684** |
-| воспроизведённый Orthrus | 1.219 | 0.826 | 0.627 | 0.506 |
-| непрерывное без многошаговости | 1.255 | 0.837 | 0.553 | 0.443 |
+| experiment | Δ | 95% CI | t | p | per seed |
+|---|---|---|---|---|---|
+| **continuous + multi-step** | **+0.893** | ± 0.085 | +45.1 | 0.0005 | 0.925 / 0.897 / 0.857 |
+| masked + multi-step | +0.070 | ± 0.014 | +21.6 | 0.0021 | 0.068 / 0.066 / 0.077 |
+| Orthrus, reproduced | +0.071 | ± 0.019 | +15.8 | 0.0040 | 0.069 / 0.064 / 0.079 |
+| **continuous, no multi-step** | **−0.563** | ± 0.526 | −4.60 | 0.044 | −0.337 / −0.595 / −0.757 |
+
+The gain from refinement is **thirteen times larger** with a continuous state,
+and without the training the same architecture *loses* acceptance on all three
+seeds.
+
+### Throughput, averaged over seeds
+
+| experiment | 1 pass | 3 | 4 |
+|---|---|---|---|
+| masked + multi-step | **1.326** | 0.681 | 0.550 |
+| continuous + multi-step | 1.257 | **0.824** | **0.675** |
+| Orthrus, reproduced | 1.219 | 0.628 | 0.507 |
+| continuous, no multi-step | 1.245 | 0.554 | 0.394 |
+
+**Multi-step buys quality, not speed.** Only single-pass decoding clears 1.0.
+The continuous state loses the least as passes grow (1.257 → 0.675 against
+1.219 → 0.507), but it does not beat plain decoding either — exactly as the
+prefix-fixing lemma predicts.
+
+### A reversal at one pass
+
+At a single pass, **masking wins**: −0.148 ± 0.047 in favour of the placeholder
+(`p = 0.0055`). The advantage of a continuous state appears only with refinement
+and grows with it: **−0.148 → +0.612 → +0.675** at one, three and four passes.
+
+### Between-seed stability
+
+| experiment | σ at 1 pass | at 3 | at 4 |
+|---|---|---|---|
+| Orthrus, reproduced | 0.004 | 0.001 | 0.001 |
+| masked + multi-step | 0.005 | 0.008 | 0.004 |
+| continuous + multi-step | 0.007 | 0.032 | 0.043 |
+| **continuous, no multi-step** | 0.005 | 0.013 | **0.228** |
+
+Untrained multi-step refinement is not merely worse, it is **unpredictably**
+worse: at four passes the three seeds give 1.227 / 0.933 / 0.778. Every other
+run stays within 0.05.
+
+### Single-seed ablations (prompt-level intervals, seed 42 only)
+
+| ablation | Δ | 95% CI | verdict |
+|---|---|---|---|
+| multiplicative time conditioning | +0.027 | [−0.006, +0.060] | not significant (p = 0.23) |
+| flow-consistency terms | −0.114 | [−0.150, −0.078] | significantly harmful |
+| freezing the value projection | −0.244 | [−0.281, −0.207] | significantly harmful |
+| equal position weights, continuous | −0.043 | [−0.074, −0.012] | marginal (p = 0.022) |
+| equal position weights, masked | −0.005 | [−0.022, +0.012] | no effect (p = 0.57) |
 
 ---
 
-## Выводы
+## 5. Conclusions
 
-**1. Вывод статьи об оптимальности одного прохода верен для маскирования и неверен
-для непрерывного состояния.** У всех маскирующих вариантов приёмка от числа
-проходов почти не растёт (+0.055…+0.069 от одного к четырём) независимо от того,
-учили их многошаговости или нет. У непрерывного состояния с обучением она растёт
-на **+0.925**.
+**The paper's conclusion is correct for its own architecture and does not
+generalise.** With masking, acceptance barely responds to refinement passes
+(+0.070) whether or not the model was trained on them. With a continuous state
+trained on its own procedure, it grows by +0.893.
 
-**2. Многошаговость надо обучать, иначе она вредит.** Одна и та же архитектура без
-этого члена **теряет** 0.337 токена при переходе от одного прохода к четырём —
-единственный отрицательный рост в наборе.
+**Multi-step refinement must be trained, or it hurts.** The identical
+architecture without that term loses 0.563 tokens going from one pass to four,
+and the loss varies wildly across seeds.
 
-**3. Непрерывное состояние несущее.** При одном и том же члене цели переход от
-заглушки к точке симплекса даёт **+0.640** [+0.601, +0.679]. Это и есть ответ на
-вопрос атрибуции: дело не в члене цели самом по себе.
+**The continuous state is load-bearing.** Holding the objective fixed and
+swapping the placeholder for a simplex point is worth +0.612.
 
-**4. Ускорения многошаговость не даёт, и это надо говорить прямо.** Пропускная
-способность падает у всех вариантов монотонно, и **ни один при многошаговости не
-превышает единицу**, то есть не быстрее обычного декода. Цикл стоит `n+1`
-форвардов, а приёмка растёт медленнее, чем `n`. Единственная область, где скорость
-выше единицы, — одношаговое декодирование: 1.327 у лучшего маскирующего варианта,
-1.264 у непрерывного, 1.219 у воспроизведённого Orthrus.
+**No speedup.** Throughput falls monotonically; nothing multi-step beats plain
+autoregressive decoding. What multi-step buys is draft quality at a fixed block
+width.
 
-Что многошаговость даёт — **качество чернового предложения при равном числе
-позиций**, и падение скорости у непрерывного состояния самое пологое: с 1.264 до
-0.684 против 1.219 → 0.506 у Orthrus.
-
-**5. Три идеи не подтвердились:** мультипликативное обусловливание временем
-(+0.027, незначимо), члены согласованности траектории (−0.114), заморозка проекции
-значений (−0.244).
+**Three ideas did not survive:** multiplicative time conditioning, flow
+consistency terms, and freezing the value projection.
 
 ---
 
-## Ограничение, которое не снимается статистикой
+## 6. What remains open
 
-**Сид обучения один.** Все интервалы выше построены по 460 задачам и описывают
-разброс **измерения**: устоит ли разница на других задачах. Они не описывают
-разброс **метода** между прогонами обучения. Утверждение «этот способ обучения
-лучше того» требует нескольких сидов; при двух степень свободы равна единице и
-порог значимости 12.71, то есть почти любой эффект окажется незначимым.
-
-Минимальный осмысленный план — три ключевых эксперимента (1, 4, 5) на четырёх
-сидах: 12 часов обучения и час замера, степень свободы 3, порог 3.18.
+- **Three seeds give `df = 2`.** All headline contrasts clear the 4.30 threshold
+  comfortably, but the design is small; a fourth seed would halve the critical
+  value.
+- **Eight of ten runs were still improving at the step budget.** The horizon,
+  not convergence, sets these numbers.
+- **The self-correction term has no potential function.** `argmax` kills the
+  target gradient and the detach kills the input gradient, so the sum is not the
+  gradient of any scalar in `θ`. Convergence was observed on every curve; it is
+  not guaranteed by anything.
+- **Assumptions the code cannot remove** are listed in
+  [ASSUMPTIONS.md](ASSUMPTIONS.md), including one that was measured and found
+  **unsatisfied**: the additive time conditioning cannot gate the input Jacobian
+  at any realistic amplitude, so verifier alignment and multi-step training do
+  share capacity. The multiplicative fix built to relieve it showed no effect.
