@@ -192,7 +192,7 @@ line. What matches: $B$ sampled anchor positions per batch with contiguous block
 of width $K$; the corruption rule (anchor kept visible, remaining $K-1$ slots
 replaced by `<mask>`); forward KL against the frozen AR head's full distribution;
 gradients confined to the diffusion module; and the dual-pass block mask, whose
-two clauses — causal AR context $\mathbf 1[k<L]\cdot\mathbf 1[k\le a_b-1]$ and
+two clauses — causal AR context $\mathbf 1[k \lt L]\cdot\mathbf 1[k\le a_b-1]$ and
 bidirectional-within-block $\mathbf 1[k\ge L]\cdot\mathbf 1[\lfloor q/K\rfloor=\lfloor (k-L)/K\rfloor]$ —
 appear verbatim in both the sparse FlexAttention path and the dense fallback.
 
@@ -367,7 +367,7 @@ on the last, the object to imitate is one **Jacobi sweep** of the greedy AR
 chain,
 
 ```math
-T(\mathrm{ctx}, d)_j \;=\; \arg\max\; p_{\mathrm{AR}}\big(\cdot \mid \mathrm{ctx},\, d_{<j}\big)
+T(\mathrm{ctx}, d)_j \;=\; \arg\max\; p_{\mathrm{AR}}\big(\cdot \mid \mathrm{ctx},\, d_{\lt j}\big)
 ```
 
 — "take the whole current draft and advance every position by one AR step, in
@@ -438,7 +438,7 @@ parameterisation: `EC` is in nats and invariant to reparameterising `t`, while
 
 ### What the theory predicts about speed
 
-If the map realised the Jacobi sweep `T(ctx,d)_j = argmax p_AR(·|ctx, d_{<j})`
+If the map realised the Jacobi sweep `T(ctx,d)_j = argmax p_AR(·|ctx, d_{\lt j})`
 exactly, `n` chained passes would fix positions `1 … n`, giving
 `A_n ≥ min(n, K−1)`. Substituting into
 
@@ -590,11 +590,6 @@ consistency terms, and freezing the value projection.
   replaces over 4,981 (query, key) pairs across six block geometries and both
   in-block causality settings, with zero disagreement, so the two differ in
   speed and not in what they compute.
-- **Two of the five horizons cannot be re-measured.** The `snap-0012000` and
-  `snap-0014000` checkpoints were deleted to free disk and are gone for every
-  configuration and seed; their rows survive in `data/measurements/` but
-  reproducing them needs retraining. Every checkpoint behind a headline number
-  is intact: 12 of 12 at the 20k horizon, and 10k and 16k are complete as well.
 
 ### Assumptions the code cannot remove
 
