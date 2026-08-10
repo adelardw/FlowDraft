@@ -133,120 +133,174 @@ Verified against central differences to $1.4 \times 10^{-7}$.
 
 ## 3. The loss, experiment by experiment
 
+### Notation: the two drafters are different objects
+
+They are written with different letters throughout, because they are not the
+same kind of function.
+
+| | masked drafter | flow map |
+|---|---|---|
+| symbol | $d_\theta$ | $\pi^\theta_{s,t}$ |
+| what it is | **one** map | a **two-parameter family** of maps |
+| input | block state $M$ — every slot is either `[MASK]` or a committed token | simplex point $x_s$ — every slot is a distribution part-way between prior and answer |
+| indices | **none** | $s$ = time of the *input* state, $t$ = time the *output* should reach |
+| slot values | discrete: unknown / committed | continuous: $x_s = (1-s)x_0 + s\,x_1$ |
+| what "progress" means | how many slots are committed | how far along $s$ every slot is, individually |
+
+```math
+d_\theta\big(\cdot \mid \mathrm{ctx}, M\big) \;:\; \text{block state} \longrightarrow \text{distribution over the vocabulary}
+```
+
+```math
+\pi^\theta_{s,t}\big(x_s\big) \;:\; \text{simplex point at time } s \longrightarrow \text{distribution the slot should hold at time } t
+```
+
+The masked drafter has no $s$ because its input carries no notion of partial
+progress, and no $t$ because its output is always "the answer" — there is no
+intermediate target to aim at. **That absence is the subject of this study.**
+
 Shared symbols:
 
 | symbol | meaning |
 |---|---|
-| `p_AR(·\|ctx)` | frozen verifier's distribution, stop-gradient throughout |
-| `u_j` | `∂E[A]/∂a_j` times the chain-validity gate |
-| `v_j` | 1 at the verifier's break position, `tail` elsewhere |
-| `r` | refinement passes trained per step (2 here) |
-| `sg` | stop-gradient |
+| $p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx})$ | frozen verifier's distribution, stop-gradient throughout |
+| $u_j$ | $\partial\mathbb{E}[A]/\partial a_j$ times the chain-validity gate |
+| $v_j$ | 1 at the verifier's break position, `tail` elsewhere |
+| $r$ | refinement passes trained per step (2 here) |
+| $M_k$ | masked block state after $k$ commits |
+| $x_k$ | simplex block state at restart $k$ |
+
+---
 
 ### 3.1 Orthrus, reproduced — `*_masked_paper`
 
-One term. Every drafted slot holds the mask vector; the target is the frozen
-model's distribution conditioned on the corpus prefix.
+One term. Every drafted slot holds the mask vector, so the state is $M_0$ — all
+slots unknown. **No indices anywhere**: a single map, a single target.
 
 ```math
-\mathcal{L} \;=\; \mathrm{KL}\Big(\,\mathrm{sg}\;p_{\mathrm{AR}}(\cdot\mid \mathrm{ctx})\;\Big\|\;\pi(\mathrm{mask})\Big)
+\mathcal{L} \;=\; \mathrm{KL}\Big(\,\mathrm{sg}\;p_{\mathrm{AR}}(\cdot\mid \mathrm{ctx})\;\Big\|\;d_\theta(\cdot\mid\mathrm{ctx}, M_0)\Big)
 ```
 
-No position weights, no chain gate, projections `W_Q, W_K, W_V` only. Nothing
-here depends on the drafter's own output, so multi-step refinement is available
-at decode time but is never trained.
+No position weights, no chain gate, projections $W_Q, W_K, W_V$ only. Nothing
+depends on the drafter's own output, so multi-step refinement is available at
+decode time but is never trained.
+
+---
 
 ### 3.2 Masked plus multi-step training — `*_masked_multistep`
 
-Adds a term that trains the drafter on the state sequence its own decoding
-visits.
+Still $d_\theta$, still no $(s,t)$. What changes is the **state argument**: the
+second term feeds block states the decoder actually visits.
 
 ```math
-\mathcal{L} \;=\; \underbrace{\mathrm{KL}\big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\big\|\, \pi(\mathrm{mask})\big)\cdot u_j}_{\text{verifier alignment}}
+\mathcal{L} \;=\;
+\underbrace{\mathrm{KL}\Big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\Big\|\, d_\theta(\cdot\mid\mathrm{ctx}, M_0)\Big)\cdot u_j}_{\text{verifier alignment}}
 \;+\;
-w_{\text{self}}\cdot\underbrace{\frac{1}{r}\sum_{k=1}^{r}
-\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,d_{k-1}\big),\;\pi(\mathrm{state}_k)\Big)\cdot v_j\, u_j}_{\text{multi-step}}
+w_{\text{self}}\cdot
+\underbrace{\frac{1}{r}\sum_{k=1}^{r}
+\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,\hat d_{k-1}\big),\;\; d_\theta(\cdot\mid\mathrm{ctx}, M_k)\Big)\cdot v_j\, u_j}_{\text{multi-step}}
 ```
 
-State `k` freezes the most confident `keep_k` slots at their chosen tokens and
-re-masks the rest:
+where $\hat d_{k-1}$ is the token sequence proposed at pass $k-1$, and $M_k$
+freezes its most confident slots:
 
 ```math
-\mathrm{keep}_k \;=\; \mathrm{round}\!\Big((K-1)\cdot\frac{k+1}{r+1}\Big)
+\mathrm{keep}_k \;=\; \mathrm{round}\!\Big((K-1)\cdot\frac{k+1}{r+1}\Big),
+\qquad
+M_k = \big\{\text{slots in } \mathrm{keep}_k \text{ hold } \hat d_{k-1}\text{'s tokens; the rest hold } \texttt{[MASK]}\big\}
 ```
 
 ```
-  pass 0   │ anchor │ MASK │ MASK │ MASK │ ... │ MASK │   propose all 31
-  pass 1   │ anchor │  t₄  │ MASK │  t₉  │ ... │ MASK │   10 slots frozen
-  pass 2   │ anchor │  t₄  │  t₇  │  t₉  │ ... │ MASK │   21 slots frozen
+  pass 0   │ anchor │ MASK │ MASK │ MASK │ ... │ MASK │   M₀, propose all 31
+  pass 1   │ anchor │  t₄  │ MASK │  t₉  │ ... │ MASK │   M₁, 10 slots frozen
+  pass 2   │ anchor │  t₄  │  t₇  │  t₉  │ ... │ MASK │   M₂, 21 slots frozen
 ```
 
 The committed set is monotone and frozen tokens never change — the same
-sequence the decoder walks at `r+1` passes. At `K = 32, r = 2` this is
-`[10, 21]` on both sides, verified by instrumenting both paths.
+sequence the decoder walks at $r+1$ passes. At $K = 32$, $r = 2$ this is
+$[10, 21]$ on both sides, verified by instrumenting both paths.
+
+**A slot here is binary.** It is either `[MASK]` or a hard token. There is no
+way to say "this slot is 70% settled", which is exactly what a time index would
+express.
+
+---
 
 ### 3.3 Continuous state, ablation — `*_flow_baseline`
 
-Simplex slots, but only the verifier-alignment term. **This is the ablation
-that makes the multi-step claim testable**: the target does not depend on the
-drafter's state, so nothing teaches the map to read its own draft.
+Now the indices appear. Only one pair is ever used: $(s,t) = (0,1)$ — from a
+pure prior draw to the answer.
 
 ```math
 \mathcal{L} \;=\; w_{\text{verify}}\cdot
-\mathrm{KL}\Big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx})\;\Big\|\;\pi_{0,1}(x_0)\Big)\cdot u_j
+\mathrm{KL}\Big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx})\;\Big\|\;\pi^\theta_{\,0,\,1}(x_0)\Big)\cdot u_j
 ```
 
-Evaluated at `s = 0` on a fresh prior draw, so the input carries no information
-about the answer at all. The name was `flow_verify`; it is now `flow_baseline`,
-because "verify" reads as the verification pass rather than as "trained on the
-verifier-alignment term only".
+Read the subscripts: input at time $s = 0$ (pure noise, no information about the
+answer), output aimed at time $t = 1$ (the answer itself). This is the first leg
+of every decode cycle. The rest of the family — every $\pi_{s,t}$ with $s > 0$ —
+receives no gradient from this term at all.
+
+---
 
 ### 3.4 Continuous state plus multi-step training — `*_flow_multistep`
 
-The main result.
+The main result. The second term reaches **into the family**: it trains
+$\pi_{s_k,1}$ at several interior $s_k$, which is precisely what the masked
+parameterisation cannot express.
 
 ```math
 \mathcal{L} \;=\; w_{\text{verify}}\cdot
-\mathrm{KL}\big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\big\|\, \pi_{0,1}(x_0)\big)\cdot u_j
+\underbrace{\mathrm{KL}\Big(\mathrm{sg}\,p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}) \,\Big\|\, \pi^\theta_{\,0,\,1}(x_0)\Big)\cdot u_j}_{\text{trains one member: } s=0}
 \;+\;
-w_{\text{self}}\cdot\frac{1}{r}\sum_{k=1}^{r}
-\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,\arg\max q_{k-1}\big),\;\pi_{s_k,1}(x_k)\Big)\cdot v_j\, u_j
+w_{\text{self}}\cdot
+\underbrace{\frac{1}{r}\sum_{k=1}^{r}
+\ell\Big(p_{\mathrm{AR}}\big(\cdot\mid\mathrm{ctx},\,\arg\max q_{k-1}\big),\;\; \pi^\theta_{\,s_k,\,1}(x_k)\Big)\cdot v_j\, u_j}_{\text{trains members at } s_1,\dots,s_r}
 ```
 
 with
 
 ```math
-q_0 = \pi_{0,1}(x_0),
+q_0 = \pi^\theta_{\,0,\,1}(x_0),
 \qquad
 x_k = (1-s_k)\,x_0' + s_k\,q_{k-1},
 \qquad
 s_1 < \dots < s_r \ \text{stratified in } (s_{\min}, 1)
 ```
 
+Note that $t = 1$ in **every** term: the drafter is always asked for the answer,
+never for an intermediate distribution. What varies is $s$ — how far along the
+input already is. The restart $x_k$ mixes a *fresh* prior draw $x_0'$ with the
+previous pass's output $q_{k-1}$, so $s_k$ literally sets how much of the
+previous draft survives into the next input.
+
 ```
-  pass 0   │ anchor │  x₀  │  x₀  │  x₀  │ ... │  x₀  │   pure prior, s = 0
-  pass 1   │ anchor │  x₁  │  x₁  │  x₁  │ ... │  x₁  │   x₁ = (1-s₁)x₀' + s₁q₀
-  pass 2   │ anchor │  x₂  │  x₂  │  x₂  │ ... │  x₂  │   x₂ = (1-s₂)x₀' + s₂q₁
+  pass 0   │ anchor │  x₀  │  x₀  │  x₀  │ ... │  x₀  │   s = 0,   pure prior
+  pass 1   │ anchor │  x₁  │  x₁  │  x₁  │ ... │  x₁  │   s = s₁,  x₁ = (1-s₁)x₀' + s₁q₀
+  pass 2   │ anchor │  x₂  │  x₂  │  x₂  │ ... │  x₂  │   s = s₂,  x₂ = (1-s₂)x₀' + s₂q₁
 ```
 
-Every slot moves at every pass — nothing is frozen, because a simplex point can
-express "mostly settled" without being committed. That is the structural
-difference from 3.2, where a slot is either masked or fixed.
+**Every slot moves at every pass** — nothing is frozen, because a simplex point
+expresses "mostly settled" without committing. That is the structural difference
+from 3.2, where a slot is either masked or fixed and the only thing that can
+change between passes is *which* slots are fixed.
 
 States are detached between passes: the term asks for per-jump stationarity,
-not for a differentiable composition through `r` passes.
+not for a differentiable composition through $r$ passes.
 
-**`s_min = 0.5`, not 0.** The draft is recoverable from `x_k` only when its
-component dominates the prior's, i.e.
+**$s_{\min} = 0.5$, not 0.** The draft is recoverable from $x_k$ only when its
+component dominates the prior's:
 
 ```math
 s \;>\; \frac{1}{1 + q_{\max} - q_{r}} \;\approx\; \frac{1}{1+q_{\max}}
 ```
 
-which is 0.53 at confidence 0.9 and 0.83 at 0.2. With `s_min = 0` the lower
+which is 0.53 at confidence 0.9 and 0.83 at 0.2. With $s_{\min} = 0$ the lower
 stratification bin lies entirely below that threshold for any draw, and there
 the term's minimiser is an input-independent mixture — precisely the degeneracy
 the term exists to prevent.
+
+---
 
 ### 3.5 Trajectory-structure terms — measured, rejected
 
