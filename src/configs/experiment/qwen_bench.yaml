@@ -1,0 +1,65 @@
+# @package _global_
+# Shared setup for the Qwen3-1.7B campaign. Not an experiment by itself: it
+# holds everything the arms must agree on for their contrast to be readable.
+#
+# The training recipe follows Orthrus Table 4 verbatim — sequence length 2048,
+# 256 anchor blocks, block size 32, two epochs over 600k examples, peak LR
+# 2e-4 with cosine schedule and 5% warmup, gradient clipping 1.0, global batch
+# 128 (micro-batch 1 x accumulation 128 on a single device; on 8 devices use
+# accumulation 16 instead and the product is unchanged).
+#
+# Everything below this line was validated on SmolLM2-135M across three seeds;
+# see EXPERIMENTS.md. What does NOT transfer automatically is
+# `acceptance_profile` — see the note on it.
+defaults:
+  - override /model: qwen3_1.7b
+
+train:
+  block_size: 32                # K: one clean anchor + 31 drafted positions
+  anchors_per_sequence: 256
+  respect_document_boundaries: true
+  lr: 2e-4
+  warmup_ratio: 0.05
+
+  # Per-position weights are dE/da_j, the sensitivity of expected accepted
+  # length to per-position agreement. `acceptance_profile` states the ACCEPTANCE
+  # REGIME being aimed at, and the weights follow from it exactly.
+  #
+  # 0.93 here, against 0.8 on the 135M bench, and the difference is deliberate.
+  # Orthrus reports TPF 6.35 with acceptance length 11.7 at K=32 on Qwen3-8B;
+  # solving E[len] = sum_j a^j for a gives 0.929. A 1.7B backbone sits between
+  # that and the 135M bench, so this is an interpolation, not a measurement.
+  # Getting it wrong is not free: at profile 0.93 positions 8..31 carry ~44% of
+  # the gradient mass, at 0.8 about 20%, at 0.6 about 3%. Re-derive it from the
+  # per-position acceptance this run logs, then retrain if it moved far.
+  acceptance_profile: [0.93]
+  teacher_chain_tail_weight: 0.3
+  teacher_target: soft          # paper Table 5: 86.2% / TPF 6.35 vs 5.86 for hard CE
+
+  checkpoint_every_n_steps: 500
+  checkpoint_name: snap-{step:07d}
+  monitor: val/tpf
+  monitor_mode: max
+  early_stop_patience: 5
+
+  # Validation decodes the schedule the run is aiming at, in RESTART-PAIR form.
+  # An integer would expand to legs with t<1, which no term in the objective
+  # gives gradient to when the consistency terms are off.
+  val_decode_prompts: 24
+  val_decode_datasets: [gsm8k, math500, humaneval, mbpp, aime24, aime25]
+  val_decode_jumps: [[0.0, 1.0], [0.5, 1.0], [0.75, 1.0]]
+  val_decode_max_new: 128       # 4 decode cycles at K=32; 32 would give one
+
+data:
+  splits: [chat, math, code]    # paper: 1:1:1 chat/math/code
+  pack_sequences: true
+  pad_to_max_length: true
+  train_size: 600000
+  batch_size: 1
+  max_length: 2048
+
+trainer:
+  max_steps: 7376               # 471,952 packed sequences / 128 x 2 epochs
+  accumulate_grad_batches: 128  # single device; use 16 on 8 devices
+  # In LOADER BATCHES, not optimizer steps: 32000 = every 250 steps.
+  val_check_interval: 32000

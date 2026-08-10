@@ -90,6 +90,62 @@ Untrained multi-step refinement is not merely worse but *unpredictably* worse:
 at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
 every other run stays within 0.05.
 
+### Running the campaign on Qwen3-1.7B
+
+The four experiments that carry the claims have Qwen presets reproducing the
+paper's Table 4 hyperparameters exactly (2048 tokens, 256 anchor blocks, block
+size 32, two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup,
+gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
+
+```bash
+# reference point: Orthrus verbatim — W_Q, W_K, W_V only
+./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper
+
+# masked drafter trained on its own refinement procedure
+./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_selfcorrect
+
+# continuous state, verifier alignment only — the ablation
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_verify
+
+# continuous state trained on its own refinement procedure — the main result
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_selfcorrect
+```
+
+Measure a checkpoint. `model.backbone.dtype=float32` is required for the
+losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
+agreement on near-ties. `decode.jumps` takes restart pairs; an integer expands
+to legs at `t<1` that nothing in the objective trains when the consistency
+terms are off.
+
+```bash
+./hf-auth.sh uv run python src/eval.py \
+    checkpoint=checkpoints/qwen-flow-selfcorrect/last.ckpt \
+    data=math500 decode.block_size=32 decode.n_prompts=100 \
+    "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+    model.backbone.dtype=float32 \
+    per_prompt_file=results/qwen-per-prompt.jsonl
+
+uv run python bench/analyze.py --data results   # CIs, Holm, RM-ANOVA, bootstrap
+```
+
+**Memory, single device, micro-batch 1:** ~12.8 GB for the paper projection set
+and ~14.5 GB for ours, plus attention activations — comfortable on an 80 GB
+A100, worth measuring on a 40 GB card. The paper used 8 GPUs for throughput,
+not because a single device cannot hold it: global batch 128 is micro-batch 1
+with accumulation 128 on one device or 16 on eight, and the per-device
+footprint is identical.
+
+**One knob does not transfer.** `acceptance_profile` states the acceptance
+regime the position weights aim at. It is 0.8 on the 135M bench and 0.93 in the
+Qwen presets, interpolated from the paper's own numbers (TPF 6.35 at acceptance
+length 11.7 solves to a = 0.929). Getting it wrong is not free: at 0.93 the
+deep positions carry ~44% of the gradient mass, at 0.6 about 3%. Every run logs
+per-position acceptance, so derive it from the data and retrain if it moved.
+
+**Untested on this hardware.** Collective operations, the rank seed offset and
+the sparse FlexAttention path are no-ops on a single MPS device and have never
+been exercised. Run one short job before committing to a long one.
+
 ### What changed in the code
 
 Defects found and fixed, each with a measured before/after:
