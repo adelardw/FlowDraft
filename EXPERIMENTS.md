@@ -298,6 +298,22 @@ once with gradient and reused once detached. Each $x_0^{(k)}$ is an
 previous draft as **data rather than as a gradient path**: without it the
 $r$ rounds would collapse into one long chain through $\theta$.
 
+**What $\arg\max$ does here.** $q_{k-1}$ holds one distribution over the
+vocabulary per drafted position, and the $\arg\max$ is taken along the
+vocabulary axis, *independently at each position* — turning the draft from
+distributions into concrete tokens, exactly the block the drafter would propose
+at decode. Conditioning on tokens rather than on $q_{k-1}$ itself is forced by
+what acceptance means: position $j$ is accepted iff its token equals the
+verifier's own $\arg\max$ given the tokens before it, so a target conditioned on
+a soft mixture would be conditioned on something the verifier never sees. This
+is also the only term whose target depends on the drafter's state at all —
+every other teacher term aims at $p_{\mathrm{AR}}(\cdot\mid\mathrm{corpus})$,
+which the drafter's output does not enter. The price is that $\arg\max$ has zero
+derivative almost everywhere, so **no gradient reaches $\theta$ through the
+target**; together with the $\mathrm{sg}$ on $q_{k-1}$ that makes this term a
+DAgger step rather than the gradient of anything — see the assumptions table
+in §6.
+
 Note that $t = 1$ in **every** term: the drafter is always asked for the answer,
 never for an intermediate distribution. What varies is $s$ — how far along the
 input already is. Since $x_k$ mixes a fresh prior draw with $q_{k-1}$, the value
