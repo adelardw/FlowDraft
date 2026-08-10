@@ -584,8 +584,17 @@ consistency terms, and freezing the value projection.
   the term is still needed once multi-step training covers the restarts has not
   been measured — only argued, and the first decode pass does start at `s = 0`
   where no draft exists yet.
-- **Nothing has run on CUDA or on Qwen.** Collective operations, the rank seed
-  offset and the sparse FlexAttention path are no-ops on a single MPS device.
+- **Nothing has run on CUDA or on Qwen.** Collective operations and the rank
+  seed offset are no-ops on a single MPS device. The sparse FlexAttention path
+  never executed either — though its mask was checked against the dense one it
+  replaces over 4,981 (query, key) pairs across six block geometries and both
+  in-block causality settings, with zero disagreement, so the two differ in
+  speed and not in what they compute.
+- **Two of the five horizons cannot be re-measured.** The `snap-0012000` and
+  `snap-0014000` checkpoints were deleted to free disk and are gone for every
+  configuration and seed; their rows survive in `data/measurements/` but
+  reproducing them needs retraining. Every checkpoint behind a headline number
+  is intact: 12 of 12 at the 20k horizon, and 10k and 16k are complete as well.
 
 ### Assumptions the code cannot remove
 

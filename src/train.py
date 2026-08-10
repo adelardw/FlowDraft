@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import hydra
@@ -393,7 +394,19 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Код возврата берётся из ИСХОДА, а не назначается заранее. Раньше здесь
+    # стоял безусловный `os._exit(0)`, и упавший прогон рапортовал успех:
+    # Hydra перехватывает исключение сама, печатает его и выходит, после чего
+    # управление возвращалось сюда и обнулял`о` код. Последовательный прогон
+    # пресетов проверяет `$?` и принял бы поломку за нормальное завершение.
+    exit_code = 0
+    try:
+        main()
+    except SystemExit as exc:            # собственный выход Hydra при ошибке
+        exit_code = int(exc.code or 0)
+    except BaseException:                # включая KeyboardInterrupt
+        traceback.print_exc()
+        exit_code = 1
     # Обучение закончено и последний чекпоинт записан, но процесс на этом не
     # умирает: интерпретатор уходит в деструктор пула потоков pyarrow (его
     # держит потоковый датасет) и висит там неограниченно долго -- наблюдалось
@@ -406,4 +419,4 @@ if __name__ == "__main__":
     logging.shutdown()
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    os._exit(exit_code)
