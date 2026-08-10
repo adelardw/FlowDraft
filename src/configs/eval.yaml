@@ -19,7 +19,7 @@ lossless_policy: assert       # assert (canonical) | diagnose (throughput audit)
 # precision. Замерено при K=32, temperature=0: bf16 даёт 5 lossless из 6,
 # float32 — 6 из 6, и расхождения у ДВУХ разных драфтеров приходятся на одни
 # позиции, то есть это арифметика верификатора на близких значениях, а не
-# логика приёмки. Для сравнения рук безвредно (ствол один и тот же у всех), для
+# логика приёмки. Для сравнения конфигураций безвредно (ствол один и тот же у всех), для
 # утверждения «декод lossless» — нет. Мерить так:
 #   uv run python src/eval.py checkpoint=... model.backbone.dtype=float32
 variant: null               # null = infer from checkpoint, otherwise flowdraft when no checkpoint

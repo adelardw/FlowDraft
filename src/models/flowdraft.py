@@ -657,23 +657,23 @@ class FlowDraft(L.LightningModule):
 
     @staticmethod
     def _jump_schedule(jumps):
-        """Normalise a schedule to a list of ``(s, t)`` legs.
+        """Normalise a schedule to a list of ``(s, t)`` refinement passes.
 
         Three accepted forms:
 
-        * ``int n`` — n equal legs over ``linspace(0, 1)``: ``(0, 1/n),
-          (1/n, 2/n), ...``. Each leg advances the state a little.
+        * ``int n`` — n equal refinement passes over ``linspace(0, 1)``: ``(0, 1/n),
+          (1/n, 2/n), ...``. Each refinement pass advances the state a little.
         * ``list of times`` ``[0, u, 1]`` — the same thing written out.
-        * ``list of pairs`` ``[(0, 1), (s, 1)]`` — legs that need NOT chain.
+        * ``list of pairs`` ``[(0, 1), (s, 1)]`` — refinement passes that need NOT chain.
           ``(s, 1)`` after ``(0, 1)`` means "draft the whole way, then re-enter
           the family at s carrying that draft", which is a different operation
           from splitting the interval and the only one the self-correction term
           trains: it supervises ``π_{s,1}`` on a state built from the model's
           own completed draft, never on a half-advanced interpolant. A schedule
-          of chained legs asks the map questions at pairs whose inputs it was
+          of chained refinement passes asks the map questions at pairs whose inputs it was
           not shown.
 
-        Every leg must satisfy ``0 <= s < t <= 1``; the first must start at 0
+        Every refinement pass must satisfy ``0 <= s < t <= 1``; the first must start at 0
         and the last must end at 1, so the deployed map is still ``·, 1``.
         """
         # Нормализация к обычным питоновским контейнерам, и НА ЛЮБОЙ глубине.
@@ -694,23 +694,23 @@ class FlowDraft(L.LightningModule):
             ]
         if isinstance(jumps, int):
             times = torch.linspace(0, 1, jumps + 1).tolist()
-            legs = list(zip(times[:-1], times[1:]))
+            passes = list(zip(times[:-1], times[1:]))
         else:
             items = list(jumps)
             if items and isinstance(items[0], (list, tuple)):
-                legs = [(float(a), float(b)) for a, b in items]
+                passes = [(float(a), float(b)) for a, b in items]
             else:
                 times = [float(x) for x in items]
-                legs = list(zip(times[:-1], times[1:]))
-        if not legs:
-            raise ValueError("jump schedule must contain at least one leg")
-        if any(not 0.0 <= s < t <= 1.0 for s, t in legs):
-            raise ValueError(f"every leg must satisfy 0 <= s < t <= 1, got {legs}")
-        if legs[0][0] != 0.0 or legs[-1][1] != 1.0:
+                passes = list(zip(times[:-1], times[1:]))
+        if not passes:
+            raise ValueError("jump schedule must contain at least one refinement pass")
+        if any(not 0.0 <= s < t <= 1.0 for s, t in passes):
+            raise ValueError(f"every refinement pass must satisfy 0 <= s < t <= 1, got {passes}")
+        if passes[0][0] != 0.0 or passes[-1][1] != 1.0:
             raise ValueError(
-                f"a schedule must start at s=0 and finish at t=1, got {legs}"
+                f"a schedule must start at s=0 and finish at t=1, got {passes}"
             )
-        return legs
+        return passes
 
     @staticmethod
     def verify_greedy(draft_ids, last_logits, verify_logits):
@@ -919,25 +919,25 @@ class FlowDraft(L.LightningModule):
             device=x.device,
         )
         previous_t = None
-        for leg, (s_i, t_i) in enumerate(times):
+        for pass_idx, (s_i, t_i) in enumerate(times):
             if previous_t is not None and abs(s_i - previous_t) > 1e-9:
-                # This leg does not continue the previous one: it RE-ENTERS the
+                # This refinement pass does not continue the previous one: it RE-ENTERS the
                 # family at s_i. The state it should read is the one training
                 # built at that time — a fresh prior draw mixed with the draft
-                # in hand — not the transported point left by the previous leg,
+                # in hand — not the transported point left by the previous refinement pass,
                 # which sits at a different time and would put the map at a pair
                 # it was never shown. Rebuilding it here is what makes a
                 # schedule like [(0,1), (0.5,1)] the operation it reads as.
                 # Розыгрыш рестарта тоже обязан подчиняться fixed_prior. Он
-                # лежал вне этого блока, поэтому при n > 1 шум второй ноги брался
-                # из глобального RNG, который замер нигде не сеет: руки не были
+                # лежал вне этого блока, поэтому при n > 1 шум второго шага уточнения брался
+                # из глобального RNG, который замер нигде не сеет: конфигурации не были
                 # спарены по этой оси вообще, а у маскирующего драфтера её нет.
                 if bool(decode_cfg.get("fixed_prior", False)):
                     with torch.random.fork_rng(
                         devices=[device] if device.type != "cpu" else [],
                         device_type=device.type,
                     ):
-                        torch.manual_seed(int(self.cfg.get("seed", 0)) * 7919 + leg)
+                        torch.manual_seed(int(self.cfg.get("seed", 0)) * 7919 + pass_idx)
                         fresh = self.sample_prior(x)
                 else:
                     fresh = self.sample_prior(x)
@@ -945,7 +945,7 @@ class FlowDraft(L.LightningModule):
                 if anchor is not None:
                     x = torch.cat([anchor, x[:, 1:]], dim=1)
             previous_t = t_i
-            # One scalar time per leg. A per-position clock existed here for the
+            # One scalar time per refinement pass. A per-position clock existed here for the
             # carried-tail state; that state is gone (bucket/README.md), and with
             # it the only caller. Announcing per-position times when the block is
             # NOT mixed is the conditioning that cost 1.16 TPF when it slipped in.

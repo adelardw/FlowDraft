@@ -1,7 +1,7 @@
 # @package _global_
 # Orthrus verbatim (arXiv 2605.12825, sec. 3): the diffusion attention trains
 # W_Q, W_K, W_V and nothing else — no output projection, no per-head norms, no
-# position weights, no chain gate. The reference point every other arm is
+# position weights, no chain gate. The reference point every other configuration is
 # measured against, and the only place our numbers meet the paper's directly.
 #   ./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper
 defaults:

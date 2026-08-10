@@ -257,7 +257,7 @@ pure prior draw to the answer.
 ```
 
 Read the subscripts: input at time $s = 0$ (pure noise, no information about the
-answer), output aimed at time $t = 1$ (the answer itself). This is the first leg
+answer), output aimed at time $t = 1$ (the answer itself). This is the first refinement pass
 of every decode cycle. The rest of the family — every $\pi^\theta_{s,t}$ with $s > 0$ —
 receives no gradient from this term at all.
 
@@ -496,7 +496,7 @@ consistency terms, and freezing the value projection.
 - **`verify_kl` was never ablated.** At one refinement pass it does all the work
   (the multi-step term adds +0.018); at three or four the roles invert. Whether
   the term is still needed once multi-step training covers the restarts has not
-  been measured — only argued, and the first decode leg does start at `s = 0`
+  been measured — only argued, and the first decode pass does start at `s = 0`
   where no draft exists yet.
 - **Nothing has run on CUDA or on Qwen.** Collective operations, the rank seed
   offset and the sparse FlexAttention path are no-ops on a single MPS device.

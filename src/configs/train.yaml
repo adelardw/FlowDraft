@@ -27,7 +27,7 @@ train:
   respect_document_boundaries: true   # constrains ANCHOR SELECTION only. The
                                 # block-wise attention still reads the whole AR
                                 # prefix through earlier documents, exactly as
-                                # the masked baseline does -- both arms share the
+                                # the masked baseline does -- both configurations share the
                                 # convention, so it is not a comparison defect
 
   lr: 1e-4
@@ -57,17 +57,17 @@ train:
                                 # coarser floor would break gamma = 1 at t = 1:
                                 # at 1e-2 that identity already fails for s > 0.99
   td_min_step: 0.01             # minimum finite-difference probe for the drift term
-  min_jump_gap: 0.0             # floor on t - s. Affects exactly ONE arm --
+  min_jump_gap: 0.0             # floor on t - s. Affects exactly ONE configuration --
                                 # the only one with endpoint_weight or lambda
                                 # non-zero; elsewhere the (s,t) forward is not
                                 # computed at all (measured: loss identical at
-                                # gap 0 / 0.05 / 0.2 for nine of ten arms,
+                                # gap 0 / 0.05 / 0.2 for nine of ten configurations,
                                 # 11.564 / 11.530 / 11.286 for the tenth).
                                 # Kept at 0: the gradient at s ~ t is NOT zero,
                                 # it is O(t - s), so those pairs are weak rather
                                 # than useless, and there is no evidence that
                                 # excluding them helps. Raising it changes what
-                                # that arm means and needs its own control
+                                # that configuration means and needs its own control
 
   # --- objective ----------------------------------------------------------
   #   loss = verify_kl_weight   * KL(p_AR || pi_{0,1}(x0))
@@ -76,9 +76,9 @@ train:
   #        + lambda * (4*EC + 2*TD)
   verify_kl_weight: 0.0
   selfcorrect_kl_weight: 0.0    # the multi-step term: walks the jump schedule, each
-                                # leg supervised by the AR sweep of the leg before it
-  selfcorrect_rounds: 2         # legs after the first; costs r DF + (r-1) AR forwards
-  selfcorrect_s_min: 0.0        # entry times stratified in (s_min, 1). The leg reads
+                                # refinement pass supervised by the AR sweep of the refinement pass before it
+  selfcorrect_rounds: 2         # refinement passes after the first; costs r DF + (r-1) AR forwards
+  selfcorrect_s_min: 0.0        # entry times stratified in (s_min, 1). The refinement pass reads
                                 # (1-s)x0' + s q, so s near 1 hands it the draft itself
                                 # -- the Jacobi operator -- and s near 0 buries the draft
                                 # under prior noise at a frozen embedding

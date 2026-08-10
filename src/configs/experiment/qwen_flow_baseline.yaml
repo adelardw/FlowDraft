@@ -3,7 +3,7 @@
 # multi-step claim testable: the target of this term does not depend on the
 # drafter's state, so nothing here teaches the map to read its own draft.
 #
-# On the 135M bench this arm LOSES 0.563 accepted tokens going from one
+# On the 135M bench this configuration LOSES 0.563 accepted tokens going from one
 # refinement pass to four, and does so unpredictably: three seeds gave
 # 1.227 / 0.933 / 0.778 at four passes.
 #   ./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_baseline

@@ -105,7 +105,7 @@ class FlowDraftBlockWise(FlowDraft):
             # Ширина блока сообщается адаптеру и на одноякорном пути. Без неё
             # он не знает, какие позиции — якоря, и гейт входа гасил бы якорь
             # вместе с приором. Раньше здесь шёл литеральный пустой df_kwargs,
-            # поэтому исключение якоря не действовало НИ В ОДНОЙ руке стенда:
+            # поэтому исключение якоря не действовало НИ В ОДНОЙ конфигурации стенда:
             # у всех anchors_per_sequence = 1.
             df_kwargs = {**df_kwargs,
                          "diffusion_block_size": x_in.size(1)}
@@ -328,17 +328,17 @@ class FlowDraftBlockWise(FlowDraft):
         """Entry times ``s_1 < ... < s_r``, one per equal bin of ``(s_min, 1)``.
 
         The schedule a multi-jump decode executes is a sequence of RESTARTS,
-        ``[(0,1), (s_1,1), ..., (s_{r-1},1)]``: every leg asks the terminal
+        ``[(0,1), (s_1,1), ..., (s_{r-1},1)]``: every refinement pass asks the terminal
         question from wherever the previous one left the draft. Stratifying
         rather than using a fixed grid covers the family instead of sampling the
         same r-1 points every step.
 
-        ``train.selfcorrect_s_min`` decides how much of the draft the leg
+        ``train.selfcorrect_s_min`` decides how much of the draft the refinement pass
         actually receives, and it is the load-bearing knob. The entry state is
         ``(1-s) x_0' + s q``, so at ``s = 0.25`` three quarters of the input is
         prior noise and the draft arrives at a quarter amplitude -- through a
         FROZEN embedding, with no input projection to rescale it. Pushed towards
-        1 the input becomes the draft itself, and the leg is asked the
+        1 the input becomes the draft itself, and the refinement pass is asked the
         well-posed question "read these tokens, take one AR step at every
         position in parallel", which is the Jacobi operator the prefix-fixing
         induction is stated for. Transport is unaffected either way: at ``t = 1``
@@ -357,7 +357,7 @@ class FlowDraftBlockWise(FlowDraft):
     def _selfcorrect_kl(self, verify_logits, onpolicy_logits, accepted, known, anchor_ids,
                         block_mask, ctx_mask, cache, anchor, df_kwargs):
         """The multi-step term: the drafter walks its OWN jump schedule, and
-        every leg is supervised by the verifier's answer to the leg before it.
+        every refinement pass is supervised by the verifier's answer to the refinement pass before it.
 
         A schedule of ``n`` jumps executes a composition that no pairwise term
         evaluates end to end. Training one extra pair -- say ``(0.5, 1)`` -- buys
@@ -387,9 +387,9 @@ class FlowDraftBlockWise(FlowDraft):
         reward the derivative a second jump lives on.
 
         States are detached between rounds. Backpropagating through the
-        composition would let an early leg optimise a later leg's input, a
+        composition would let an early refinement pass optimise a later refinement pass's input, a
         self-referential objective on a map whose failure mode is collapse; the
-        induction above needs each leg to sweep correctly, not the chain to be
+        induction above needs each refinement pass to sweep correctly, not the chain to be
         differentiated.
 
         The verdict weights, it does not mask, and the weighted set is ``known``
@@ -438,7 +438,7 @@ class FlowDraftBlockWise(FlowDraft):
             # `position_weight`, а два порядка отличаются постоянным множителем
             # (замер: лосс 1.0273889 против 1.0273888, расхождение 1.2e-7 —
             # шум float32). Выбран тот, у которого средний вес РОВНО 1.000 при
-            # любой приёмке: тогда логируемое число сравнимо между руками и по
+            # любой приёмке: тогда логируемое число сравнимо между конфигурациями и по
             # ходу обучения, а у обратного порядка оно плывёт (1.057).
             # The prefix-conjunction weight is a property of the metric, not of
             # any one target, so it multiplies here exactly as it does in
@@ -712,7 +712,7 @@ class FlowDraftBlockWise(FlowDraft):
         # в EC, а pi -- в точку приземления x_jump. При endpoint_weight = 0 и
         # lambda = 0 его выход в лосс не входит вовсе, и градиент по нему ровно
         # нулевой (проверено retain_grad). Это был мёртвый форвард: 1 из 3 у
-        # руки только с verify_kl и 1 из 7 у рук с самокоррекцией, то есть
+        # конфигурации только с verify_kl и 1 из 7 у конфигураций с самокоррекцией, то есть
         # 33% и 14% всей работы шага. Заодно он делал число форвардов у ветвей
         # разным (7 против 6) без всякой причины.
         draft_logits = None

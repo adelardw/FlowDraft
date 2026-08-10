@@ -120,7 +120,7 @@ gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 Measure a checkpoint. `model.backbone.dtype=float32` is required for the
 losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
 agreement on near-ties. `decode.jumps` takes restart pairs; an integer expands
-to legs at `t<1` that nothing in the objective trains when the consistency
+to passes at `t<1` that nothing in the objective trains when the consistency
 terms are off.
 
 ```bash
@@ -159,7 +159,7 @@ Defects found and fixed, each with a measured before/after:
 | | before | after |
 |---|---|---|
 | commit widths in multi-step training | `[16, 31]` — the second pass supervised a block with no masks left | `[10, 21]`, matching decode exactly |
-| validation schedule given as an integer | two legs of three ran at `t<1`, where no term provides gradient | restart pairs matching what is trained |
+| validation schedule given as an integer | two passes of three ran at `t<1`, where no term provides gradient | restart pairs matching what is trained |
 | position weights across the two branches | different dtype, 2.828 vs 2.824 | bitwise identical |
 | mixed-benchmark validation | crashed on nested Hydra initialisation | works |
 | schedule parsing for pair form | crashed on `ListConfig` | all five input forms |
@@ -248,10 +248,10 @@ Qwen3-1.7B — the four experiments that carry the claims, at the paper's
 hyperparameters:
 
 ```bash
-for arm in qwen_masked_paper qwen_masked_multistep \
+for exp in qwen_masked_paper qwen_masked_multistep \
            qwen_flow_baseline qwen_flow_multistep; do
-  ./hf-auth.sh uv run python src/train.py +experiment=$arm \
-      output_dir=checkpoints/$arm \
+  ./hf-auth.sh uv run python src/train.py +experiment=$exp \
+      output_dir=checkpoints/$exp \
       model.adapter.flex_attention_backend=flash
 done
 ```
@@ -261,17 +261,17 @@ time**: on a single device parallel runs contend for the same memory and the
 timings stop being comparable.
 
 ```bash
-ARMS="smollm_masked_paper smollm_masked_baseline smollm_masked_selfcorrect \
+EXPERIMENTS="smollm_masked_paper smollm_masked_baseline smollm_masked_selfcorrect \
       smollm_masked_selfcorrect_prefixweight smollm_flow_verify \
       smollm_flow_selfcorrect smollm_flow_selfcorrect_prefixweight"
 
 for seed in 42 43 44; do
   out=checkpoints; [ $seed = 42 ] || out=checkpoints/s$seed
-  for arm in $ARMS; do
+  for exp in $EXPERIMENTS; do
     resume=""
-    [ -f "$out/$arm/last.ckpt" ] && resume="resume_from_checkpoint=$out/$arm/last.ckpt"
-    ./hf-auth.sh uv run python src/train.py +experiment=$arm \
-        seed=$seed output_dir=$out/$arm $resume
+    [ -f "$out/$exp/last.ckpt" ] && resume="resume_from_checkpoint=$out/$exp/last.ckpt"
+    ./hf-auth.sh uv run python src/train.py +experiment=$exp \
+        seed=$seed output_dir=$out/$exp $resume
   done
 done
 ```
@@ -314,10 +314,10 @@ done
 ```
 
 AIME 24 and 25 hold 30 tasks each — that is the whole set, not a subsample.
-`decode.jumps` takes restart pairs; an integer expands to legs at `t < 1`, which
+`decode.jumps` takes restart pairs; an integer expands to passes at `t < 1`, which
 nothing in the objective trains once the consistency terms are off. Sweep the
 schedule by repeating the loop with `decode.jumps=1`, `[[0,1],[0.5,1]]` and the
-four-leg form.
+four-pass form.
 
 ### 5. Metrics and statistics
 
@@ -423,7 +423,7 @@ Unit of observation is the pair (prompt, seed): 24 prompts x 5 seeds =
 **120 cells** per point, `decode.fixed_prior=true`. Both noise axes are real —
 the same checkpoint on the same prompts drifts by up to 0.16 tokens across prior
 draws — so every contrast is **paired on both**, never a difference of means.
-Each arm is measured at **three training horizons**, because a single horizon
+Each configuration is measured at **three training horizons**, because a single horizon
 cannot tell a converging gap from a noisy one, and because between-snapshot
 spread on an unchanged objective reaches 0.5 tokens.
 
@@ -438,7 +438,7 @@ L = w_verify · KL( p_AR ‖ pi_{0,1}(x0) ) · u_j                              
 x0 ~ prior,  x_s = (1-s) x0 + s x1,  gamma = (t-s)/(1-s),  X_{s,t}(x) = x + gamma (pi - x)
 
 q_0  = pi_{0,1}(x0)                     the jump the decode loop executes
-x_k  = (1-s_k) x0' + s_k q_{k-1}         restart carrying the previous leg's draft
+x_k  = (1-s_k) x0' + s_k q_{k-1}         restart carrying the previous pass's draft
 q_k  = pi_{s_k,1}(x_k),  detached between rounds,  s_1 < ... < s_r in (s_min, 1)
 
 u_j = chain-validity gate x prefix-survival weights dE/da_j
@@ -465,7 +465,7 @@ express — some positions committed, the rest re-masked
 confidence-ordered-unmasking schedule. Running the two against each other
 separates *training for the procedure* from *the state being continuous*.
 
-### The five arms
+### The five configurations
 
 Named by what their objective contains, not by their script key. All five share
 the data, the schedule, the backbone and the budget; only the terms differ.
@@ -480,13 +480,13 @@ the data, the schedule, the backbone and the budget; only the terms differ.
 
 ### Results
 
-Two independent training seeds, six arms, 6000 steps each, snapshots along the
+Two independent training seeds, six configurations, 6000 steps each, snapshots along the
 way. Unit of observation is the **prompt** (24 of them): the masked drafter's
 decode is deterministic — the prior does not enter it — so its five decode seeds
 are bit-identical copies, and treating 120 cells as independent understated the
 standard error by sqrt(5).
 
-| arm | A@1 (s42/s43) | A@2 | A@4 | growth A@4 − A@1 |
+| configuration | A@1 (s42/s43) | A@2 | A@4 | growth A@4 − A@1 |
 |---|---|---|---|---|
 | `masked` | 1.391 / 1.454 | 1.803 / 1.707 | 2.595 / 3.140 | +1.204 (t=+4.15) / +1.686 (t=+5.24) |
 | `masked + self-corr` | 1.301 / 1.358 | 1.425 / 1.577 | 2.728 / 2.517 | +1.427 (t=+4.34) / +1.159 (t=+5.02) |
@@ -495,7 +495,7 @@ standard error by sqrt(5).
 | `flow + self-corr + CFM` | 1.163 / 1.401 | 1.748 / 1.782 | 2.006 / 2.085 | +0.843 (t=+3.75) / +0.684 (t=+3.50) |
 | `flow + self-corr, old weighting` | 1.383 / 1.436 | 1.708 / 1.698 | 2.055 / 2.059 | +0.672 (t=+3.35) / +0.622 (t=+3.92) |
 
-| arm | TPF@1 | TPF@2 | TPF@4 |
+| configuration | TPF@1 | TPF@2 | TPF@4 |
 |---|---|---|---|
 | `masked` | 1.211 | 0.918 | 0.773 |
 | `masked + self-corr` | 1.165 | 0.834 | 0.724 |
@@ -511,8 +511,8 @@ parity between branches, and a second seed.**
 
 Acceptance grows with the number of jumps only when the drafter is trained
 against the verifier's verdict on its own draft. Without that term the flow-map
-arm *degrades* with jumps — `+1.255` and `+1.093` at `n=4`
-(t = +5.09, +4.11) separate the two, and the arm without
+configuration *degrades* with jumps — `+1.255` and `+1.093` at `n=4`
+(t = +5.09, +4.11) separate the two, and the configuration without
 it moves the wrong way on both seeds. At `n=2` the same contrast is
 `+0.678` / `+0.554` (t = +4.27, +4.03).
 
@@ -535,7 +535,7 @@ corrected one clean, the tail carrying its rejected guess), and as the
 - **The CFM structure.** `-0.212` / `-0.050` at `n=4`. Effect
   not detected; the earlier `-0.63` at t = -6.5 did not reproduce once the
   weight confound and the LR re-warmup were gone.
-- **Multi-step as throughput.** TPF falls with `n` for every arm. Only `n=1`
+- **Multi-step as throughput.** TPF falls with `n` for every configuration. Only `n=1`
   beats plain AR. Multi-step buys acceptance, never speed.
 
 And the masked baseline grows with jumps **without being trained for it at
@@ -558,9 +558,9 @@ Four were real and all four inflated the earlier conclusions:
 
 | defect | effect |
 |---|---|
-| SE over 120 cells when the masked arms have 24 independent units | three of four "established" findings |
-| position weights on the flow arms only | the claimed parity was partly a weight contrast |
-| `fixed_prior` not covering the restart draw | arms unpaired on second-leg noise at `n>1` |
+| SE over 120 cells when the masked configurations have 24 independent units | three of four "established" findings |
+| position weights on the flow configurations only | the claimed parity was partly a weight contrast |
+| `fixed_prior` not covering the restart draw | configurations unpaired on second-pass noise at `n>1` |
 | cosine rebuilt on resume, LR back to ~79% of peak | the 4000-step point was systematically handicapped |
 
 Two more were bugs in the self-correction term itself: the masked branch's
@@ -569,14 +569,14 @@ committed draft token straight out of slot `j` — a copy shortcut on exactly th
 full-weight positions — and training committed `K/2` positions where decoding
 commits `round(K(k+1)/n)`.
 
-An arm trained with the *old* weight profile (`flow + self-corr, old
+A configuration trained with the *old* weight profile (`flow + self-corr, old
 weighting`) is kept as a control on the fix itself. It is worse, but only
 slightly and only on one seed: the copy-shortcut argument was right in sign and
 small in size.
 
 ### Known limits### Known limits (what the next stage must fix)
 
-- **One training seed per arm.** The intervals cover decode noise, not
+- **One training seed per configuration.** The intervals cover decode noise, not
   training-run variance. Between-snapshot spread on an unchanged objective
   reaches 0.5 tokens — larger than every contrast in finding 3. Multiple seeds
   are what would move findings 2-3 from "trend plus t" to settled.
@@ -599,7 +599,7 @@ small in size.
 
 ### Reproducing
 
-Every arm is `src/train.py` with a different set of loss weights; nothing else
+Every configuration is `src/train.py` with a different set of loss weights; nothing else
 differs. Common to all: `model=smollm2_135m train.block_size=8
 train.anchors_per_sequence=1 data.batch_size=2 data.max_length=256
 data.shuffle_buffer=64 trainer.precision=32`.
@@ -626,7 +626,7 @@ Longer horizons continue from a checkpoint with
 train.checkpoint_every_n_steps=2000 "train.checkpoint_name='snap-{step:07d}'"`
 (the quotes matter — Hydra's override grammar rejects a bare `{`).
 
-Acceptance is then read with `src/eval.py` per arm and schedule
+Acceptance is then read with `src/eval.py` per configuration and schedule
 (`decode.jumps=1`, `'decode.jumps=[[0,1],[0.5,1]]'`, `decode.fixed_prior=true`),
 one JSON row per run into `results/eval.jsonl`.
 
@@ -875,7 +875,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.time_sampling` | `paper` | how (s, t) pairs are drawn: `paper` \| `triangle` \| `sequential` |
 | `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
 | `train.endpoint_weight` | 1.0 | weight of categorical VFM endpoint CE; 0 = endpoint-off ablation |
-| `train.selfcorrect_kl_weight` | 0.0 | the multi-step term: the drafter's own jump schedule, each leg supervised by the frozen AR sweep over the leg before it |
+| `train.selfcorrect_kl_weight` | 0.0 | the multi-step term: the drafter's own jump schedule, each pass supervised by the frozen AR sweep over the pass before it |
 | `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
 | `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
 | `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |

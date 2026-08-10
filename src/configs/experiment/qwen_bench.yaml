@@ -1,6 +1,6 @@
 # @package _global_
 # Shared setup for the Qwen3-1.7B campaign. Not an experiment by itself: it
-# holds everything the arms must agree on for their contrast to be readable.
+# holds everything the configurations must agree on for their contrast to be readable.
 #
 # The training recipe follows Orthrus Table 4 verbatim — sequence length 2048,
 # 256 anchor blocks, block size 32, two epochs over 600k examples, peak LR
@@ -54,7 +54,7 @@ train:
   early_stop_patience: 5
 
   # Validation decodes the schedule the run is aiming at, in RESTART-PAIR form.
-  # An integer would expand to legs with t<1, which no term in the objective
+  # An integer would expand to refinement passes with t<1, which no term in the objective
   # gives gradient to when the consistency terms are off.
   val_decode_prompts: 24
   val_decode_datasets: [gsm8k, math500, humaneval, mbpp, aime24, aime25]

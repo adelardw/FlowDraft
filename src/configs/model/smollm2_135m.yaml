@@ -25,5 +25,5 @@ adapter:
   # Llama has no per-head Q/K norms; Orthrus still keeps an independent
   # diffusion output projection alongside Q/K/V.
   # Статья обучает ТОЛЬКО Q, K, V (arXiv 2605.12825, разд. 3). `o_proj` здесь —
-  # наше добавление: +37.5% к голове. Проверяется рукой smollm_flow_selfcorrect_qkv.
+  # наше добавление: +37.5% к голове. Проверяется конфигурацией smollm_flow_selfcorrect_qkv.
   w_names: [q_proj, k_proj, v_proj, o_proj]
