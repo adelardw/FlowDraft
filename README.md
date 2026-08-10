@@ -19,8 +19,9 @@
 
 ## Table of contents
 
+- [Multi-step drafting study (August 2026)](#multi-step-drafting-study-august-2026)
 - [Overview](#overview)
-- [Quickstart](#quickstart)
+- [Quickstart](#quickstart) — setup, sparse attention, training, validation, statistics, curves
 - [Experiments (task stages)](#experiments-task-stages)
 - [SmolLM2-135M bench: what the loss terms actually buy](#smollm2-135m-bench-what-the-loss-terms-actually-buy)
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
@@ -85,6 +86,11 @@ it: −0.148 → +0.612 → +0.675 at one, three and four passes.
 ![training curves across three seeds](results/figures/seeds.png)
 ![per-benchmark breakdown](results/figures/per_benchmark.png)
 ![measured horizon](results/figures/horizon.png)
+
+Training curves for every logged loss term and every logged metric, across all
+three seeds, are in [step 6 of the Quickstart](#6-training-curves-and-figures):
+colour is the experiment, line style is the seed, so how tightly the three
+styles of one colour overlap *is* the between-seed spread.
 
 Untrained multi-step refinement is not merely worse but *unpredictably* worse:
 at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
@@ -185,80 +191,175 @@ Crucially, the AR model is what does the verifying, so it is kept **frozen throu
 
 ## Quickstart
 
+The full campaign, in the order it has to run. Every step is resumable on its
+own: training restarts from `last.ckpt`, and measurement skips any combination
+already present in its output file, so an interrupted sweep is re-launched with
+the same command.
+
+### 1. Setup (once)
+
 ```bash
-# 1. Setup (once)
 git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
 uv sync
-echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
-./hf-auth.sh                         # verify: prints your HF username
-
-# 2. Check inference works — the UNTRAINED drafter is already lossless (just slow)
-./hf-auth.sh uv run python main.py -p "Once upon a time"
-#    -> generation + [lossless vs greedy AR: PASS]
-
-# 3. Train FlowDraft (full-sequence recipe; GPU recommended)
-./hf-auth.sh uv run python src/train.py \
-    trainer.max_steps=10000 data.batch_size=8
-#    watch: loss/endpoint ↓, loss/ec ↓, loss/td sane, val/teacher_agreement ↑
-#    checkpoints (FP32 DF head + Adam moments; no frozen backbone) land in checkpoints/
-#    our ADDITION beyond the task — training in the exact inference geometry:
-#    append train.variant=flowdraft_block_wise
-#    epochs on top of streaming (nothing is downloaded ahead): a fixed pool of
-#    N samples repeated M times, each repetition in a new order —
-#    ./hf-auth.sh uv run python src/train.py \
-#        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
-
-For multi-GPU training, let Lightning run DDP and specify the GPU count:
-
-```bash
-./hf-auth.sh uv run python src/train.py \
-    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
-    data.batch_size=8 trainer.max_steps=10000
+echo "HF_TOKEN=hf_..." > .env          # gated backbone access
+./hf-auth.sh                           # verify: prints your HF username
 ```
 
-Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. Streaming train and validation datasets are split into disjoint, equal rank shards (and then partitioned among DataLoader workers). The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
+Check inference before training anything — the **untrained** drafter is already
+lossless, just slow:
 
-## Sparse-attention setup
+```bash
+./hf-auth.sh uv run python main.py -p "Once upon a time"
+#   -> generation + [lossless vs greedy AR: PASS]
+```
 
-The paper-style `+experiment=orthrus` uses PyTorch **FlexAttention** for its
-256 isolated masked blocks. The stable default is FlexAttention's Triton
-backend on every CUDA architecture. It has the same sparse-mask semantics as
-the newer FlashAttention-4 path.
+### 2. Sparse attention: FlexAttention and FlashAttention-4
 
-FA4 can be tested as an explicit H100/H200/Blackwell performance opt-in with
-`model.adapter.flex_attention_backend=flash`. Install it manually on the CUDA
-node (it is deliberately not a project dependency, so CPU/macOS development
-environments remain lightweight):
+The masked baseline drafts up to 256 isolated blocks per step, so its attention
+mask is sparse by construction. Three backends implement the *same* mask —
+causal into the cached prefix, bidirectional within a block, nothing across
+blocks — and differ only in speed:
+
+| backend | override | where it runs |
+|---|---|---|
+| FlexAttention + Triton | `model.adapter.flex_attention_backend=triton` | every CUDA architecture; the stable default |
+| FlashAttention-4 | `model.adapter.flex_attention_backend=flash` | Hopper / Blackwell only (compute capability >= 9) |
+| dense additive mask | chosen automatically | CPU, Apple Silicon, CUDA builds without FlexAttention |
+
+FA4 ships as a prerelease and is deliberately **not** a project dependency, so
+CPU and macOS environments stay lightweight. On the CUDA node:
 
 ```bash
 uv pip install ninja packaging
-# FA4 is currently distributed as a prerelease.
 uv pip install --prerelease=allow --no-build-isolation "flash-attn-4[cu13]"
-```
 
-Verify the required training API before launching a run:
-
-```bash
+# verify BOTH before committing to a long run
 uv run python -c "from torch.nn.attention.flex_attention import flex_attention; print('FlexAttention: OK')"
 uv run python -c "import flash_attn; print('flash-attn: OK')"
 ```
 
-`flash-attn-4` accelerates the Hopper/Blackwell backend; FlexAttention is the
-required component for sparse baseline training. CPU, Apple Silicon, and
-CUDA builds without FlexAttention use neither of these paths.
+Then append `model.adapter.flex_attention_backend=flash` to the training
+commands below. Asking for `flash` on a pre-Hopper card is refused with a
+message rather than silently downgraded.
 
-# 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
-./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
+### 3. Train every experiment
 
-# 5. Generate with the trained drafter (greedy; add --temperature for sampling)
-./hf-auth.sh uv run python main.py -p "..." \
-    --checkpoint checkpoints/last.ckpt --jumps 2
+Qwen3-1.7B — the four experiments that carry the claims, at the paper's
+hyperparameters:
+
+```bash
+for arm in qwen_masked_paper qwen_masked_multistep \
+           qwen_flow_baseline qwen_flow_multistep; do
+  ./hf-auth.sh uv run python src/train.py +experiment=$arm \
+      output_dir=checkpoints/$arm \
+      model.adapter.flex_attention_backend=flash
+done
 ```
+
+SmolLM2-135M — the full bench, replicated across seeds. Runs go **one at a
+time**: on a single device parallel runs contend for the same memory and the
+timings stop being comparable.
+
+```bash
+ARMS="smollm_masked_paper smollm_masked_baseline smollm_masked_selfcorrect \
+      smollm_masked_selfcorrect_prefixweight smollm_flow_verify \
+      smollm_flow_selfcorrect smollm_flow_selfcorrect_prefixweight"
+
+for seed in 42 43 44; do
+  out=checkpoints; [ $seed = 42 ] || out=checkpoints/s$seed
+  for arm in $ARMS; do
+    resume=""
+    [ -f "$out/$arm/last.ckpt" ] && resume="resume_from_checkpoint=$out/$arm/last.ckpt"
+    ./hf-auth.sh uv run python src/train.py +experiment=$arm \
+        seed=$seed output_dir=$out/$arm $resume
+  done
+done
+```
+
+Watch `val/acceptance_decode` rise and `val/loss/verify_kl` fall. Checkpoints
+hold the FP32 drafter head and its Adam moments; the frozen backbone is not
+stored. For multi-GPU, hand the run to Lightning's DDP:
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep \
+    trainer.accelerator=gpu trainer.devices=8 trainer.strategy=ddp
+```
+
+Training always disables `model.backbone.device_map` — Hugging Face device maps
+are inference sharding, while DDP needs one complete replica per GPU. Streaming
+train and validation datasets are split into disjoint, equal rank shards, then
+partitioned among DataLoader workers. `data.batch_size` is per GPU; reach a
+larger global batch with `trainer.accumulate_grad_batches`.
+
+### 4. Validate on every dataset
+
+Six benchmarks, 460 tasks. `model.backbone.dtype=float32` is **required** for
+the losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
+agreement on near-ties. `per_prompt_file` is what makes the statistics possible:
+without it only means are written, and no interval, contrast or ANOVA can be
+built from means alone.
+
+```bash
+CKPT=checkpoints/qwen_flow_multistep/last.ckpt
+
+for ds in gsm8k:100 math500:100 humaneval:100 mbpp:100 aime24:30 aime25:30; do
+  ./hf-auth.sh uv run python src/eval.py \
+      checkpoint=$CKPT data=${ds%%:*} decode.n_prompts=${ds##*:} \
+      decode.block_size=32 decode.max_new_tokens=64 \
+      "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+      model.backbone.dtype=float32 \
+      results_file=results/aggregate.jsonl \
+      per_prompt_file=results/pp-qwen.jsonl
+done
+```
+
+AIME 24 and 25 hold 30 tasks each — that is the whole set, not a subsample.
+`decode.jumps` takes restart pairs; an integer expands to legs at `t < 1`, which
+nothing in the objective trains once the consistency terms are off. Sweep the
+schedule by repeating the loop with `decode.jumps=1`, `[[0,1],[0.5,1]]` and the
+four-leg form.
+
+### 5. Metrics and statistics
+
+```bash
+uv run python bench/analyze.py --data results
+```
+
+Prints, in order: acceptance per experiment with Student intervals; every paired
+contrast with Holm correction; repeated-measures ANOVA with the
+Greenhouse-Geisser correction; the per-dataset breakdown; stratified bootstrap,
+sign test and Wilcoxon across datasets; and rank stability across prompt folds
+by Kendall tau. The unit of observation is the **prompt**, and the header states
+plainly how many training seeds stand behind the numbers — resampling prompts
+answers "will this hold on other tasks", never "will this hold on another
+training run".
+
+Useful flags: `--step` (which snapshot), `--sched` (`n1`/`n2`/`n3`/`n4`),
+`--metric acceptance|tpf`, `--folds`.
+
+### 6. Training curves and figures
+
+```bash
+uv run python bench/curves.py     # every loss term and every metric, per seed
+uv run python bench/figures.py    # acceptance vs passes, horizon, contrasts
+```
+
+`bench/curves.py` reads the TensorBoard scalars each run writes under
+`checkpoints/**/lightning_logs/` and produces two figures in which colour is the
+experiment and line style is the training seed, so "do the experiments differ"
+and "do the seeds agree" stay separate questions. Terms carrying weight zero are
+named in the caption instead of being drawn as a flat line on an invented axis.
+
+![loss curves per experiment and seed](results/figures/curves_loss.png)
+![validation metrics per experiment and seed](results/figures/curves_metrics.png)
+
+Live monitoring during a run: `uv run tensorboard --logdir checkpoints`.
 
 Laptop debugging: `src/train.py` and `src/eval.py` also run on a small ungated
 backbone — append the hydra overrides
 `model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
 model.backbone.device_map=null`.
+
 
 ## Experiments (task stages)
 
