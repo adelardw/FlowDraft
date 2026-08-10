@@ -511,10 +511,27 @@ seeds.
 | Orthrus, reproduced | 1.219 | 0.628 | 0.507 |
 | continuous, no multi-step | 1.245 | 0.554 | 0.394 |
 
-**Multi-step buys quality, not speed.** Only single-pass decoding clears 1.0.
-The continuous state loses the least as passes grow (1.257 → 0.675 against
-1.219 → 0.507), but it does not beat plain decoding either — exactly as the
-prefix-fixing lemma predicts.
+**Separate the training term from the decode schedule — they pull opposite
+ways.** Multi-step *training* raises throughput; extra *decode* passes lower it.
+Read down the first column, where every method is fastest: multi-step training
+is worth **+0.107 tokens per forward over Orthrus (+8.8%)** on the masked
+drafter and **+0.038 (+3.1%)** on the continuous one, both significant with the
+seed as the unit (`t = 129.5` and `t = 6.9`, `n = 3`). The best throughput in
+the study is masked + multi-step at a single pass, 1.327 against 1.219.
+
+Read across a row instead and the schedule takes it back: a cycle of `n` passes
+spends `n+1` forwards while acceptance grows slower than `n`, so nothing beyond
+one pass clears 1.0. The continuous state loses the least (1.257 → 0.675 against
+1.219 → 0.507), which is precisely why its acceptance advantage — the largest
+effect in this study — does not become speed. This is what the prefix-fixing
+lemma predicts: `TPF = 1` is a floor, not a mechanism.
+
+**Wall-clock does not follow, and this bench cannot settle it.** At one pass the
+same runs give 1.211× plain decoding for masked + multi-step against 1.209× for
+Orthrus — the per-forward gain vanishes in seconds, because a 135M forward on
+MPS is dominated by fixed overhead. Tokens per forward is the
+hardware-independent quantity; converting it to wall-clock needs the Qwen3-1.7B
+run, which has not been done.
 
 ### A reversal at one pass
 

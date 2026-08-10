@@ -67,12 +67,29 @@ continuous state trained on the procedure, by +0.070 with masking, and **falls
 by 0.563** for the same continuous architecture left untrained on it — on all
 three seeds.
 
-**Multi-step buys quality, not speed.** Throughput falls monotonically and
-nothing multi-step exceeds 1.0 tokens per forward, i.e. none beats plain
-autoregressive decoding: a cycle costs `n+1` forwards while acceptance grows
-slower than `n`. This is what the prefix-fixing lemma predicts — it yields
-`TPF = 1` as a floor, not as a speedup mechanism. Only single-pass decoding
-clears 1.0 (1.326 / 1.257 / 1.219).
+**Two different things wear the same name, and they pull opposite ways.**
+Multi-step *training* — the loss term — **raises** throughput. Multi-step
+*decoding* — spending extra passes at inference — lowers it.
+
+At one pass, which is where every method is fastest, multi-step training is
+worth **+0.107 tokens per forward over Orthrus (+8.8%, t = 129 with the seed as
+the unit)** for the masked drafter, and +0.038 (+3.1%) for the continuous one.
+The best throughput measured in the study is masked + multi-step at a single
+pass: **1.327 against Orthrus's 1.219**.
+
+Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
+while acceptance grows slower than `n`, so every schedule beyond one pass drops
+below plain decoding. That is what the prefix-fixing lemma predicts — `TPF = 1`
+is a floor, not a speedup mechanism. The continuous state loses the least
+(1.257 → 0.675 against Orthrus's 1.219 → 0.507), which is exactly why its large
+acceptance advantage does not convert into speed.
+
+**Wall-clock is a separate question and is not settled here.** On this bench —
+MPS, a 135M backbone — a single pass runs at 1.211× plain decoding for masked +
+multi-step against 1.209× for Orthrus: the throughput gain does not show up in
+seconds, because at 135M a forward is dominated by fixed overhead rather than by
+arithmetic. Tokens per forward is the hardware-independent number; turning it
+into wall-clock needs the Qwen3-1.7B run, which has not happened.
 
 **A reversal worth noting.** At a single pass masking *wins* (−0.148 ± 0.047).
 The advantage of a continuous state appears only with refinement and grows with
