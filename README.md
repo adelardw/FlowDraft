@@ -111,7 +111,7 @@ it: −0.148 → +0.612 → +0.675 at one, three and four passes.
 
 ![acceptance and throughput vs refinement passes](results/figures/multistep.png)
 ![paired contrasts with the seed as the unit](results/figures/contrasts.png)
-![training curves across three seeds](results/figures/seeds.png)
+![acceptance during training, per experiment and seed](results/figures/curves_seeds.png)
 ![per-benchmark breakdown](results/figures/per_benchmark.png)
 ![measured horizon](results/figures/horizon.png)
 
@@ -450,15 +450,23 @@ Useful flags: `--step` (which snapshot), `--sched` (`n1`/`n2`/`n3`/`n4`),
 ### 6. Training curves and figures
 
 ```bash
-uv run python bench/curves.py     # every loss term and every metric, per seed
-uv run python bench/figures.py    # acceptance vs passes, horizon, contrasts
+uv run python bench/curves.py     # every loss term, every metric, per seed
 ```
 
 `bench/curves.py` reads the TensorBoard scalars each run writes under
-`checkpoints/**/lightning_logs/` and produces two figures in which colour is the
-experiment and line style is the training seed, so "do the experiments differ"
-and "do the seeds agree" stay separate questions. Terms carrying weight zero are
-named in the caption instead of being drawn as a flat line on an invented axis.
+`checkpoints/**/lightning_logs/` and produces three figures — `curves_loss`,
+`curves_metrics` and `curves_seeds` — in which colour is the experiment and line
+style is the training seed, so "do the experiments differ" and "do the seeds
+agree" stay separate questions. Terms carrying weight zero are named in the
+caption instead of being drawn as a flat line on an invented axis.
+
+**`bench/figures.py` is stale and is deliberately not listed above.** It dates
+from the earlier 6000-step, five-configuration bench, its labels are in Russian,
+and it writes `contrasts.png` — so running it would overwrite a current figure
+with an outdated one. The four result figures in the study section
+(`multistep`, `contrasts`, `per_benchmark`, `horizon`) were produced by a script
+that was never committed and cannot presently be regenerated; their numbers were
+checked against `bench/analyze.py`, but the plotting code behind them is gone.
 
 ![loss curves per experiment and seed](results/figures/curves_loss.png)
 ![validation metrics per experiment and seed](results/figures/curves_metrics.png)
