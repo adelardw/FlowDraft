@@ -215,3 +215,6 @@ results/eval-prompts.jsonl   # построчный дамп eval, гигаба�
 bench/
 results/measure-per-prompt.jsonl
 data/measurements/*.jsonl
+
+# рабочие заметки, не часть проекта
+.notes/

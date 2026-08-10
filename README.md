@@ -173,7 +173,7 @@ arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6).
 
 Rejected configurations live in [bucket/](bucket/) with their numbers.
 Objective assumptions that code cannot remove are in
-[ASSUMPTIONS.md](ASSUMPTIONS.md), including one measured and found unsatisfied.
+section 6 of [EXPERIMENTS.md](EXPERIMENTS.md), including one measured and found unsatisfied.
 
 ## Overview
 

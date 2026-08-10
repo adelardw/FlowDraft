@@ -400,19 +400,33 @@ consistency terms, and freezing the value projection.
 
 ---
 
-## 6. What remains open
+## 6. What remains open, and what the objective assumes
 
-- **Three seeds give `df = 2`.** All headline contrasts clear the 4.30 threshold
-  comfortably, but the design is small; a fourth seed would halve the critical
-  value.
+### Open
+
+- **Three seeds give `df = 2`.** Every headline contrast clears the 4.30
+  threshold comfortably, but the design is small; a fourth seed would halve the
+  critical value.
 - **Eight of ten runs were still improving at the step budget.** The horizon,
   not convergence, sets these numbers.
-- **The self-correction term has no potential function.** `argmax` kills the
-  target gradient and the detach kills the input gradient, so the sum is not the
-  gradient of any scalar in `θ`. Convergence was observed on every curve; it is
-  not guaranteed by anything.
-- **Assumptions the code cannot remove** are listed in
-  [ASSUMPTIONS.md](ASSUMPTIONS.md), including one that was measured and found
-  **unsatisfied**: the additive time conditioning cannot gate the input Jacobian
-  at any realistic amplitude, so verifier alignment and multi-step training do
-  share capacity. The multiplicative fix built to relieve it showed no effect.
+- **`verify_kl` was never ablated.** At one refinement pass it does all the work
+  (the multi-step term adds +0.018); at three or four the roles invert. Whether
+  the term is still needed once multi-step training covers the restarts has not
+  been measured — only argued, and the first decode leg does start at `s = 0`
+  where no draft exists yet.
+- **Nothing has run on CUDA or on Qwen.** Collective operations, the rank seed
+  offset and the sparse FlexAttention path are no-ops on a single MPS device.
+
+### Assumptions the code cannot remove
+
+| assumption | status |
+|---|---|
+| Weighting `KL_j` by `∂E[A]/∂a_j` presumes the coupling `∂a_j/∂θ ≈ −κ·∂KL_j/∂θ` has a **position-independent** `κ`. Deep positions have higher target entropy, so it does not. | never measured; measurable from the per-position acceptance every run logs |
+| The weight profile is **frozen** at one acceptance regime while `∂E/∂a` depends on the current point, so the stationary point is that of a linear functional `Σ c_j a_j`, not of `E`. | second-order near the anchor; at profile 0.93 against a working point near 0.6 the deep positions get ~16× more gradient mass than their contribution warrants |
+| The chain-validity gate is exact **pointwise at a fixed context**. At decode the whole prefix is self-generated, not corpus text; nothing in the objective addresses that shift. | proven pointwise, including at the break position; the distribution shift is untreated |
+| The prefix-fixing lemma is proven for a **token** operator. The map reads `(1−s)x₀′ + s·q`, so "realises `T` exactly" must hold for every prior draw and every `s`. | `s_min = 0.5` removes the region where recovery is provably impossible; it does not establish recovery elsewhere |
+| The multi-step term is **DAgger**: `argmax` kills the target gradient, the detach kills the input gradient, and the input distribution's dependence on `θ` is discarded. The sum is therefore not the gradient of any scalar function of `θ`. | no potential, hence no convergence guarantee. Convergence was observed on every curve across three seeds; it is not implied by anything |
+| Relieving the input requires a **saturating region** reachable by additive conditioning: `verify_kl` at `s = 0` wants `∂π/∂x = 0`, the multi-step term wants the opposite. | **measured and unsatisfied** — response is damped only at amplitudes 81–325× the median embedding norm, far outside what training reaches. The multiplicative gate built to relieve it gave +0.027 (p = 0.23) |
+
+Two of these are measurable rather than permanent: the coupling constant `κ_j`
+and the input Jacobian at a trained checkpoint. Neither was measured.
