@@ -2,8 +2,6 @@
 
 > Raising the **acceptance ceiling** of lossless parallel decoding by upgrading the *drafter* to a **Categorical Flow Map** — faster generation, provably identical output.
 
-**Documentation:** **English** · [Russian](README.ru.md)
-
 <!-- Badges — TODO: fill in once the repo is public
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -609,7 +607,6 @@ Checkpointing has three independent outputs:
   step is not a periodic checkpoint boundary.
 
 An uncatchable process kill or a full filesystem cannot produce a final file.
-The Russian guide is maintained separately in `README.ru.md`.
 
 **Resume after interruption.** Use the newest periodic checkpoint after a hard
 interruption, or `last.ckpt` after a normal/handled termination. Resume the full
