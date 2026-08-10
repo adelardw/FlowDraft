@@ -244,21 +244,113 @@ message rather than silently downgraded.
 
 ### 3. Train every experiment
 
-Qwen3-1.7B — the four experiments that carry the claims, at the paper's
-hyperparameters:
+One command per configuration, each self-contained. Every configuration lives in
+`src/configs/experiment/`; the command differs only in the preset name, because
+everything a comparison must hold fixed lives in the shared base the preset
+inherits.
+
+#### Qwen3-1.7B — the four experiments that carry the claims
+
+At the paper's hyperparameters: 2048 tokens, 256 anchor blocks, block size 32,
+two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup, gradient
+clipping 1.0, global batch 128.
 
 ```bash
-for exp in qwen_masked_paper qwen_masked_multistep \
-           qwen_flow_baseline qwen_flow_multistep; do
-  ./hf-auth.sh uv run python src/train.py +experiment=$exp \
-      output_dir=checkpoints/$exp \
-      model.adapter.flex_attention_backend=flash
-done
+# Orthrus verbatim: the diffusion attention trains W_Q, W_K, W_V and nothing
+# else — no output projection, no per-head norms, no position weights.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_paper \
+    output_dir=checkpoints/qwen_masked_paper \
+    model.adapter.flex_attention_backend=flash
+
+# Masked drafter trained on the state sequence its own decoding visits:
+# propose, freeze the most confident positions, re-mask the rest, repeat.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_masked_multistep \
+    output_dir=checkpoints/qwen_masked_multistep \
+    model.adapter.flex_attention_backend=flash
+
+# Continuous state, verifier alignment ONLY. The ablation that makes the
+# multi-step claim testable: this target does not depend on the drafter.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_baseline \
+    output_dir=checkpoints/qwen_flow_baseline \
+    model.adapter.flex_attention_backend=flash
+
+# THE MAIN RESULT. Continuous state trained on its own refinement procedure:
+# the drafter proposes, one frozen forward over that proposal supplies both
+# the target and the greedy verdict.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flow_multistep \
+    output_dir=checkpoints/qwen_flow_multistep \
+    model.adapter.flex_attention_backend=flash
 ```
 
-SmolLM2-135M — the full bench, replicated across seeds. Runs go **one at a
-time**: on a single device parallel runs contend for the same memory and the
-timings stop being comparable.
+#### SmolLM2-135M — the seven-configuration bench
+
+Drop `model.adapter.flex_attention_backend` here: at this scale the dense mask
+is used and the override does nothing. To replicate a configuration on another
+seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
+
+```bash
+# Orthrus EXACTLY as published — not one of our additions is present. This is
+# the only point at which the reproduction is compared with the paper.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_paper \
+    output_dir=checkpoints/smollm_masked_paper
+
+# The same baseline in the bench geometry, plus our three additions. The
+# contrast against the line above prices those additions on their own.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_baseline \
+    output_dir=checkpoints/smollm_masked_baseline
+
+# Baseline plus the multi-step term, in the MASKED state. Against the line
+# above this is the multi-step effect where the state cannot carry a draft.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_selfcorrect \
+    output_dir=checkpoints/smollm_masked_selfcorrect
+
+# Control for the weight profile INSIDE the multi-step term (tail = 1.0
+# restores the old profile). If it is no worse, the change was cosmetic.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_masked_selfcorrect_prefixweight \
+    output_dir=checkpoints/smollm_masked_selfcorrect_prefixweight
+
+# Flow map WITHOUT multi-step: only the alignment on the jump that ends a
+# decode cycle. The ablation the main claim is measured against.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flow_verify \
+    output_dir=checkpoints/smollm_flow_verify
+
+# THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
+# procedure.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flow_selfcorrect \
+    output_dir=checkpoints/smollm_flow_selfcorrect
+
+# The weight-profile control again, mirrored onto the flow branch — so the
+# profile is controlled once per branch and never confounds the comparison.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flow_selfcorrect_prefixweight \
+    output_dir=checkpoints/smollm_flow_selfcorrect_prefixweight
+```
+
+#### Whole-campaign presets
+
+Two older presets train a full campaign rather than one contrast:
+
+```bash
+# Paper-faithful Orthrus on a frozen Qwen3-1.7B, packed 2048-token sequences.
+./hf-auth.sh uv run python src/train.py +experiment=orthrus
+
+# FlowDraft in the exact inference geometry — boundary-aware, packed 2048.
+./hf-auth.sh uv run python src/train.py +experiment=flowdraft_packed_blockwise
+```
+
+**Two presets are bases, not experiments.** `smollm_bench` and `qwen_bench` hold
+what every configuration must agree on for a contrast to be readable, and are
+meant to be inherited rather than run. They *do* compose and start — which is
+the trap — but with none of the weights that define a contrast, so the run falls
+back to the repository defaults: `train.variant=flowdraft` (full-sequence
+geometry, not the bench's) and the trajectory-structure objective that §3.5 of
+[EXPERIMENTS.md](EXPERIMENTS.md) measured and rejected. Nothing errors; you
+simply do not get any of the configurations above.
+
+#### All of them in sequence
+
+Runs go **one at a time**: on a single device parallel runs contend for the same
+memory and the timings stop being comparable. The loop resumes anything already
+started.
 
 ```bash
 EXPERIMENTS="smollm_masked_paper smollm_masked_baseline smollm_masked_selfcorrect \
@@ -395,7 +487,9 @@ uv run python src/plots.py
 
 # ADDITION (beyond the task) — FlowDraft retrained in the exact inference
 # geometry (block-causal), directly comparable with Orthrus
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_block_wise
+./hf-auth.sh uv run python src/train.py +experiment=flowdraft_packed_blockwise
+#   the PRESET is flowdraft_packed_blockwise; flowdraft_block_wise is the
+#   train.variant it sets — passing the variant name to +experiment= fails
 #   eval: same stage-5 commands with variant=orthrus / flowdraft_block_wise
 ```
 
