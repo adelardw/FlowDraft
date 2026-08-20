@@ -1,0 +1,44 @@
+# @package _global_
+# Общая часть стенда Qwen3-0.6B. Сама по себе конфигурацией не является.
+#
+# Геометрия повторяет `smollm_base` ДОСЛОВНО: block_size 32, один якорный блок,
+# контекст 256, батч 2, 20000 шагов, то же расписание валидации и тот же профиль
+# приёмки. Меняется ровно одно — ствол. Только при таком условии разница между
+# двумя точками масштаба читается как «эффект от размера модели», а не как смесь
+# из десяти отличий.
+#
+# Это НЕ постановка статьи: там 256 якорных блоков и контекст 2048, то есть
+# диффузионный проход в 256 раз длиннее. Сверять эти числа с таблицей 1 нельзя.
+#
+# Снимок раз в 4000, а не в 2000: чекпоинт здесь ~2 ГиБ против ~0.3 у SmolLM,
+# и при кадансе 2000 четыре конфигурации заняли бы около 100 ГиБ вместо 63.
+defaults:
+  - override /model: qwen3_0.6b
+
+train:
+  block_size: 32
+  anchors_per_sequence: 1
+  lr: 3e-4
+  teacher_chain_tail_weight: 0.3
+  acceptance_profile: [0.8]
+  checkpoint_every_n_steps: 4000
+  checkpoint_name: snap-{step:07d}
+  monitor: val/tpf
+  monitor_mode: max
+  early_stop_patience: 5
+  val_decode_prompts: 30
+  val_decode_datasets: [gsm8k, math500, humaneval, mbpp, aime24, aime25]
+  val_decode_jumps: [[0.0, 1.0], [0.5, 1.0], [0.75, 1.0]]
+  val_decode_max_new: 128
+
+data:
+  batch_size: 2
+  max_length: 256
+  val_size: 8
+  shuffle_buffer: 64
+
+trainer:
+  max_steps: 20000
+  val_check_interval: 2000
+  precision: 32
+  log_every_n_steps: 200
