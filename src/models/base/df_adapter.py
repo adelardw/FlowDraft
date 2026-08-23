@@ -1,8 +1,23 @@
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.func import functional_call
 from src.models.base.fte import FlowTimeEmbedding
+
+
+_FLEX_COMPILE_OK = True
+
+
+def _df_attention_mode():
+    """Как считать двухпроходное внимание DF: ``auto``, ``dense`` или ``sparse``.
+
+    Задаётся переменной окружения ``FLOWDRAFT_DF_ATTENTION``. Не конфигом: это
+    свойство машины, а не эксперимента, и одни и те же конфиги должны идти на
+    любом железе без правок.
+    """
+    return os.environ.get("FLOWDRAFT_DF_ATTENTION", "auto").strip().lower()
 
 
 def _make_dual_pass_block_mask(
@@ -132,7 +147,24 @@ def _install_qwen3_flex_df_attention(module, *, backend="triton"):
         # will raise a direct, actionable error from _make_dual_pass_block_mask.
         return
 
-    compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+    # Компиляция здесь — только скорость. Если dynamo отказывается трассировать
+    # flex_attention, прямой вызов даёт тот же результат, и это несравнимо лучше
+    # падения посреди прогона. Переключаемся один раз на процесс.
+    _compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+
+    def compiled(*a, **kw):
+        global _FLEX_COMPILE_OK
+        if _FLEX_COMPILE_OK:
+            try:
+                return _compiled(*a, **kw)
+            except Exception as exc:
+                if not type(exc).__module__.startswith("torch._dynamo"):
+                    raise
+                _FLEX_COMPILE_OK = False
+                print(f"[flowdraft] torch.compile отказал на flex_attention "
+                      f"({type(exc).__name__}), перехожу на прямой вызов", flush=True)
+        kw.pop("kernel_options", None)
+        return flex_attention(*a, **kw)
     # Accelerate installs its device-dispatch wrapper in ``module.forward``
     # and keeps the model's implementation in ``module._old_forward``. Patch
     # that implementation when present: replacing ``module.forward`` would
@@ -532,8 +564,16 @@ class FlowDraftAttentionAdapter(nn.Module):
                 # медленнее, но те же числа. Раньше здесь стояло исключение, и
                 # ни один не-Qwen3 пресет нельзя было ни обучить, ни
                 # воспроизвести на целевой машине вообще.
+                # torch.compile на torch 2.10 отказывается трассировать
+                # flex_attention ("Attempt to trace generator") и роняет обучение
+                # на первом же шаге. Плотная маска проверена на поэлементное
+                # совпадение с разреженной при обоих значениях causal_in_block,
+                # то есть даёт ТЕ ЖЕ числа, только без разреженности. При нашем
+                # контексте в 256 токенов она ничего не стоит, поэтому есть чем
+                # переключиться, не трогая конфиги.
                 use_sparse = (
-                    inputs_embeds.is_cuda
+                    _df_attention_mode() != "dense"
+                    and inputs_embeds.is_cuda
                     and self.model.config.model_type == "qwen3"
                 )
                 if use_sparse:
