@@ -85,7 +85,8 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
         # Steady-state rate: every token the draft cycles produced over the
-        # forwards those cycles cost, with the prefill excluded. This is the
+        # forwards those cycles cost, with the prefill excluded — both its
+        # forward AND the one token it materialises, which costs no cycle. This is the
         # quantity the analytic bound (accepted + 1) / (jumps + 1) predicts, so
         # a gap between the two says the measurement is off rather than the
         # model. Length-independent, hence the one to compare across runs.

@@ -1037,7 +1037,7 @@ class FlowDraft(L.LightningModule):
             if eos_token_id is not None and int(pending) == eos_token_id:
                 return self._finalize(
                     input_ids, emitted, max_new_tokens, eos_token_id, start,
-                    n_forwards, acceptance=acceptance,
+                    n_forwards, acceptance=acceptance, prefill_tokens=1,
                 )
 
         while len(emitted) < max_new_tokens:
@@ -1106,7 +1106,7 @@ class FlowDraft(L.LightningModule):
                 break
 
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                              acceptance=acceptance)
+                              acceptance=acceptance, prefill_tokens=int(bool(emitted)))
 
     @torch.no_grad()
     def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,
@@ -1158,7 +1158,7 @@ class FlowDraft(L.LightningModule):
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards)
 
     def _finalize(self, input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                  acceptance=None, cycle_forwards=None):
+                  acceptance=None, cycle_forwards=None, prefill_tokens=0):
         produced = len(emitted)
         emitted = emitted[:max_new_tokens]
         if eos_token_id is not None and eos_token_id in emitted:
@@ -1176,7 +1176,14 @@ class FlowDraft(L.LightningModule):
             # through it at an identical max_new_tokens. These two report the
             # steady-state rate instead: every token the cycles actually
             # produced, over the forwards those cycles actually cost.
-            "produced_tokens": produced,
+            # `prefill_tokens` — то, что вышло из ПРЕФИЛЛА, а не из циклов:
+            # первый токен материализуется прямо из распределения префилла и не
+            # стоит ни одного прохода цикла. В числителе установившейся скорости
+            # ему не место — иначе она завышена ровно на `1/produced`, то есть
+            # на 3.1% при 32 новых токенах и на 1.6% при 64, и перестаёт быть
+            # длинно-независимой, чем и объявлена. Замерено: смещение падает
+            # как 1/produced на длинах 32, 64 и 128.
+            "produced_tokens": produced - prefill_tokens,
             "cycle_forwards": n_forwards - 1 if cycle_forwards is None else cycle_forwards,
             "seconds": time.perf_counter() - start,
         }
