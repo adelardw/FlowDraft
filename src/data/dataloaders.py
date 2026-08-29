@@ -120,8 +120,13 @@ class PackedTokenStream(IterableDataset):
     an EOS-delimited source-example boundary.
     """
 
-    def __init__(self, ds, tokenize, max_length: int, size: int | None = None):
+    def __init__(self, ds, tokenize, max_length: int, size: int | None = None,
+                 skip: int = 0):
         self.ds, self.tokenize, self.max_length, self.size = ds, tokenize, max_length, size
+        # Сколько упакованных кусков уже съедено к моменту возобновления.
+        # Пропускается ЗДЕСЬ, а не на строках: одна строка даёт несколько
+        # кусков, и пропуск строк промахнулся бы во столько же раз.
+        self.skip = int(skip or 0)
 
     def set_epoch(self, epoch: int):
         if hasattr(self.ds, "set_epoch"):
@@ -157,6 +162,9 @@ class PackedTokenStream(IterableDataset):
                 emitted += 1
                 if usable is not None and emitted > usable:
                     return
+                # До шардирования: иначе ранги пропустили бы разное.
+                if emitted <= self.skip:
+                    continue
                 yield {
                     "input_ids": torch.tensor(ids, dtype=torch.long),
                     "attention_mask": torch.ones(self.max_length, dtype=torch.long),
@@ -320,8 +328,13 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     # шага 6000, переучивался бы ровно на тех же примерах, и «дольше» означало
     # бы «больше эпох», а не «больше данных». `data.stream_skip` — сколько
     # обучающих примеров уже съедено к моменту возобновления.
+    # `stream_skip` считается в ОБУЧАЮЩИХ ПРИМЕРАХ (шаг x батч x накопление).
+    # В неупакованном режиме пример = строка, и пропуск строк тут верен. В
+    # упакованном пример = кусок в `max_length` токенов, а одна строка даёт их
+    # несколько, поэтому пропуск строк промахнулся бы во столько же раз. Там
+    # он применяется ПОСЛЕ упаковки, в тех же единицах, — см. ниже.
     consumed = int(d.get("stream_skip", 0) or 0)
-    if consumed:
+    if consumed and not d.get("pack_sequences", False):
         train_ds = train_ds.skip(consumed)
     # data.train_size bounds the training pool to a FIXED set of samples, so
     # trainer.max_epochs repeats exactly that set (an epoch in the strict
@@ -368,7 +381,8 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
         # читает.
         train_ds.shard_by_rank = False
         train_ds.shard_by_worker = False
-        train_ds = PackedTokenStream(train_ds, tokenize_for_pack, max_length=d.max_length)
+        train_ds = PackedTokenStream(train_ds, tokenize_for_pack,
+                                     max_length=d.max_length, skip=consumed)
     return make_loader(train_ds, packed=pack_sequences), (
         make_loader(val_ds) if val_ds is not None else None
     )
