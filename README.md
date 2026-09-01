@@ -8,7 +8,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> **Status: the multi-step study is complete.** Ten training runs on SmolLM2-135M at 20k steps, three replicated across three seeds, measured on 460 tasks from six benchmarks with the training seed as the unit of observation. Decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Nothing has run on CUDA or on Qwen3** — those presets are written and reviewed but never exercised on that hardware.
+> **Status: two scale points measured.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -17,10 +17,13 @@
 
 ## Table of contents
 
-- [Multi-step drafting study (August 2026)](#multi-step-drafting-study-august-2026)
+- [Results, first scale point: SmolLM2-135M](#results-first-scale-point-smollm2-135m-august-2026) — ten runs, three seeds, the multi-step claims
+- [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
+- [Porting to Qwen3-1.7B](#porting-to-qwen3-17b-the-papers-own-scale) — hyperparameters, hardware, memory
+- [Defects found and fixed](#defects-found-and-fixed)
 - [Overview](#overview)
 - [Quickstart](#quickstart) — setup, sparse attention, training, validation, statistics, curves
-- [Experiments](#experiments) — the four presets and what each one tests
+- [Experiments](#experiments) — the presets and what each one tests
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
@@ -42,7 +45,7 @@
 - [Acknowledgments](#acknowledgments)
 - [License](#license) 🚧
 
-## Multi-step drafting study (August 2026)
+## Results, first scale point: SmolLM2-135M (August 2026)
 
 Ten training runs on SmolLM2-135M at 20k steps, three of them replicated across
 three seeds. Measured on 460 tasks from six benchmarks: 56,000 per-prompt
@@ -124,7 +127,115 @@ Untrained multi-step refinement is not merely worse but *unpredictably* worse:
 at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
 every other run stays within 0.05.
 
-### Running the campaign on Qwen3-1.7B
+## Results, second scale point: Qwen3-0.6B (August 2026)
+
+Five configurations at a **matched budget of 10,000 optimizer steps**, effective
+batch 16 — 41M tokens, 0.231 per trainable parameter against the 135M bench's
+0.386. Measured exactly as the first scale point: 460 prompts from six
+benchmarks at four refinement schedules, 120 decode measurements, output
+identical to greedy AR in every one of them. One training seed.
+
+**The signature reproduces at 0.6B.** Extra refinement passes keep paying only
+for the drafter trained on its own refinement; the other configurations are flat
+whatever their objective.
+
+| accepted tokens per cycle | 1 pass | 2 | 3 | 4 passes | growth |
+|---|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.837 | 1.850 | 1.883 | 1.900 | +0.062 ± 0.010 |
+| masked + multi-step training | 2.007 | 2.023 | 2.045 | 2.081 | +0.071 ± 0.013 |
+| continuous state, no multi-step | 1.705 | 1.724 | 1.749 | 1.749 | +0.035 ± 0.015 |
+| continuous + multi-step (Q,K,V,O) | 1.952 | 2.501 | 2.882 | 2.997 | +0.995 ± 0.048 |
+| **continuous + multi-step (Q,K,V)** | **2.088** | **2.772** | **3.288** | **3.557** | **+1.414 ± 0.053** |
+
+Multi-step training on the *masked* state grows no faster than Orthrus without
+it at all. The term is not what pays — the state that carries it is.
+
+The same measurements in throughput, which is what a deployment pays in. One
+pass is the operating point for every configuration; beyond it the extra
+forwards cost more than the acceptance they buy, and by four passes everything
+is below plain autoregressive decoding.
+
+| tokens per forward | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.419 | 0.950 | 0.721 | 0.580 |
+| masked + multi-step training | 1.504 | 1.008 | 0.761 | 0.616 |
+| continuous state, no multi-step | 1.353 | 0.908 | 0.687 | 0.550 |
+| continuous + multi-step (Q,K,V,O) | 1.476 | 1.167 | 0.971 | 0.799 |
+| **continuous + multi-step (Q,K,V)** | **1.544** | **1.257** | **1.072** | **0.911** |
+
+
+**The output projection was costing us, and dropping it removes the confound.**
+Every configuration except the reproduced baseline used to adapt Q, K, V *and
+O*, a third more trainable head than the paper's three projections — so "we beat
+Orthrus" was never a matched claim. Training the same continuous multi-step
+configuration on Q, K, V alone makes it **better**, not worse, and the
+comparison against the baseline is now like-for-like:
+
+| contrast | 1 pass | 4 passes |
+|---|---|---|
+| **continuous + multi-step vs Orthrus, same projections** | **+0.243** ± 0.025 | **+1.595** ± 0.059 |
+| cost of adapting O as well | +0.140 ± 0.027 | +0.559 ± 0.047 |
+| continuous vs masked, both multi-step | +0.081 ± 0.026 | +1.424 ± 0.053 |
+| multi-step training, continuous state (Q,K,V,O) | +0.241 ± 0.027 | +1.200 ± 0.054 |
+
+**Compared with 135M, at the same schedule.** The first scale point states its
+contrasts at three refinement passes, so these are the numbers to set beside
+them — not the four-pass column above, which would flatter this backbone:
+
+| contrast, three refinement passes | SmolLM2-135M | Qwen3-0.6B |
+|---|---|---|
+| multi-step training, continuous state (Q,K,V,O) | +1.138 ± 0.109 | +1.080 ± 0.049 |
+| best run vs reproduced Orthrus | +0.835 ± 0.085 | +0.936 ± 0.051 |
+| the same with matched projections (Q,K,V) | — | +1.356 ± 0.051 |
+
+The multi-step contrast is the same at both scales within its intervals — it
+does not shrink, and it does not grow either. What does grow is the margin over
+the baseline, and most of that comes from dropping the output projection.
+
+The earlier reversal on this backbone — an untrained-looking continuous branch
+on a laptop run — was undertraining, not a property of the method: that run saw
+0.058 tokens per trainable parameter, 6.5× less than the 135M bench.
+
+**Extra passes still do not pay in throughput, for any configuration.** Tokens
+per forward falls from 1.544 to 0.911 for the best run, below plain decoding by
+four passes.
+The break-even condition `A(n+1) − A(n) > TPF(n)` fails at every transition. One
+pass remains the operating point, and there the best run is **1.544 against
+Orthrus's 1.419** — +8.8%, the same margin the 135M bench reported for its own
+best single-pass configuration.
+
+**Limits, stated up front.** One seed, so the between-run intervals use the
+prompt as the unit of observation and do not carry between-seed spread; the
+growth contrasts are within-model and paired, which is what they are for. The
+Q,K,V run still differs from the baseline in position weights and a chain-tail
+weight even though the projections now match. And nothing has converged —
+validation loss is still falling for all of them at 10k, so this is a matched
+budget rather than a settled state. Whether O would catch up given more steps is
+open: it carries 49% more trainable parameters and is behind on held-out
+acceptance while *ahead* on teacher-forced agreement, which is the opposite of
+what a simply-undertrained model looks like, but two budgets would settle it and
+we measured one.
+
+![Qwen3-0.6B: acceptance and throughput vs refinement passes](results/figures/qwen06_passes.png)
+![Qwen3-0.6B: per-benchmark breakdown at four refinement passes](results/figures/qwen06_per_benchmark.png)
+![Qwen3-0.6B: acceptance as the training loop sees it and as decoding delivers it](results/figures/qwen06_acceptance.png)
+![Qwen3-0.6B: teacher-forced agreement and validation loss during training](results/figures/qwen06_training.png)
+
+The per-benchmark figure answers whether the average is carried by one dataset:
+it is not — the ordering is the same on all six, and the Q,K,V run leads
+everywhere. Whiskers there are 95% intervals over prompts within a benchmark,
+so they show measurement spread, not the between-seed spread the 135M figures
+carry.
+
+The last two figures are the caution. In-training teacher-forced agreement
+ranks the configurations differently from held-out decoding — it puts Orthrus
+first at every step, while decoding puts it fourth — which is the same proxy
+failure the 135M study documents, now visible on a second backbone. In-training
+acceptance is read from eight held-out sequences and is quantised to 1/8, so it
+shows a trajectory and nothing finer; the decode measurement beside it rests on
+460 prompts.
+
+## Porting to Qwen3-1.7B, the paper's own scale
 
 The four experiments that carry the claims have Qwen presets reproducing the
 paper's Table 4 hyperparameters exactly (2048 tokens, 256 anchor blocks, block
@@ -195,9 +306,9 @@ per-position acceptance, so derive it from the data and retrain if it moved.
 the sparse FlexAttention path are no-ops on a single MPS device and have never
 been exercised. Run one short job before committing to a long one.
 
-### What changed in the code
+## Defects found and fixed
 
-Defects found and fixed, each with a measured before/after:
+Each with a measured before and after:
 
 | | before | after |
 |---|---|---|
@@ -292,6 +403,70 @@ One command per configuration, each self-contained. Every configuration lives in
 everything a comparison must hold fixed lives in the shared base the preset
 inherits.
 
+#### SmolLM2-135M — the first scale point
+
+Drop `model.adapter.flex_attention_backend` here: at this scale the dense mask
+is used and the override does nothing. To replicate a configuration on another
+seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
+
+```bash
+# Orthrus EXACTLY as published — not one of our additions is present. This is
+# the only point at which the reproduction is compared with the paper.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
+    output_dir=checkpoints/smollm_orthrus
+
+# Baseline plus the multi-step term, in the MASKED state. Against the line
+# above this is the multi-step effect where the state cannot carry a draft.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus_multistep \
+    output_dir=checkpoints/smollm_orthrus_multistep
+
+
+# Flow map WITHOUT multi-step: only the alignment on the jump that ends a
+# decode cycle. The ablation the main claim is measured against.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft \
+    output_dir=checkpoints/smollm_flowdraft
+
+# THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
+# procedure.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
+    output_dir=checkpoints/smollm_flowdraft_multistep
+
+```
+
+
+#### Qwen3-0.6B — the second scale point
+
+The bench geometry of the 135M runs on a larger backbone: block size 32, one
+anchor block, context 256, effective batch 16. Not the paper's setup — do not
+compare these against its Table 1. Trained on Kaggle T4s, which is why the
+batch is split: 16×1 where memory allows and 8×2 where it does not, the same
+16 either way.
+
+```bash
+# Orthrus at this scale: W_Q, W_K, W_V only, no position weights.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus \
+    output_dir=checkpoints/qwen06_orthrus
+
+# Masked state plus the multi-step term.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_multistep \
+    output_dir=checkpoints/qwen06_orthrus_multistep
+
+# Continuous state, verifier alignment only — the ablation the main claim is
+# measured against.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft \
+    output_dir=checkpoints/qwen06_flowdraft
+
+# Continuous state trained on its own refinement, adapting Q, K, V and O.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep \
+    output_dir=checkpoints/qwen06_flowdraft_multistep
+
+# THE SAME, on Q, K, V alone — the projection set the baseline uses. This is
+# the configuration that leads at this scale, and the one whose comparison
+# against Orthrus is like-for-like.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep_qkv \
+    output_dir=checkpoints/qwen06_flowdraft_multistep_qkv
+```
+
 #### Qwen3-1.7B — the four experiments that carry the claims
 
 At the paper's hyperparameters: 2048 tokens, 256 anchor blocks, block size 32,
@@ -325,45 +500,15 @@ clipping 1.0, global batch 128.
     model.adapter.flex_attention_backend=flash
 ```
 
-#### SmolLM2-135M — the seven-configuration bench
-
-Drop `model.adapter.flex_attention_backend` here: at this scale the dense mask
-is used and the override does nothing. To replicate a configuration on another
-seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
-
-```bash
-# Orthrus EXACTLY as published — not one of our additions is present. This is
-# the only point at which the reproduction is compared with the paper.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
-    output_dir=checkpoints/smollm_orthrus
-
-# Baseline plus the multi-step term, in the MASKED state. Against the line
-# above this is the multi-step effect where the state cannot carry a draft.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus_multistep \
-    output_dir=checkpoints/smollm_orthrus_multistep
-
-
-# Flow map WITHOUT multi-step: only the alignment on the jump that ends a
-# decode cycle. The ablation the main claim is measured against.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft \
-    output_dir=checkpoints/smollm_flowdraft
-
-# THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
-# procedure.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
-    output_dir=checkpoints/smollm_flowdraft_multistep
-
-```
-
-
-**Two presets are bases, not experiments.** `smollm_base` and `qwen_base` hold
-what every configuration must agree on for a contrast to be readable, and are
-meant to be inherited rather than run. They *do* compose and start — which is
-the trap — but with none of the weights that define a contrast, so the run falls
-back to the repository defaults: `train.variant=flowdraft` (full-sequence
-geometry, not the bench's) and the trajectory-structure objective that §3.5 of
-[EXPERIMENTS.md](EXPERIMENTS.md) measured and rejected. Nothing errors; you
-simply do not get any of the configurations above.
+**Three presets are bases, not experiments.** `smollm_base`, `qwen06_base` and
+`qwen_base` hold what every configuration at that scale must agree on for a
+contrast to be readable, and are meant to be inherited rather than run. They
+*do* compose and start — which is the trap — but with none of the weights that
+define a contrast, so the run falls back to the repository defaults:
+`train.variant=flowdraft` (full-sequence geometry, not the bench's) and the
+trajectory-structure objective that §3.5 of [EXPERIMENTS.md](EXPERIMENTS.md)
+measured and rejected. Nothing errors; you simply do not get any of the
+configurations above.
 
 #### All of them in sequence
 
@@ -481,20 +626,23 @@ model.backbone.device_map=null`.
 
 ## Experiments
 
-Four experiments, each a preset in `src/configs/experiment/`, on two backbones.
-What each one tests, the loss written out term by term, the results and the
-statistics are in **[EXPERIMENTS.md](EXPERIMENTS.md)**; the commands that launch
-them are in [step 3 of the Quickstart](#3-train-every-experiment).
+Four experiments across three backbones, each a preset in
+`src/configs/experiment/`, plus one projection ablation that exists only where
+it was measured. What each one tests, the loss written out term by term, the
+results and the statistics are in **[EXPERIMENTS.md](EXPERIMENTS.md)**; the
+commands that launch them are in
+[step 3 of the Quickstart](#3-train-every-experiment).
 
-| experiment | SmolLM2-135M | Qwen3-1.7B |
-|---|---|---|
-| Orthrus, reproduced | `smollm_orthrus` | `qwen_orthrus` |
-| masked + multi-step | `smollm_orthrus_multistep` | `qwen_orthrus_multistep` |
-| continuous state, ablation | `smollm_flowdraft` | `qwen_flowdraft` |
-| continuous state + multi-step | `smollm_flowdraft_multistep` | `qwen_flowdraft_multistep` |
+| experiment | SmolLM2-135M | Qwen3-0.6B | Qwen3-1.7B |
+|---|---|---|---|
+| Orthrus, reproduced | `smollm_orthrus` | `qwen06_orthrus` | `qwen_orthrus` |
+| masked + multi-step | `smollm_orthrus_multistep` | `qwen06_orthrus_multistep` | `qwen_orthrus_multistep` |
+| continuous state, ablation | `smollm_flowdraft` | `qwen06_flowdraft` | `qwen_flowdraft` |
+| continuous state + multi-step | `smollm_flowdraft_multistep` | `qwen06_flowdraft_multistep` | `qwen_flowdraft_multistep` |
+| the same on Q,K,V alone | — | `qwen06_flowdraft_multistep_qkv` | — |
 
-`smollm_base` and `qwen_base` are the shared bases these inherit, not
-experiments. Presets that were measured and rejected — the trajectory-structure
+`smollm_base`, `qwen06_base` and `qwen_base` are the shared bases these inherit,
+not experiments. Presets that were measured and rejected — the trajectory-structure
 objective, the input gate, the Q/K/O projection set, the weight-profile controls
 — live in `bucket/` with their numbers, and are deliberately not shipped.
 
