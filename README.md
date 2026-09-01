@@ -8,7 +8,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> **Status: two scale points measured.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
+> **Status: two scale points measured.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -61,9 +61,11 @@ cost more than they return. What a continuous state changes is *acceptance*:
 trained on its own refinement, it keeps gaining as passes are added (1.58 → 2.51
 from one pass to four) where the masked drafter is flat (1.72 → 1.79) and an
 untrained continuous state collapses (1.56 → 1.23). Separately, the multi-step
-*training* term raises throughput at a single pass, by +8.8% on the masked
-drafter. Intervals below use the **training seed** as the unit of observation
-(three seeds, df = 2), so they describe the method rather than one trained model.
+*training* term raises throughput at a single pass — by +3.1% on the continuous
+state, where the comparison is matched, and by +1.6% on the masked one once its
+control is matched too, against the +8.8% an unmatched comparison shows.
+Intervals below use the **training seed** as the unit of observation (three
+seeds, df = 2), so they describe the method rather than one trained model.
 
 **Scale, stated plainly.** The paper reports an average TPF of 3.89 on
 Qwen3-1.7B greedy — roughly 6.8 accepted tokens per cycle. This bench, on
@@ -77,7 +79,15 @@ point than at ours. Multi-step still fails to pay here.
 | multi-step training, continuous state | **+1.138** | ± 0.109 | 0.0005 |
 | best run vs reproduced Orthrus | **+0.835** | ± 0.085 | 0.0006 |
 | continuous state vs masking, same objective | +0.612 | ± 0.065 | 0.0006 |
-| multi-step training, masking | +0.223 | ± 0.021 | 0.0005 |
+| masked + multi-step vs reproduced Orthrus | +0.223 | ± 0.021 | 0.0005 |
+
+The last row is a method against a published baseline, not an isolated
+mechanism, and it used to be labelled as one. Those two runs differ in three
+things at once — the output projection, the acceptance profile and the
+chain-tail weight — and against a control matched on all three the multi-step
+term is worth **+0.046**, not +0.223. Four fifths of the row is the bundle. The
+correction and its caveats are in
+[EXPERIMENTS.md](EXPERIMENTS.md); the other three rows are matched.
 
 Going from one refinement pass to four, acceptance grows by **+0.893** with a
 continuous state trained on the procedure, by +0.070 with masking, and **falls
@@ -88,11 +98,15 @@ three seeds.
 Multi-step *training* — the loss term — **raises** throughput. Multi-step
 *decoding* — spending extra passes at inference — lowers it.
 
-At one pass, which is where every method is fastest, multi-step training is
-worth **+0.107 tokens per forward over Orthrus (+8.8%, t = 129 with the seed as
-the unit)** for the masked drafter, and +0.038 (+3.1%) for the continuous one.
-The best throughput measured in the study is masked + multi-step at a single
-pass: **1.327 against Orthrus's 1.219**.
+At one pass, which is where every method is fastest, the masked + multi-step run
+is worth **+0.107 tokens per forward over the reproduced Orthrus (+8.8%, t = 129
+with the seed as the unit)**. That comparison carries the same three-way
+difference as the acceptance row above, so it measures the method rather than
+the term: against a control matched on projections, profile and tail — one seed,
+so a size and not an interval — the multi-step term alone is worth **+1.6%**. On
+the continuous state, where the comparison *is* matched, the term is worth
++0.038 (+3.1%). The best throughput measured in the study is masked +
+multi-step at a single pass: **1.327 against Orthrus's 1.219**.
 
 Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
 while acceptance grows slower than `n`, so every schedule beyond one pass drops
@@ -129,11 +143,17 @@ every other run stays within 0.05.
 
 ## Results, second scale point: Qwen3-0.6B (August 2026)
 
+**This is a scale check, not a second set of claims.** One training seed, so
+nothing here carries a between-seed interval and nothing here should be read as
+independent confirmation at the strength of the 135M study. What it can do — and
+does — is show that the mechanism survives a 4.4× larger backbone, and that the
+direction of every contrast is the same.
+
 Five configurations at a **matched budget of 10,000 optimizer steps**, effective
 batch 16 — 41M tokens, 0.231 per trainable parameter against the 135M bench's
 0.386. Measured exactly as the first scale point: 460 prompts from six
 benchmarks at four refinement schedules, 120 decode measurements, output
-identical to greedy AR in every one of them. One training seed.
+identical to greedy AR in every one of them.
 
 **The signature reproduces at 0.6B.** Extra refinement passes keep paying only
 for the drafter trained on its own refinement; the other configurations are flat

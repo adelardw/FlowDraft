@@ -504,7 +504,34 @@ Intervals in this section use the **training seed** as the unit of observation
 | **multi-step training, continuous state** | **+1.138** | ± 0.109 | +45.0 | 0.0005 | 1.175 / 1.151 / 1.090 |
 | **best vs reproduced Orthrus** | **+0.835** | ± 0.085 | +42.3 | 0.0006 | 0.870 / 0.834 / 0.802 |
 | continuous state vs masking, same objective | +0.612 | ± 0.065 | +40.6 | 0.0006 | 0.640 / 0.610 / 0.588 |
-| multi-step training, masking | +0.223 | ± 0.021 | +46.4 | 0.0005 | 0.230 / 0.225 / 0.214 |
+| masked + multi-step vs reproduced Orthrus | +0.223 | ± 0.021 | +46.4 | 0.0005 | 0.230 / 0.225 / 0.214 |
+
+**The last row is not an isolated mechanism, and it used to be labelled as one.**
+It read *multi-step training, masking*, which claims the multi-step term alone
+accounts for it. It does not. `smollm_orthrus_multistep` differs from the
+reproduced baseline in three ways at once: it adapts the output projection as
+well as Q, K and V, it carries the measured acceptance profile, and its
+chain-tail weight is 0.3 against the baseline's 1.0.
+
+Against a control matched on all three — masked state, four projections, the
+same weights, no multi-step term — the multi-step term is worth **+0.046**
+(positive on all six benchmarks, +0.015 to +0.085) rather than +0.223. **Four
+fifths of that row is the bundle, not the mechanism.** The control was trained
+and measured at one seed only, so the correction states a size, not an interval;
+the +0.223 above keeps its three-seed interval because the comparison it makes —
+against the published baseline — is the one the seeds were run for.
+
+The other three rows are matched. *Multi-step training, continuous state*
+differs in `selfcorrect_kl_weight` and `selfcorrect_s_min` and in nothing else;
+*continuous state vs masking* holds projections, profile and tail fixed and
+varies the state; *best vs reproduced Orthrus* is a method against a published
+baseline, which is what it says.
+
+The second scale point makes the same point from the other side: on Qwen3-0.6B,
+training the continuous multi-step run on Q, K, V alone — the baseline's own
+projection set — makes it **better**, not worse. The output projection was
+costing acceptance while making every comparison against the baseline
+unmatched. See the Qwen3-0.6B section of [README.md](README.md).
 
 ### Growth from one pass to four
 
