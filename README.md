@@ -338,7 +338,7 @@ weights, not by arithmetic.
 
 ![Qwen3-0.6B at 80k: acceptance, throughput and wall-clock against refinement passes](results/figures/qwen06_80k_passes.png)
 ![Qwen3-0.6B at 80k: the cost of a decode schedule that leaves the trained range](results/figures/qwen06_80k_schedule.png)
-![Qwen3-0.6B at 80k: both arms per benchmark, and the paired margin, at three refinement passes](results/figures/qwen06_80k_benchmarks.png)
+![Qwen3-0.6B at 80k: both arms per benchmark, and the paired margin, at three refinement passes](results/figures/qwen06_80k_per_benchmark.png)
 
 **Limits, unchanged from the section above.** One training seed per arm, so the
 intervals use the prompt as the unit of observation and answer "will this hold on
