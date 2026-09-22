@@ -8,7 +8,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> **Status: two scale points measured.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
+> **Status: two scale points measured, one of them to a converged budget.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -19,6 +19,7 @@
 
 - [Results, first scale point: SmolLM2-135M](#results-first-scale-point-smollm2-135m-august-2026) — ten runs, three seeds, the multi-step claims
 - [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
+- [Results at a converged budget: Qwen3-0.6B to 80,000 steps](#results-at-a-converged-budget-qwen3-06b-to-80000-steps-september-2026) — both arms to convergence, and the schedule that was costing a pass
 - [Porting to Qwen3-1.7B](#porting-to-qwen3-17b-the-papers-own-scale) — hyperparameters, hardware, memory
 - [Defects found and fixed](#defects-found-and-fixed)
 - [Overview](#overview)
@@ -254,6 +255,99 @@ failure the 135M study documents, now visible on a second backbone. In-training
 acceptance is read from eight held-out sequences and is quantised to 1/8, so it
 shows a trajectory and nothing finer; the decode measurement beside it rests on
 460 prompts.
+
+The budget caveat this section ends on is lifted in the next one: the reproduced
+baseline and the Q,K,V flow map were both carried to 80,000 steps and measured
+again, with a decode schedule that stays inside the range the refinement term was
+trained on.
+
+## Results at a converged budget: Qwen3-0.6B to 80,000 steps (September 2026)
+
+**What this section adds.** The 10k section above is a matched-budget snapshot of
+five configurations; it ends by saying nothing has converged. This one takes the
+two configurations that matter — the reproduced Orthrus baseline and the flow map
+on the same three projections — to **80,000 optimizer steps each**, and measures
+them the same way. Orthrus spent 74.9 hours of training across nine sessions, the
+flow map 110.5 across twelve; the step counts are identical, which is what the
+comparison rests on. Two things are new besides the budget: a **decode schedule
+that stays inside the range the refinement term was trained on**, and the first
+wall-clock numbers from a real GPU rather than a laptop.
+
+**Acceptance.** Sixty measurements, 460 prompts from six benchmarks, every one
+bitwise-identical to greedy AR.
+
+| accepted tokens per cycle | 1 pass | 2 | 3 | 4 passes | growth |
+|---|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 2.201 | 2.215 | 2.258 | 2.312 | +0.096 ± 0.017 |
+| **continuous state + multi-step (Q,K,V)** | **2.576** | **3.265** | **3.740** | **4.189** | **+1.559 ± 0.066** |
+
+Paired by prompt, the margin is **+0.360 ± 0.035** at one pass (ahead on 81% of
+prompts), **+0.998 ± 0.047** at two (99%), **+1.423 ± 0.059** at three and
+**+1.823 ± 0.073** at four — the last two on **all 460 prompts without a single
+exception**. The per-benchmark breakdown at three passes is uniform: math500
++1.732, aime25 +1.742, aime24 +1.612, mbpp +1.323, gsm8k +1.294, humaneval
++1.190.
+
+**The margin did not shrink with training — it grew.** Against the 10k section:
+at one pass +0.243 → **+0.360**, at three +1.356 → **+1.423**. An intermediate
+measurement taken at 42k against 33k steps appeared to show the opposite, but
+those budgets were not matched and the apparent narrowing was the gap in steps,
+not a property of the method.
+
+**Throughput, and the schedule that was costing us a pass.** The four-pass
+schedule used in every earlier table enters the refinement chain at `s = 0.34`.
+Training places its two refinement entries in `[0.5, 0.75)` and `[0.75, 1)` —
+`train.selfcorrect_s_min` is 0.5 — so that entry asks the drafter to refine from
+a state it has never seen, where two thirds of the input is prior noise arriving
+through a frozen embedding. It costs **−0.733 ± 0.055** accepted tokens against
+the three-pass schedule, degrading 90–97% of the prompts on every one of the six
+benchmarks. Moving the same entry inside the trained range turns a loss into the
+best result of the campaign: **2.974 → 4.189**.
+
+Orthrus is the control that makes this an explanation rather than a story: it has
+no self-correction and no `s_min`, and its two four-pass schedules return **the
+identical number on every one of the 460 prompts** (`+0.000 ± 0.000`). Only the
+number of passes reaches it; where they start does not. That is also direct
+evidence, with no theory in it, that the continuous branch is a map in `s` rather
+than a repeated projection under another name.
+
+| tokens per forward | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.601 | 1.072 | 0.814 | 0.662 |
+| **continuous state + multi-step (Q,K,V)** | **1.788** | **1.422** | **1.185** | **1.038** |
+
+The break-even condition `A(n+1) − A(n) > TPF(n)` still fails at every transition
+for both arms, so **one pass remains the operating point** and the paper's
+conclusion about single-step projection stands. What changes is the penalty: the
+flow map stays above plain decoding at every schedule, where the baseline drops
+below it from three passes on.
+
+**Wall-clock, measured on a T4 rather than a laptop.** The 135M section reports
+that its throughput gain did not show up in seconds, because at that size a
+forward is dominated by fixed overhead. On a real GPU it does:
+
+| wall-clock speedup over plain decoding | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.347 | 0.906 | 0.693 | 0.564 |
+| **continuous state + multi-step (Q,K,V)** | **1.440** | **1.130** | **0.929** | **0.805** |
+
+Both arms are faster than autoregressive decoding at one pass; only the flow map
+is still faster at two. These numbers are a T4 at `float32` with the dense
+attention path, batch one — the regime in which decoding is bound by reading the
+weights, not by arithmetic.
+
+![Qwen3-0.6B at 80k: acceptance, throughput and wall-clock against refinement passes](results/figures/qwen06_80k_passes.png)
+![Qwen3-0.6B at 80k: the cost of a decode schedule that leaves the trained range](results/figures/qwen06_80k_schedule.png)
+![Qwen3-0.6B at 80k: paired per-benchmark margin at three refinement passes](results/figures/qwen06_80k_benchmarks.png)
+
+**Limits, unchanged from the section above.** One training seed per arm, so the
+intervals use the prompt as the unit of observation and answer "will this hold on
+other tasks", never "will this hold on another training run". The two arms still
+differ in position weights and a chain-tail weight even though the projections
+match. And the four-pass column of every earlier table in this README — 10k
+included — was measured with the out-of-range schedule and therefore understates
+the method; the growth it reports for the flow map is roughly a quarter of what
+the corrected schedule delivers.
 
 ## Porting to Qwen3-1.7B, the paper's own scale
 
