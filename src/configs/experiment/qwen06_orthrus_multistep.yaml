@@ -1,0 +1,11 @@
+# @package _global_
+# Маскирующий драфтер плюс многошаговое обучение. Зеркало `smollm_orthrus_multistep`.
+defaults:
+  - /experiment/qwen06_base
+  - _self_
+
+output_dir: checkpoints/qwen06_orthrus_multistep
+train:
+  variant: orthrus
+  selfcorrect_kl_weight: 1.0
+  selfcorrect_rounds: 2

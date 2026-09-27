@@ -1,0 +1,33 @@
+# Вторая точка масштаба для стенда: те же 20000 шагов и та же геометрия, что у
+# SmolLM2-135M, но ствол в 4.4 раза больше. Нужна ровно затем, чтобы увидеть,
+# СЖИМАЕТСЯ ли выигрыш многошаговости с ростом модели, — на одной точке этого
+# не видно.
+#
+# Не путать с `qwen3_1.7b`: тот стоит в пресетах, воспроизводящих постановку
+# статьи (256 якорных блоков, контекст 2048). Здесь постановка стендовая.
+
+name: Qwen/Qwen3-0.6B
+
+backbone:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  dtype: bfloat16
+  device_map: auto
+  attn_implementation: sdpa
+  low_cpu_mem_usage: true
+  trust_remote_code: false
+  use_cache: false
+
+tokenizer:
+  pretrained_model_name_or_path: ${..name}
+  revision: main
+  use_fast: true
+  padding_side: right
+  trust_remote_code: false
+
+adapter:
+  # Тот же набор, что у SmolLM2-135M на стенде: Q, K, V плюс наше добавление
+  # o_proj. Пресет `qwen06_orthrus` сузит его до трёх проекций статьи.
+  # У Qwen3 есть ещё q_norm/k_norm — сюда они НЕ включены, иначе сравнение с
+  # SmolLM-точкой несло бы внутри себя ещё и контраст «нормы против без норм».
+  w_names: [q_proj, k_proj, v_proj, o_proj]

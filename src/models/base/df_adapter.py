@@ -1,17 +1,40 @@
 
+import os
+
 import torch
 import torch.nn as nn
 from torch.func import functional_call
 from src.models.base.fte import FlowTimeEmbedding
 
 
-def _make_dual_pass_block_mask(batch, heads, q_len, ar_len, block_size, causal_limit):
+_FLEX_COMPILE_OK = True
+
+
+def _df_attention_mode():
+    """Как считать двухпроходное внимание DF: ``auto``, ``dense`` или ``sparse``.
+
+    Задаётся переменной окружения ``FLOWDRAFT_DF_ATTENTION``. Не конфигом: это
+    свойство машины, а не эксперимента, и одни и те же конфиги должны идти на
+    любом железе без правок.
+    """
+    return os.environ.get("FLOWDRAFT_DF_ATTENTION", "auto").strip().lower()
+
+
+def _make_dual_pass_block_mask(
+    batch, heads, q_len, ar_len, block_size, causal_limit, causal_in_block=False
+):
     """Paper's sparse AR-cache + independent diffusion-block mask.
 
     Based on the MIT-licensed official Orthrus implementation
     (chiennv2000/orthrus, ``generate_dual_pass_mask``).  Import lazily: the
     CPU/macOS development build does not ship FlexAttention, while the H100
     training environment does.
+
+    ``causal_in_block`` makes the intra-block relation causal instead of
+    bidirectional. That is not a diffusion geometry — it is the AR teacher
+    evaluated on the SAME isolated-block layout, which is what an on-policy
+    target needs: position ``j`` of a block must see the drafted tokens before
+    it and nothing after, exactly as the verification forward does at decode.
     """
     try:
         from torch.nn.attention.flex_attention import create_block_mask
@@ -24,7 +47,10 @@ def _make_dual_pass_block_mask(batch, heads, q_len, ar_len, block_size, causal_l
     def mask_fn(b, h, q_idx, kv_idx):
         is_ar = kv_idx < ar_len
         allow_ar = is_ar & (kv_idx <= causal_limit[b, q_idx])
-        allow_block = (~is_ar) & ((q_idx // block_size) == ((kv_idx - ar_len) // block_size))
+        same_block = (q_idx // block_size) == ((kv_idx - ar_len) // block_size)
+        if causal_in_block:
+            same_block = same_block & ((kv_idx - ar_len) <= q_idx)
+        allow_block = (~is_ar) & same_block
         return allow_ar | allow_block
 
     return create_block_mask(
@@ -39,13 +65,17 @@ def _make_dual_pass_block_mask(batch, heads, q_len, ar_len, block_size, causal_l
 
 
 def _dense_dual_pass_mask(
-    batch, q_len, ar_len, block_size, causal_limit, dtype, device
+    batch, q_len, ar_len, block_size, causal_limit, dtype, device,
+    causal_in_block=False,
 ):
     """Materialize the Orthrus sparse relation as an additive SDPA mask.
 
     FlexAttention has no CPU backward implementation. This equivalent dense
     path keeps small CPU development and regression runs functional while the
     production CUDA path remains sparse.
+
+    ``causal_in_block`` restricts the intra-block relation to the past, giving
+    the AR teacher's geometry on the isolated-block layout.
     """
     q_idx = torch.arange(q_len, device=device)
     kv_idx = torch.arange(ar_len + q_len, device=device)
@@ -56,6 +86,8 @@ def _dense_dual_pass_mask(
     same_block = (q_idx[:, None] // block_size) == (
         (kv_idx[None, :] - ar_len) // block_size
     )
+    if causal_in_block:
+        same_block = same_block & ((kv_idx[None, :] - ar_len) <= q_idx[:, None])
     allow = allow_ar | ((~is_ar) & same_block)[None]
     mask = torch.zeros(
         batch, 1, q_len, ar_len + q_len, dtype=dtype, device=device
@@ -115,7 +147,24 @@ def _install_qwen3_flex_df_attention(module, *, backend="triton"):
         # will raise a direct, actionable error from _make_dual_pass_block_mask.
         return
 
-    compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+    # Компиляция здесь — только скорость. Если dynamo отказывается трассировать
+    # flex_attention, прямой вызов даёт тот же результат, и это несравнимо лучше
+    # падения посреди прогона. Переключаемся один раз на процесс.
+    _compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+
+    def compiled(*a, **kw):
+        global _FLEX_COMPILE_OK
+        if _FLEX_COMPILE_OK:
+            try:
+                return _compiled(*a, **kw)
+            except Exception as exc:
+                if not type(exc).__module__.startswith("torch._dynamo"):
+                    raise
+                _FLEX_COMPILE_OK = False
+                print(f"[flowdraft] torch.compile отказал на flex_attention "
+                      f"({type(exc).__name__}), перехожу на прямой вызов", flush=True)
+        kw.pop("kernel_options", None)
+        return flex_attention(*a, **kw)
     # Accelerate installs its device-dispatch wrapper in ``module.forward``
     # and keeps the model's implementation in ``module._old_forward``. Patch
     # that implementation when present: replacing ``module.forward`` would
@@ -200,10 +249,24 @@ class FlowDraftAttentionAdapter(nn.Module):
     :func:`torch.func.functional_call`, which substitutes the matched
     projection weights with their twins for exactly one forward — no module
     surgery, no mode flags, nothing to restore afterwards. Norms, MLP,
-    ``o_proj``, embeddings and the LM head are therefore shared by
-    construction. The official Orthrus Qwen implementation does *not* share
-    the attention output projection or Q/K normalization with AR, so those
-    modules belong in Qwen3's default ``w_names`` too.
+    embeddings and the LM head are therefore shared by construction.
+
+    Что обучает статья. Orthrus (arXiv 2605.12825, разд. 3) пишет дословно:
+    "a trainable diffusion attention module, parameterized by projection
+    matrices (W_Q^diff, W_K^diff, W_V^diff) initialized from their frozen AR
+    counterparts". То есть Q, K, V — и ВСЁ: ни выходной проекции, ни
+    нормировок Q/K там нет. Прежний комментарий в этом месте утверждал
+    обратное и ссылки не имел; из официальной реализации в проект заимствована
+    только маска (``generate_dual_pass_mask``), не список обучаемых проекций.
+
+    Наши конфиги добавляют ``o_proj`` (на SmolLM2-135M это 9.95М из 26.54М,
+    37.5% головы), а конфиг Qwen3 — ещё и ``q_norm``/``k_norm``. Это отход от
+    статьи в сторону БОЛЬШЕЙ ёмкости, одинаковый у всех конфигураций, поэтому контрасты
+    между конфигурациями он не портит — но «наш бейзлайн» при нём не равен
+    опубликованному Orthrus, и утверждение о сравнении требует оговорки.
+    Набор проверяется конфигурациями (обе в ``bucket/``) ``smollm_flow_selfcorrect_qkv`` (набор статьи) и
+    ``smollm_flow_selfcorrect_qko`` (внимание плюс сведение голов, значения
+    заморожены).
 
     Shared KV cache (Orthrus contract): the cache holds AR-path K/V of
     *committed* tokens only. Pass ``past_key_values`` (a mutable HF ``Cache``,
@@ -230,6 +293,8 @@ class FlowDraftAttentionAdapter(nn.Module):
         model,
         w_names=("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
         flex_attention_backend="triton",
+        time_parameterisation: str = "pair",
+        conditioning_gate: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -251,9 +316,21 @@ class FlowDraftAttentionAdapter(nn.Module):
         self.mask_embedding = nn.Parameter(
             embed_weight.detach().float().mean(0, keepdim=True)
         )
-        self.time_embed = FlowTimeEmbedding(self.model.config.hidden_size).to(
-            device=embed_weight.device
-        )
+        # A learned point ON the simplex, used as the s = 0 state when
+        # train.prior_type is "learned". At s = 0 the deployed map's minimiser
+        # is constant in its input — the target depends on the prefix alone —
+        # so the best thing to put there is not a random draw from any family
+        # but a single consistent vector the frozen trunk can learn to read as
+        # "unknown". That is what the masked baseline has and trains; feeding
+        # x_s @ E instead substitutes an UNTRAINED approximation of it, since a
+        # near-uniform simplex point embeds to the vocabulary mean plus noise.
+        # Initialised uniform, so its embedding starts at exactly that mean and
+        # training begins from the same operating point.
+        self.time_embed = FlowTimeEmbedding(
+            self.model.config.hidden_size,
+            parameterisation=time_parameterisation,
+            gated=conditioning_gate,
+        ).to(device=embed_weight.device)
         # The paper's training kernel is Qwen3-specific. Patch only Qwen3
         # attention modules; other model families retain the portable SDPA DF
         # implementation below.
@@ -376,12 +453,22 @@ class FlowDraftAttentionAdapter(nn.Module):
         past_key_values=None,
         causal_limit=None,
         diffusion_block_size=None,
+        causal_in_block: bool = False,
+        weights: str = "df",
         use_compiled_ar: bool = False,
         **kwargs,
     ):
         ## input_ids - AR IDS or OHE IDS FOR DF!
         if past_key_values is not None:
             kwargs.update(past_key_values=past_key_values, use_cache=True)
+        if weights not in ("df", "ar"):
+            raise ValueError(f"unknown weights='{weights}' (df | ar)")
+        if weights == "ar" and not use_df:
+            raise ValueError(
+                "weights='ar' selects the FROZEN weights on the block geometry; "
+                "it is meaningful only with use_df=True. For an ordinary causal "
+                "forward just call with use_df=False"
+            )
         if use_df:
             # DF PATH: same backbone, diffusion-attention modules substituted
             # by their trainable twins for this single call. The drafter reads the committed AR
@@ -404,23 +491,92 @@ class FlowDraftAttentionAdapter(nn.Module):
             if (s is None) != (t is None):
                 raise ValueError("flow-map conditioning needs both s and t (or neither)")
             if s is not None:
-                # Flow-map time conditioning, added to every block position.
-                s = torch.as_tensor(s, device=inputs_embeds.device).reshape(-1).expand(batch)
-                t = torch.as_tensor(t, device=inputs_embeds.device).reshape(-1).expand(batch)
-                inputs_embeds = inputs_embeds + self.time_embed(s, t)[:, None, :].to(inputs_embeds.dtype)
+                # Flow-map time conditioning. Two shapes are accepted and they
+                # mean different things:
+                #   scalar / [B]   -- one time for the whole block, added
+                #                     identically to every position. This is the
+                #                     original behaviour and stays bit-exact.
+                #   [B, q_len]     -- a time PER POSITION. Needed to express a
+                #                     block whose positions are at different
+                #                     stages: verifier-confirmed tokens sit at
+                #                     t = 1, a rejected guess carries its own
+                #                     draft at some interior s, a fresh slot is
+                #                     at s = 0. With one scalar per sequence
+                #                     that state cannot be described at all.
+                s = torch.as_tensor(s, device=inputs_embeds.device)
+                t = torch.as_tensor(t, device=inputs_embeds.device)
+                if s.dim() <= 1 and s.numel() <= batch:
+                    s = s.reshape(-1).expand(batch)
+                    t = t.reshape(-1).expand(batch)
+                    conditioning = self.time_embed(s, t)[:, None, :]
+                    gate = self.time_embed.input_gate(s, t)
+                    gate = None if gate is None else gate[:, None, :]
+                else:
+                    s = s.reshape(batch, -1).expand(batch, q_len)
+                    t = t.reshape(batch, -1).expand(batch, q_len)
+                    conditioning = self.time_embed(s, t)
+                    gate = self.time_embed.input_gate(s, t)
+                if gate is not None:
+                    # Вход УМНОЖАЕТСЯ на функцию от s, а не только сдвигается:
+                    # сложение не может обнулить d(выход)/d(вход), умножение
+                    # может, и без этого verify_kl (требует нуля при s = 0) и
+                    # самокоррекция (требует не-нуля) делят одну ёмкость.
+                    #
+                    # Но ТОЛЬКО на черновых позициях. Якорь — позиция 0 каждого
+                    # блока — несёт настоящий токен, и он единственный чистый:
+                    # кэш обрезан, так что этот токен живёт лишь в своей
+                    # строке. Гейт по всему тензору гасил бы его вместе с
+                    # приором, то есть требование «игнорируй приор при s = 0»
+                    # означало бы «игнорируй и якорь», и разделить эти два
+                    # гейт бы не мог — ровно та степень свободы, ради которой
+                    # он и вводится.
+                    # Ширина блока БЕРЁТСЯ ИЛИ ВЫВОДИТСЯ. Декодный путь
+                    # (`_draft_block` -> `predict`) её не передаёт никогда, и
+                    # под `if diffusion_block_size:` исключение якоря там просто
+                    # не срабатывало: обучение и декод расходились состоянием
+                    # входа у гейтованной конфигурации, причём незаметно, потому что на
+                    # инициализации гейт тождественно единица. При одном блоке
+                    # его ширина и есть длина запроса.
+                    width = int(diffusion_block_size or q_len)
+                    is_draft = (
+                        torch.arange(q_len, device=inputs_embeds.device)
+                        % width != 0
+                    )[None, :, None]
+                    if True:
+                        gate = torch.where(
+                            is_draft, gate.to(inputs_embeds.dtype),
+                            torch.ones((), dtype=inputs_embeds.dtype,
+                                       device=inputs_embeds.device),
+                        )
+                    inputs_embeds = inputs_embeds * gate.to(inputs_embeds.dtype)
+                inputs_embeds = inputs_embeds + conditioning.to(inputs_embeds.dtype)
             flex_block_mask = None
             if causal_limit is not None:
                 if diffusion_block_size is None:
                     raise ValueError("diffusion_block_size is required with causal_limit")
                 if past_key_values is None:
                     raise ValueError("paper FlexAttention DF path requires an AR cache")
-                if self.model.config.model_type != "qwen3":
-                    raise ValueError(
-                        "the paper sparse DF path (causal_limit) requires the "
-                        "patched Qwen3 attention; this backbone is "
-                        f"'{self.model.config.model_type}'"
-                    )
-                if inputs_embeds.is_cuda:
+                # Разреженный путь Qwen3-специфичен: он опирается на патченое
+                # внимание, установленное в __init__. Плотный эквивалент ниже —
+                # обычная аддитивная 4-D маска, которую принимает любой бэкбон
+                # HF, и обе маски проверены на поэлементное совпадение. Поэтому
+                # чужой бэкбон на CUDA НЕ отвергается, а идёт плотным путём:
+                # медленнее, но те же числа. Раньше здесь стояло исключение, и
+                # ни один не-Qwen3 пресет нельзя было ни обучить, ни
+                # воспроизвести на целевой машине вообще.
+                # torch.compile на torch 2.10 отказывается трассировать
+                # flex_attention ("Attempt to trace generator") и роняет обучение
+                # на первом же шаге. Плотная маска проверена на поэлементное
+                # совпадение с разреженной при обоих значениях causal_in_block,
+                # то есть даёт ТЕ ЖЕ числа, только без разреженности. При нашем
+                # контексте в 256 токенов она ничего не стоит, поэтому есть чем
+                # переключиться, не трогая конфиги.
+                use_sparse = (
+                    _df_attention_mode() != "dense"
+                    and inputs_embeds.is_cuda
+                    and self.model.config.model_type == "qwen3"
+                )
+                if use_sparse:
                     flex_block_mask = _make_dual_pass_block_mask(
                         batch,
                         self.model.config.num_attention_heads,
@@ -428,6 +584,7 @@ class FlowDraftAttentionAdapter(nn.Module):
                         committed_len,
                         int(diffusion_block_size),
                         causal_limit,
+                        causal_in_block=causal_in_block,
                     )
                 else:
                     attention_mask = _dense_dual_pass_mask(
@@ -438,7 +595,14 @@ class FlowDraftAttentionAdapter(nn.Module):
                         causal_limit,
                         inputs_embeds.dtype,
                         inputs_embeds.device,
+                        causal_in_block=causal_in_block,
                     )
+            elif causal_in_block:
+                raise ValueError(
+                    "causal_in_block describes the intra-block relation of the "
+                    "isolated-block layout and needs causal_limit to say where "
+                    "each block's AR prefix ends"
+                )
             # Qwen normally materializes a causal 4-D mask before calling
             # each attention layer. The patched DF attention ignores that
             # mask and consumes ``flex_block_mask`` instead, so pass an
@@ -456,15 +620,26 @@ class FlowDraftAttentionAdapter(nn.Module):
             # weight must follow the corresponding backbone parameter rather
             # than ``inputs_embeds`` (which starts on the embedding device).
             backbone_parameters = dict(self.model.named_parameters())
-            out = functional_call(
-                self.model,
-                {
+            # ``weights='ar'`` substitutes NOTHING, so the backbone runs on its
+            # own frozen parameters while still going through the block-geometry
+            # attention above. That is the AR teacher evaluated on an isolated
+            # block — the forward the decode loop spends on verification — and
+            # it is the only way to obtain a target conditioned on the drafter's
+            # own proposal rather than on the corpus.
+            substitution = (
+                {}
+                if weights == "ar"
+                else {
                     name: weight.to(
                         device=backbone_parameters[name].device,
                         dtype=backbone_parameters[name].dtype,
                     )
                     for name, weight in zip(self._df_names, self.df_weights)
-                },
+                }
+            )
+            out = functional_call(
+                self.model,
+                substitution,
                 kwargs=dict(
                     inputs_embeds=inputs_embeds,
                     attention_mask=model_attention_mask,

@@ -5,6 +5,8 @@ from contextlib import contextmanager
 import lightning as L
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
+from torch.utils.checkpoint import checkpoint
 from loguru import logger
 from omegaconf import OmegaConf
 from transformers import DynamicCache
@@ -26,9 +28,9 @@ class FlowDraft(L.LightningModule):
     The categorical flow-map objective lives in :meth:`compute_loss`:
     ``endpoint + lambda * (4*EC + 2*TD)`` — categorical VFM anchors the
     diagonal ``π_{t,t}``, endpoint consistency propagates it to the jumps,
-    and temporal drift keeps the family smooth in ``t``. Optional verifier
-    auxiliaries align either the diagonal or, in block-wise training, the
-    exact one-jump inference map ``π_{0,1}`` with the frozen AR distribution.
+    and temporal drift keeps the family smooth in ``t``. In block-wise training
+    a verifier term aligns the one-jump map ``π_{0,1}`` — the map the decode
+    loop actually executes — with the frozen AR distribution.
 
     Expected batch — a dict with:
         ``input_ids [B, T]`` (long) · ``attention_mask [B, T]`` (long, 1=live)
@@ -72,7 +74,11 @@ class FlowDraft(L.LightningModule):
     @contextmanager
     def _frozen_val_rng(self, batch_idx: int):
         """Make stochastic validation inputs repeatable without perturbing training."""
-        devices = None if self.device.type == "cpu" else [self.device]
+        # An EMPTY device list, not None: with None ``fork_rng`` enumerates every
+        # device of the given type and asks each for its RNG state, and
+        # ``torch.cpu`` exposes no ``get_rng_state``. The CPU generator is forked
+        # regardless, which is the one this needs.
+        devices = [] if self.device.type == "cpu" else [self.device]
         with torch.random.fork_rng(devices=devices, device_type=self.device.type):
             torch.manual_seed(int(self.cfg.seed) * 1_000_003 + batch_idx)
             yield
@@ -133,6 +139,44 @@ class FlowDraft(L.LightningModule):
         if sampler is None:
             raise ValueError(f"unknown time_sampling='{mode}' (sequential | triangle | paper)")
         s, t = sampler(batch, simplex.device)
+        # Прыжок обязан быть прыжком: t - s >= min_jump_gap.
+        #
+        # Пара с s ~ t не является диагональю — диагональ pi_{t,t} обучается
+        # ОТДЕЛЬНЫМ форвардом при (t, t). Пара s ~ t это вырожденный прыжок, и
+        # он не даёт ничего: при t -> s таргет EC приходит из того же вызова
+        # сети, что и предсказание, значит tgt = sg(p) и градиент по логитам
+        # равен p - sg(p) = РОВНО НОЛЬ (замер: 1.9e-9); член TD при этом щупает
+        # исчезающий интервал. При `paper` таких розыгрышей 15.7% при gamma <
+        # 0.05 и 46% при gamma < 0.25 — то есть шестая часть работы шага уходила
+        # в тождественно нулевой градиент. Раньше я гасил это ниже по течению,
+        # гейтом на самом члене; правильное место — здесь, где пара рождается.
+        #
+        # Масштабирование, а не обрезание: s равномерна на [0, t], и умножение
+        # на (t - gap)/t переносит её равномерно на [0, t - gap]. Обрезание же
+        # свалило бы всю вырожденную массу в одну точку на границе.
+        gap = float(self.cfg.train.get("min_jump_gap", 0.0))
+        if gap > 0.0:
+            # ОБЕ времени переносятся, ни одно не обрезается. Кламп по t
+            # сваливал 4.97% розыгрышей ровно в точку (s=0, t=gap) — то самое
+            # схлопывание массы на границе, которого масштабирование избегает
+            # в s|t, но кламп возвращал в маргинале t. Отображение
+            #   t' = gap + (1-gap)t,  s' = (1-gap)s
+            # переносит t равномерно на [gap, 1], сохраняет s|t' равномерной на
+            # [0, t'-gap] и даёт t'-s' = gap + (1-gap)(t-s) >= gap.
+            s = s * (1.0 - gap)
+            t = gap + (1.0 - gap) * t
+        # Stratify t = 1 as an atom. pi_{s,1} is the ONLY map the decode loop
+        # executes, and under every continuous sampler here it has probability
+        # zero — 'paper' puts 1% of draws above t = 0.99. So the endpoint,
+        # consistency and drift terms train t < 1 almost surely and reach the
+        # deployed pair only through the smoothness of a single additive time
+        # vector. Forcing a share of the batch onto t = 1 gives them gradient
+        # where it is used.
+        atom = float(self.cfg.train.get("terminal_time_fraction", 0.0))
+        if atom > 0.0:
+            pick = torch.rand(batch, device=simplex.device) < atom
+            t = torch.where(pick, torch.ones_like(t), t)
+            s = torch.minimum(s, t)
         x0 = self.sample_prior(simplex, attention_mask)
         x_s = (1.0 - s[:, None, None]) * x0 + s[:, None, None] * simplex
         # Same trajectory at time t — the anchor input. Built from DATA, so it
@@ -142,15 +186,198 @@ class FlowDraft(L.LightningModule):
         return x_s, x_t, s, t
 
     def sample_prior(self, simplex, attention_mask=None):
-        """Sample the exact prior consumed by one-jump training and decoding."""
-        x0 = torch.distributions.Dirichlet(
-            torch.ones(simplex.size(-1), device=simplex.device)
-        ).sample(simplex.shape[:2])
+        """Sample the prior consumed by one-jump training and decoding.
+
+        The choice decides whether the interpolant ``x_s = (1-s) x0 + s x1``
+        conceals the answer or hands it over. Writing ``t*`` for the level at
+        which the clean token becomes the argmax of the input, measured at
+        ``V = 151936``:
+
+        ============ ======== ==========================================
+        prior        ``t*``   share of ``t ~ U[0,1]`` that is ambiguous
+        ============ ======== ==========================================
+        dirichlet    7.4e-5   0.007%
+        discunif     0.500    50%
+        gaussian     0.815    81%
+        ============ ======== ==========================================
+
+        Under ``dirichlet`` the prior's largest component is about
+        ``ln(V)/V ≈ 9e-5``, so a spike of size ``s`` on the clean token
+        dominates it almost immediately and every term that reads ``x_s`` is
+        solved by copying the input. ``gaussian`` keeps the largest competing
+        component near ``sqrt(2 ln V) ≈ 4.9``, so the answer stays buried until
+        ``s`` is large; ``discunif`` puts a single competing spike of size
+        ``1 - s`` against the clean ``s``, giving the crossing at one half.
+
+        ``gaussian`` leaves the simplex — the interpolant is then a point in
+        ``R^V``, which the embedding ``x @ E`` and the transport
+        ``x + γ(π - x)`` both accept, and only the model's OUTPUT has to be a
+        distribution.
+
+        Scale matters here in a way it does not in the reference method, whose
+        input projection is trained. Measured at ``V = 151936`` against a token
+        embedding's norm of 1.0, ``x0 @ E`` comes out at 0.004 for
+        ``dirichlet`` (270x too small — the frozen trunk sees essentially the
+        mean embedding, which is one reason the map behaves as a constant),
+        1.00 for ``discunif``, and 392 for an unscaled Gaussian. ``gaussian``
+        is therefore emitted at ``1/sqrt(V)``, matching the ``x/sqrt(V)`` the
+        reference feeds its projection. ``discunif`` needs no scaling at all
+        and is the safer choice against a frozen embedding.
+        """
+        vocab = simplex.size(-1)
+        kind = str(self.cfg.train.get("prior_type", "dirichlet"))
+        shape = simplex.shape[:2]
+        if kind == "dirichlet":
+            x0 = torch.distributions.Dirichlet(
+                torch.ones(vocab, device=simplex.device)
+            ).sample(shape)
+        elif kind == "gaussian":
+            # Scaled by 1/sqrt(V), as the reference implementation feeds
+            # x/sqrt(V) to its input projection. Without it the embedding
+            # x0 @ E has norm ~sqrt(V) times a token's — measured at V=151936,
+            # 391 against 1.0 — and a FROZEN trunk has no way to absorb that.
+            x0 = torch.randn(
+                *shape, vocab, device=simplex.device, dtype=simplex.dtype
+            ) / (vocab ** 0.5)
+        elif kind == "discunif":
+            idx = torch.randint(vocab, shape, device=simplex.device)
+            x0 = F.one_hot(idx, vocab).to(simplex.dtype)
+        else:
+            raise ValueError(
+                f"unknown prior_type='{kind}' "
+                "(dirichlet | gaussian | discunif)"
+            )
         if attention_mask is not None:
             x0 = x0 * attention_mask[..., None].to(x0.dtype)
         return x0
 
     # --- the loss is yours ----------------------------------------------------
+
+    def _teacher_loss(self, teacher_logits, logits, live, sample_weight=None,
+                      position_weight=None):
+        """Match the drafter to the frozen AR path, in one of two senses.
+
+        ``train.teacher_target``:
+
+        * ``soft`` — ``KL(sg(p_AR) || π)``. Minimised at ``π = p_AR``, so with an
+          attainable target this is the complete objective.
+        * ``hard`` — ``CE(argmax p_AR, π)``. Minimised by putting the mode where
+          the verifier's mode is, and indifferent to the rest of the mass.
+        * ``tv`` — total variation ``½ Σ |p_AR − π|``. Speculative sampling
+          accepts a proposal with probability ``Σ min(p, q) = 1 − TV(p, q)``, so
+          for sampled decoding this is not a surrogate for the acceptance rate
+          but the acceptance rate itself, up to sign.
+
+        Which one matches the metric depends on how the drafter will be
+        decoded, because the two verification rules read different things.
+        Greedy accepts on ``argmax π == argmax p_AR`` and ignores the rest of
+        the distribution; speculative sampling reads all of it. Note that
+        neither choice can affect output quality — verification makes the
+        emitted text identical to the AR model's under both rules — so this
+        only ever trades acceptance in one decoding mode against the other.
+
+        The choice matters because the target is NOT attainable: ``p_AR`` at a
+        block position is conditioned on the clean tokens before it, which the
+        drafter does not have, so it can only represent a mixture over the
+        predecessors it is uncertain about. Under that constraint a forward KL
+        spends capacity matching mass that greedy verification never reads, and
+        a blurred mixture can score better on it while its argmax sits on a
+        different token than the verifier's — lower loss, rejected block.
+        Greedy acceptance is exactly ``argmax π == argmax p_AR``, which is what
+        the hard target optimises directly.
+
+        Keep ``soft`` for sampled decoding: the coupled-Gumbel scheme accepts
+        against the whole proposal distribution, not just its mode.
+        """
+        mode = str(self.cfg.train.get("teacher_target", "soft"))
+        if mode not in ("soft", "hard", "tv"):
+            raise ValueError(f"unknown teacher_target='{mode}' (soft | hard | tv)")
+        if not live.any():
+            return logits.sum() * 0.0
+        # Все три режима идут ОДНИМ чанкованным путём. Раньше чанкование было
+        # только у `soft`, и `hard` при бумажном пресете стоил 2.0 ГБ, `tv` --
+        # 5.1 ГБ на вызов: `logits.float()`, копия, которую cross_entropy
+        # заставляет сделать из транспонирования, и две полные fp32-софтмаксы
+        # соответственно.
+        vocab = logits.size(-1)
+        flat_q = logits.reshape(-1, vocab)
+        flat_p = teacher_logits.reshape(-1, vocab)
+        live_f = live.reshape(-1).to(torch.float32)
+        factor = live_f
+        if sample_weight is not None:
+            # Вес примера СЖИМАЕТ член (расписание (1-t)^p гасит учителя),
+            # поэтому в знаменатель не входит.
+            factor = factor * sample_weight[:, None].expand_as(live).reshape(
+                -1).to(torch.float32)
+        if position_weight is not None:
+            # Вес позиции ПЕРЕРАСПРЕДЕЛЯЕТ внутри блока и не должен менять
+            # масштаб члена целиком, иначе баланс с прочими членами поплывёт
+            # вслед за свойством данных. Деление на реализованную массу веса
+            # держит масштаб на месте.
+            w_f = position_weight.expand_as(live).reshape(-1).to(torch.float32)
+            factor = factor * w_f
+            denom = (w_f * live_f).sum().clamp_min(1e-6)
+        else:
+            denom = live_f.sum().clamp_min(1e-6)
+
+        def chunk_term(q_chunk, p_chunk, f_chunk):
+            if mode == "hard":
+                per_token = F.cross_entropy(
+                    q_chunk.float(), p_chunk.argmax(-1), reduction="none",
+                )
+            elif mode == "tv":
+                per_token = 0.5 * (
+                    F.softmax(p_chunk.float(), -1) - F.softmax(q_chunk.float(), -1)
+                ).abs().sum(-1)
+            else:
+                log_q = F.log_softmax(q_chunk.float(), -1)
+                log_p = F.log_softmax(p_chunk.float(), -1)
+                per_token = (log_p.exp() * (log_p - log_q)).sum(-1)
+            return (per_token * f_chunk).sum()
+
+        size = self._kl_chunk_rows(vocab)
+        total = flat_q.new_zeros((), dtype=torch.float32)
+        for start in range(0, flat_q.size(0), size):
+            stop = start + size
+            total = total + checkpoint(
+                chunk_term, flat_q[start:stop], flat_p[start:stop],
+                factor[start:stop], use_reentrant=False,
+            )
+        return total / denom
+
+    def _kl_chunk_rows(self, vocab):
+        """Сколько строк считать за раз в чанкованном KL.
+
+        Константа здесь не работает: кусок стоит `строки * V * 4` байт на
+        тензор, и при V=151936 значение 4096 означает 2.5 ГБ на тензор, то
+        есть весь бумажный пресет (3584 строки) укладывается в ОДИН кусок и
+        чанкование не делает ничего. Бюджет задаётся в байтах на тензор и
+        переводится в строки по фактическому словарю; `train.kl_chunk`, если
+        задан явно, имеет приоритет.
+        """
+        explicit = self.cfg.train.get("kl_chunk", None)
+        if explicit:
+            return int(explicit)
+        budget = int(self.cfg.train.get("kl_chunk_bytes", 256 * 1024 * 1024))
+        return max(256, budget // max(int(vocab), 1) // 4)
+
+    def _assert_finite(self, loss, batch_idx):
+        """Проверка конечности лосса КОЛЛЕКТИВНАЯ.
+
+        NaN под bf16 обычно появляется на одном ранге. Если этот ранг выбросит
+        исключение в одиночку, остальные останутся ждать в all-reduce
+        градиентов, пока не сработает сторож NCCL (порядка получаса), и прогон
+        сообщит о падении не там, где оно случилось. Один маленький all_reduce
+        на шаг стоит дёшево и делает падение одновременным.
+        """
+        bad = torch.zeros((), device=loss.device, dtype=torch.float32)
+        if not torch.isfinite(loss):
+            bad = bad + 1.0
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            bad = trainer.strategy.reduce(bad, reduce_op="sum")
+        if bad.item() > 0:
+            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
 
     def _lambda(self):
         """ECLD weight with optional staging: endpoint inference FIRST, then
@@ -166,8 +393,13 @@ class FlowDraft(L.LightningModule):
         return lam
 
     @staticmethod
-    def _masked_kl(log_p, log_q, live):
+    def _masked_kl(log_p, log_q, live, sample_weight=None):
         """``KL(p || q)`` per position, averaged over live (non-pad) tokens.
+
+        ``sample_weight`` is an optional per-sequence factor ``[B]`` applied
+        before the average. The normaliser stays the live-token count, so a
+        weight below one genuinely shrinks the term rather than being divided
+        back out.
 
         An empty ``live`` mask yields a graph-connected zero, not NaN
         (``mean()`` over an empty tensor silently poisons the weights).
@@ -175,6 +407,9 @@ class FlowDraft(L.LightningModule):
         if not live.any():
             return log_q.sum() * 0.0
         kl = (log_p.exp() * (log_p - log_q)).sum(-1)
+        if sample_weight is not None:
+            kl = kl * sample_weight[:, None].to(kl.dtype)
+            return (kl * live).sum() / live.sum()
         return kl[live].mean()
 
     def _packed_document_layout(self, batch, dtype):
@@ -234,17 +469,50 @@ class FlowDraft(L.LightningModule):
         direction with usable room, shorten the probe at a boundary, and give
         degenerate samples no TD weight.
         """
+        # A finite difference of two softmaxes is only as good as the precision
+        # the logits were computed in. Measured at V = 151936 on realistic
+        # logits, the bf16 rounding alone contributes this much of the term:
+        #
+        #     dt      signal    bf16 noise    SNR
+        #     0.01    0.0019    0.0374        0.05
+        #     0.05    0.0022    0.0084        0.26
+        #     0.10    0.0015    0.0041        0.35
+        #
+        # Under bf16 the term measures rounding, not drift, at EVERY usable
+        # step: the noise scales as 1/dt while the signal does not, so no clamp
+        # rescues it. Refuse rather than train on it silently. The exact fix is
+        # a directional derivative through the time embedding (t is already a
+        # differentiable input, so forward-mode AD gives d_t pi with no
+        # difference at all); until that exists, run this term in fp32.
+        try:
+            precision = str(self.trainer.precision)
+        except RuntimeError:  # not attached to a Trainer (unit tests, probes)
+            precision = "32"
+        if "16" in precision:
+            raise ValueError(
+                f"train.lambda > 0 puts weight on the drift term, but "
+                f"trainer.precision={precision!r} makes it numerically empty: "
+                "the bf16 rounding of the two softmaxes exceeds the drift it is "
+                "differencing by 4-20x at every usable step. Use "
+                "trainer.precision=32, or set train.lambda=0"
+            )
         dt_val = 0.05
         prefer_forward = (t + dt_val <= 1.0) | (1.0 - t >= t - s)
         room = torch.where(prefer_forward, 1.0 - t, t - s)
-        td_live = room >= 1e-3
-        step = room.clamp(max=dt_val).clamp(min=1e-3)
+        # A probe far below dt_val divides a difference of two bf16-derived
+        # softmaxes by that step and then squares it, so a 1e-3 floor amplifies
+        # quantisation noise by about 1e6. Require real room instead of
+        # clamping into it, and drop the samples that lack it from the average
+        # rather than zeroing them while they still count in the denominator.
+        floor = float(self.cfg.train.get("td_min_step", 0.01))
+        td_live = room >= floor
+        step = room.clamp(max=dt_val).clamp(min=floor)
         dt = torch.where(prefer_forward, step, -step)
         pi_dt = forward_dt(dt).float().softmax(-1)
         drift = ((pi_dt - pi) / dt[:, None, None]).pow(2).sum(-1)
-        drift = drift * td_live[:, None]
         weighted = gamma.squeeze(-1).pow(2) * drift
-        return weighted[live].mean() if live.any() else pi.sum() * 0.0
+        keep = live & td_live[:, None]
+        return weighted[keep].mean() if keep.any() else pi.sum() * 0.0
 
     def compute_loss(
         self,
@@ -287,7 +555,7 @@ class FlowDraft(L.LightningModule):
         hence the shift in the anchor. Masking happens only here, at the
         reductions — padding must not contribute to any mean.
         """
-        eps = 1e-4
+        eps = float(self.cfg.train.get("gamma_clamp", 1e-4))
         mask = batch["attention_mask"]
         live = mask.bool()
         log_draft = F.log_softmax(draft_logits.float(), -1)
@@ -328,18 +596,6 @@ class FlowDraft(L.LightningModule):
             if endpoint_live.any()
             else diag_logits.sum() * 0.0
         )
-        ar_kl_weight = self.cfg.train.get("ar_kl_weight", 0.0)
-        if ar_kl_weight:
-            if teacher_logits is None:
-                raise ValueError("teacher logits are required when train.ar_kl_weight > 0")
-            ar_kl = self._masked_kl(
-                F.log_softmax(teacher_logits[:, :-1].float(), -1),
-                F.log_softmax(diag_logits[:, 1:].float(), -1),
-                live[:, 1:],
-            )
-        else:
-            ar_kl = diag_logits.sum() * 0.0
-
         # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
         # the jump must agree with the (stop-grad) expert
         # asked at its own landing point X_{s,t}(x_s) — a level-t input.
@@ -381,15 +637,10 @@ class FlowDraft(L.LightningModule):
         endpoint_weight = self.cfg.train.get(
             "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
         )
-        loss = (
-            endpoint_weight * endpoint
-            + ar_kl_weight * ar_kl
-            + lam * (4.0 * ec + 2.0 * td)
-        )
+        loss = endpoint_weight * endpoint + lam * (4.0 * ec + 2.0 * td)
         self.log_dict(
             {
                 f"{metric_prefix}/endpoint": endpoint,
-                f"{metric_prefix}/ar_kl": ar_kl,
                 f"{metric_prefix}/ec": ec,
                 f"{metric_prefix}/td": td,
                 f"{metric_prefix}/lambda": lam,
@@ -406,11 +657,60 @@ class FlowDraft(L.LightningModule):
 
     @staticmethod
     def _jump_schedule(jumps):
-        """int n -> n equal jumps over linspace(0, 1); list -> validated as-is."""
-        times = torch.linspace(0, 1, jumps + 1).tolist() if isinstance(jumps, int) else list(jumps)
-        if times[0] != 0 or times[-1] != 1 or any(a >= b for a, b in zip(times, times[1:])):
-            raise ValueError(f"jump schedule must increase from 0 to 1, got {times}")
-        return times
+        """Normalise a schedule to a list of ``(s, t)`` refinement passes.
+
+        Three accepted forms:
+
+        * ``int n`` — n equal refinement passes over ``linspace(0, 1)``: ``(0, 1/n),
+          (1/n, 2/n), ...``. Each refinement pass advances the state a little.
+        * ``list of times`` ``[0, u, 1]`` — the same thing written out.
+        * ``list of pairs`` ``[(0, 1), (s, 1)]`` — refinement passes that need NOT chain.
+          ``(s, 1)`` after ``(0, 1)`` means "draft the whole way, then re-enter
+          the family at s carrying that draft", which is a different operation
+          from splitting the interval and the only one the self-correction term
+          trains: it supervises ``π_{s,1}`` on a state built from the model's
+          own completed draft, never on a half-advanced interpolant. A schedule
+          of chained refinement passes asks the map questions at pairs whose inputs it was
+          not shown.
+
+        Every refinement pass must satisfy ``0 <= s < t <= 1``; the first must start at 0
+        and the last must end at 1, so the deployed map is still ``·, 1``.
+        """
+        # Нормализация к обычным питоновским контейнерам, и НА ЛЮБОЙ глубине.
+        # Из конфига сюда приезжает ListConfig, который не является ни list, ни
+        # tuple, поэтому проверка на вложенность ниже его не узнавала: пары
+        # [[s,t],...] уходили в разбор плоского списка времён, где
+        # float(ListConfig) падает. Первая починка снимала только внешнюю
+        # обёртку, а вызывающие делают list(...) заранее — тогда внешний объект
+        # уже обычный список, а ЭЛЕМЕНТЫ всё ещё ListConfig, и падение
+        # повторялось. Проверять надо каждый уровень.
+        if OmegaConf.is_config(jumps):
+            jumps = OmegaConf.to_container(jumps, resolve=True)
+        elif isinstance(jumps, (list, tuple)):
+            jumps = [
+                OmegaConf.to_container(x, resolve=True)
+                if OmegaConf.is_config(x) else x
+                for x in jumps
+            ]
+        if isinstance(jumps, int):
+            times = torch.linspace(0, 1, jumps + 1).tolist()
+            passes = list(zip(times[:-1], times[1:]))
+        else:
+            items = list(jumps)
+            if items and isinstance(items[0], (list, tuple)):
+                passes = [(float(a), float(b)) for a, b in items]
+            else:
+                times = [float(x) for x in items]
+                passes = list(zip(times[:-1], times[1:]))
+        if not passes:
+            raise ValueError("jump schedule must contain at least one refinement pass")
+        if any(not 0.0 <= s < t <= 1.0 for s, t in passes):
+            raise ValueError(f"every refinement pass must satisfy 0 <= s < t <= 1, got {passes}")
+        if passes[0][0] != 0.0 or passes[-1][1] != 1.0:
+            raise ValueError(
+                f"a schedule must start at s=0 and finish at t=1, got {passes}"
+            )
+        return passes
 
     @staticmethod
     def verify_greedy(draft_ids, last_logits, verify_logits):
@@ -543,6 +843,20 @@ class FlowDraft(L.LightningModule):
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
         """Dirichlet noise -> jump schedule via :meth:`predict`.
 
+        ``carry`` — ``(q_prev, n_accepted)`` from the cycle that just ended, the
+        decode-side half of ``onpolicy_kl_weight``. Today every cycle throws its
+        rejected tail away and starts from pure noise, which is the one place
+        where a diffusion drafter is strictly worse informed than it needs to
+        be: it already guessed those tokens, and the verifier already told it
+        where the guess went wrong.
+
+        The shift is ``n_accepted + 1``, not one: the verifier consumed the
+        accepted prefix AND replaced the first mismatch with its own token, so
+        the new block's position ``j`` is the old block's ``n_accepted + 1 + j``.
+        Carried positions enter at ``decode.onpolicy_s`` and fresh ones at 0 --
+        different times in the same block, which is why this needs per-position
+        conditioning. It costs no forward: the state is already in hand.
+
         The final simplex point IS the proposal distribution ``q`` (a convex
         mix of distributions stays on the simplex): greedy takes its argmax,
         sampling draws from it. The shared cache stays AR-only: the adapter
@@ -565,9 +879,33 @@ class FlowDraft(L.LightningModule):
         drafted = block_size - 1
         if drafted <= 0:
             raise ValueError("block_size must be at least 2 (anchor + one draft)")
-        x = torch.distributions.Dirichlet(
-            torch.ones(vocab, device=device)
-        ).sample((1, drafted))
+        decode_cfg = self.cfg.get("decode", {}) if hasattr(self.cfg, "get") else {}
+        # Draw through sample_prior so the decode entry state is the SAME
+        # distribution the model was trained on. Hardcoding a family here would
+        # mismatch train and inference on the one input the deployed map ever
+        # reads, and no metric produced by such a run would mean anything.
+        x = self.sample_prior(
+            torch.zeros(1, drafted, vocab, device=device)
+        )
+        times = list(times)
+        if bool(decode_cfg.get("fixed_prior", False)):
+            # Greedy verification accepts on an argmax match, a criterion with
+            # no randomness in it, so redrawing the prior each cycle only adds
+            # variance to that one input. Freeze it instead — deterministically
+            # per cycle, but still a sample from the training prior rather than
+            # its mean, which for a one-hot prior is the uniform point and for
+            # a Dirichlet prior embeds to the vocabulary mean. Sampled decoding
+            # keeps its randomness from the proposal draw and the coupled
+            # Gumbel noise, neither of which comes from here.
+            # На CPU список устройств ПУСТОЙ, а не None: с None torch пытается
+            # взять torch.cpu.get_rng_state, которого не существует, и
+            # decode.fixed_prior=true падает на процессорном фолбэке.
+            with torch.random.fork_rng(
+                devices=[device] if device.type != "cpu" else [],
+                device_type=device.type,
+            ):
+                torch.manual_seed(int(self.cfg.get("seed", 0)))
+                x = self.sample_prior(torch.zeros(1, drafted, vocab, device=device))
         anchor = None
         if anchor_token is not None:
             anchor = F.one_hot(
@@ -580,7 +918,37 @@ class FlowDraft(L.LightningModule):
             dtype=torch.long,
             device=x.device,
         )
-        for s_i, t_i in zip(times[:-1], times[1:]):
+        previous_t = None
+        for pass_idx, (s_i, t_i) in enumerate(times):
+            if previous_t is not None and abs(s_i - previous_t) > 1e-9:
+                # This refinement pass does not continue the previous one: it RE-ENTERS the
+                # family at s_i. The state it should read is the one training
+                # built at that time — a fresh prior draw mixed with the draft
+                # in hand — not the transported point left by the previous refinement pass,
+                # which sits at a different time and would put the map at a pair
+                # it was never shown. Rebuilding it here is what makes a
+                # schedule like [(0,1), (0.5,1)] the operation it reads as.
+                # Розыгрыш рестарта тоже обязан подчиняться fixed_prior. Он
+                # лежал вне этого блока, поэтому при n > 1 шум второго шага уточнения брался
+                # из глобального RNG, который замер нигде не сеет: конфигурации не были
+                # спарены по этой оси вообще, а у маскирующего драфтера её нет.
+                if bool(decode_cfg.get("fixed_prior", False)):
+                    with torch.random.fork_rng(
+                        devices=[device] if device.type != "cpu" else [],
+                        device_type=device.type,
+                    ):
+                        torch.manual_seed(int(self.cfg.get("seed", 0)) * 7919 + pass_idx)
+                        fresh = self.sample_prior(x)
+                else:
+                    fresh = self.sample_prior(x)
+                x = (1.0 - s_i) * fresh + s_i * x
+                if anchor is not None:
+                    x = torch.cat([anchor, x[:, 1:]], dim=1)
+            previous_t = t_i
+            # One scalar time per refinement pass. A per-position clock existed here for the
+            # carried-tail state; that state is gone (bucket/README.md), and with
+            # it the only caller. Announcing per-position times when the block is
+            # NOT mixed is the conditioning that cost 1.16 TPF when it slipped in.
             x = self.predict(x, mask, s_i, t_i, past_key_values=cache)
             if anchor is not None:
                 x = torch.cat([anchor, x[:, 1:]], dim=1)  # keep the clean position clean
@@ -669,7 +1037,7 @@ class FlowDraft(L.LightningModule):
             if eos_token_id is not None and int(pending) == eos_token_id:
                 return self._finalize(
                     input_ids, emitted, max_new_tokens, eos_token_id, start,
-                    n_forwards, acceptance=acceptance,
+                    n_forwards, acceptance=acceptance, prefill_tokens=1,
                 )
 
         while len(emitted) < max_new_tokens:
@@ -677,7 +1045,7 @@ class FlowDraft(L.LightningModule):
                 cache, block_size, times,
                 sample=temperature > 0 and not coupled, anchor_token=pending,
             )
-            n_forwards += len(times) - 1
+            n_forwards += len(times)
             if temperature > 0 and coupled:
                 # keys = indices of the tokens these positions would emit;
                 # g_all[j] targets generated token (len(emitted) + j)
@@ -738,7 +1106,7 @@ class FlowDraft(L.LightningModule):
                 break
 
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                              acceptance=acceptance)
+                              acceptance=acceptance, prefill_tokens=int(bool(emitted)))
 
     @torch.no_grad()
     def ar_generate(self, text=None, *, input_ids=None, max_new_tokens: int = 128,
@@ -790,7 +1158,8 @@ class FlowDraft(L.LightningModule):
         return self._finalize(input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards)
 
     def _finalize(self, input_ids, emitted, max_new_tokens, eos_token_id, start, n_forwards,
-                  acceptance=None):
+                  acceptance=None, cycle_forwards=None, prefill_tokens=0):
+        produced = len(emitted)
         emitted = emitted[:max_new_tokens]
         if eos_token_id is not None and eos_token_id in emitted:
             emitted = emitted[: emitted.index(eos_token_id) + 1]
@@ -800,6 +1169,22 @@ class FlowDraft(L.LightningModule):
             ),
             "new_tokens": emitted,
             "n_forwards": n_forwards,
+            # End-to-end n_forwards charges the run for the prefill and for the
+            # last cycle in full even though its overflow past max_new_tokens is
+            # discarded above, so tokens/n_forwards depends on how long the
+            # generation was asked to be — two systems are only comparable
+            # through it at an identical max_new_tokens. These two report the
+            # steady-state rate instead: every token the cycles actually
+            # produced, over the forwards those cycles actually cost.
+            # `prefill_tokens` — то, что вышло из ПРЕФИЛЛА, а не из циклов:
+            # первый токен материализуется прямо из распределения префилла и не
+            # стоит ни одного прохода цикла. В числителе установившейся скорости
+            # ему не место — иначе она завышена ровно на `1/produced`, то есть
+            # на 3.1% при 32 новых токенах и на 1.6% при 64, и перестаёт быть
+            # длинно-независимой, чем и объявлена. Замерено: смещение падает
+            # как 1/produced на длинах 32, 64 и 128.
+            "produced_tokens": produced - prefill_tokens,
+            "cycle_forwards": n_forwards - 1 if cycle_forwards is None else cycle_forwards,
             "seconds": time.perf_counter() - start,
         }
         if acceptance is not None:
@@ -819,9 +1204,20 @@ class FlowDraft(L.LightningModule):
         """
         logits = self(x_s, mask, use_df=True, s=s, t=t, past_key_values=past_key_values).logits
         pi = logits.float().softmax(-1)
-        s = torch.as_tensor(s, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
-        t = torch.as_tensor(t, dtype=pi.dtype, device=pi.device).reshape(-1, 1, 1)
-        gamma = (t - s) / (1.0 - s).clamp(min=1e-4)
+        s = torch.as_tensor(s, dtype=pi.dtype, device=pi.device)
+        t = torch.as_tensor(t, dtype=pi.dtype, device=pi.device)
+        # gamma follows the shape of the times: one per sequence broadcasts over
+        # the block as before; one per POSITION gives each position its own
+        # transport, which is what a block of mixed stages needs -- a confirmed
+        # token at t = 1 must be left where it is while a fresh slot moves the
+        # whole way.
+        if s.dim() <= 1 and s.numel() <= pi.size(0):
+            s = s.reshape(-1, 1, 1)
+            t = t.reshape(-1, 1, 1)
+        else:
+            s = s.reshape(pi.size(0), -1, 1)
+            t = t.reshape(pi.size(0), -1, 1)
+        gamma = (t - s) / (1.0 - s).clamp(min=float(self.cfg.train.get("gamma_clamp", 1e-4)))
         return x_s + gamma * (pi - x_s)
 
     def _shared_step(self, batch):
@@ -837,8 +1233,8 @@ class FlowDraft(L.LightningModule):
         )
         teacher_logits = None
         # The frozen teacher is unnecessary for paper-faithful endpoint
-        # training. Keep it for validation metrics and optional AR-KL runs.
-        if not self.training or self.cfg.train.get("ar_kl_weight", 0.0):
+        # training; validation metrics still need it.
+        if not self.training:
             with torch.no_grad(), self._teacher_eval():
                 teacher_logits = self.orthrus(
                     ids,
@@ -870,8 +1266,7 @@ class FlowDraft(L.LightningModule):
     def training_step(self, batch, batch_idx):
         shared = self._shared_step(batch)
         loss = self.compute_loss(batch, *shared)
-        if not torch.isfinite(loss):
-            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
+        self._assert_finite(loss, batch_idx)
         self.log(
             "train/loss",
             loss,
@@ -923,9 +1318,16 @@ class FlowDraft(L.LightningModule):
         # validation batches. ``data.batch_size=1`` is required by the paper
         # recipe, so restricting decoding to batch zero would otherwise turn
         # any requested sample count into a single prompt.
+        # Счётчик делится между рангами: он инициализируется НА КАЖДОМ ранге,
+        # и без деления `val_decode_prompts: 16` означал бы 128 промптов на
+        # восьми GPU. Тогда val/tpf, посчитанный на одной машине, не сравним с
+        # посчитанным на другой -- это была бы другая величина, а не та же с
+        # шумом.
+        world = max(1, int(getattr(self.trainer, "world_size", 1) or 1))
         self._val_decode_remaining = (
             0 if self.trainer.sanity_checking
-            else self.cfg.train.get("val_decode_prompts", 0)
+            else max(1, int(self.cfg.train.get("val_decode_prompts", 0)) // world)
+            if self.cfg.train.get("val_decode_prompts", 0) else 0
         )
         self._val_decode_accs = []
         self._val_decode_tpfs = []
@@ -938,6 +1340,7 @@ class FlowDraft(L.LightningModule):
         self._val_decode_cycle_sums = torch.zeros(max_cycles, dtype=torch.float64)
         self._val_decode_cycle_counts = torch.zeros(max_cycles, dtype=torch.float64)
         self._val_decode_cycle_count = 0
+        self._val_mixed_done = False
 
     def on_validation_epoch_end(self):
         requested = self.cfg.train.get("val_decode_prompts", 0)
@@ -947,9 +1350,10 @@ class FlowDraft(L.LightningModule):
         # Reduce sums and counts instead of averaging rank-local means. This
         # remains correct when the final validation shard is uneven, and all
         # ranks participate even if one rank had no usable prompt.
-        position_hits = self._val_decode_position_hits.to(self.device)
-        cycle_sums = self._val_decode_cycle_sums.to(self.device)
-        cycle_counts = self._val_decode_cycle_counts.to(self.device)
+        accum = self._accum_dtype(self.device)
+        position_hits = self._val_decode_position_hits.to(self.device, accum)
+        cycle_sums = self._val_decode_cycle_sums.to(self.device, accum)
+        cycle_counts = self._val_decode_cycle_counts.to(self.device, accum)
         stats = torch.cat(
             [
                 torch.tensor(
@@ -960,7 +1364,7 @@ class FlowDraft(L.LightningModule):
                         len(self._val_decode_accs),
                         self._val_decode_cycle_count,
                     ],
-                    dtype=torch.float64,
+                    dtype=accum,
                     device=self.device,
                 ),
                 position_hits,
@@ -1027,6 +1431,18 @@ class FlowDraft(L.LightningModule):
         )
 
     @staticmethod
+    def _accum_dtype(device=None):
+        """Widest accumulator this device actually has.
+
+        Sums of counts and of per-token losses are accumulated in float64 for
+        exactness across a whole validation epoch. MPS has no float64 at all --
+        it raises rather than downcasting -- and every such call sat on a code
+        path that only the masked baseline reaches, so the baseline was simply
+        untrainable on Apple silicon while looking like a stalled process.
+        """
+        return torch.float32 if device is not None and device.type == "mps" else torch.float64
+
+    @staticmethod
     def _decode_acceptance_parts(acceptance, drafted, max_cycles):
         """Sufficient statistics for on-policy positional/cycle acceptance.
 
@@ -1053,6 +1469,61 @@ class FlowDraft(L.LightningModule):
         cycle_counts[:observed_cycles] = 1.0
         return position_hits, cycle_sums, cycle_counts, int(accepted.numel())
 
+    def _mixed_val_prompts(self):
+        """Fixed held-out prompts drawn evenly from several benchmark datasets.
+
+        Validation used to decode the first samples of the TRAINING stream, so
+        checkpoint selection was made on the training distribution. With
+        ``train.val_decode_datasets`` set, the decode instead runs on an even
+        mix of the named benchmarks -- the distributions the drafter is judged
+        on. Built once and cached: these are streaming datasets and rebuilding
+        them every validation would dominate the epoch.
+        """
+        cached = getattr(self, "_val_prompt_cache", None)
+        if cached is not None:
+            return cached
+        names = list(self.cfg.train.get("val_decode_datasets", []) or [])
+        if not names:
+            self._val_prompt_cache = []
+            return []
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+        from omegaconf import OmegaConf, open_dict
+        from src.eval import dataset_prompts
+        import os
+
+        total = int(self.cfg.train.get("val_decode_prompts", 0))
+        per = max(1, total // len(names))
+        root = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "configs")
+        prompts = []
+        for name in names:
+            # `train.py:main` уже стоит под @hydra.main, то есть GlobalHydra
+            # инициализирована, и вложенная инициализация валится с
+            # "GlobalHydra is already initialized". Обёртка try ниже ловит
+            # только загрузку датасета, так что это падало бы наружу из
+            # validation_step на ПЕРВОЙ валидации. Под запущенной Hydra
+            # достаточно самого compose: путь поиска уже включает эти конфиги.
+            if GlobalHydra.instance().is_initialized():
+                sub = compose(config_name="eval", overrides=[f"data={name}"])
+            else:
+                with initialize_config_dir(config_dir=root, version_base=None):
+                    sub = compose(config_name="eval", overrides=[f"data={name}"])
+            with open_dict(sub):
+                sub.model = self.cfg.model
+                sub.decode.n_prompts = per
+                sub.decode.prompt_len = 48
+            try:
+                prompts += [(name, p) for _, _, p in dataset_prompts(self, sub)]
+            except Exception as error:  # a dataset that will not load must not
+                logger.warning(f"validation dataset {name!r} skipped: {error}")
+        self._val_prompt_cache = prompts
+        logger.info(
+            f"validation decode uses {len(prompts)} prompts from "
+            f"{len(names)} datasets ({per} each)"
+        )
+        return prompts
+
     @torch.no_grad()
     def _maybe_decode_val(self, batch, batch_idx):
         """The REAL target metrics as validation curves: run the lossless
@@ -1065,8 +1536,45 @@ class FlowDraft(L.LightningModule):
         remaining = getattr(self, "_val_decode_remaining", 0)
         if remaining <= 0:
             return
+        mixed = self._mixed_val_prompts()
+        if mixed:
+            # Смешанный набор фиксирован и не зависит от батча, поэтому он
+            # проходится целиком на ПЕРВОМ валидационном батче, а дальше
+            # валидация ничего не декодирует.
+            if getattr(self, "_val_mixed_done", False):
+                return
+            self._val_mixed_done = True
+            accs, tpfs, decoded = [], [], 0
+            max_new = self.cfg.train.get("val_decode_max_new", 32)
+            block = self.cfg.train.get("block_size", 8)
+            vj = self.cfg.train.get("val_decode_jumps", 1)
+            for _, ids in mixed:
+                out = self.generate(input_ids=ids, block_size=block, jumps=vj,
+                                    max_new_tokens=max_new)
+                if out["acceptance"]:
+                    accs.append(sum(out["acceptance"]) / len(out["acceptance"]))
+                parts = self._decode_acceptance_parts(
+                    out["acceptance"],
+                    drafted=self._val_decode_position_hits.numel(),
+                    max_cycles=self._val_decode_cycle_sums.numel())
+                self._val_decode_position_hits += parts[0]
+                self._val_decode_cycle_sums += parts[1]
+                self._val_decode_cycle_counts += parts[2]
+                self._val_decode_cycle_count += parts[3]
+                tpfs.append(len(out["new_tokens"]) / out["n_forwards"])
+                decoded += 1
+            self._val_decode_remaining = 0
+            self._val_decode_accs.extend(accs)
+            self._val_decode_tpfs.extend(tpfs)
+            return
         max_new = self.cfg.train.get("val_decode_max_new", 32)
         block = self.cfg.train.get("block_size", 8)
+        # The schedule validation decodes with, and therefore the schedule
+        # checkpoint selection and early stopping see. Hardcoding one jump means
+        # a run aiming at multi-step would select on the metric it is not aiming
+        # at: val/tpf is the monitor, and a model better at two jumps can lose
+        # the selection to one that is better at one.
+        val_jumps = self.cfg.train.get("val_decode_jumps", 1)
         accs, tpfs = [], []
         decoded = 0
         for i in range(min(remaining, batch["input_ids"].size(0))):
@@ -1076,7 +1584,7 @@ class FlowDraft(L.LightningModule):
                 continue
             out = self.generate(
                 input_ids=batch["input_ids"][i : i + 1, :plen],
-                block_size=block, jumps=1, max_new_tokens=max_new,
+                block_size=block, jumps=val_jumps, max_new_tokens=max_new,
             )
             if out["acceptance"]:
                 accs.append(sum(out["acceptance"]) / len(out["acceptance"]))

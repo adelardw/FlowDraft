@@ -2,15 +2,13 @@
 
 > Raising the **acceptance ceiling** of lossless parallel decoding by upgrading the *drafter* to a **Categorical Flow Map** — faster generation, provably identical output.
 
-**Documentation:** **English** · [Russian](README.ru.md)
-
 <!-- Badges — TODO: fill in once the repo is public
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> 🚧 **Status: core implementation landed and smoke-verified** — adapter, three training variants (`flowdraft`, `flowdraft_block_wise`, and `orthrus`; trained end-to-end on real data: SmolLM2-135M + Nemotron), lossless decoding (**bitwise** at greedy AND at sampling via Gumbel coupling; `jumps+1` forwards per cycle), evaluation harness (mean±std, JSONL results + report plots), experiment presets for every stage of the task. GPU experiments pending; **Results** are TBD.
+> **Status: two scale points measured, one of them to a converged budget.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -19,9 +17,14 @@
 
 ## Table of contents
 
+- [Results, first scale point: SmolLM2-135M](#results-first-scale-point-smollm2-135m-august-2026) — ten runs, three seeds, the multi-step claims
+- [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
+- [Results at a converged budget: Qwen3-0.6B to 80,000 steps](#results-at-a-converged-budget-qwen3-06b-to-80000-steps-september-2026) — both arms to convergence, and the schedule that was costing a pass
+- [Porting to Qwen3-1.7B](#porting-to-qwen3-17b-the-papers-own-scale) — hyperparameters, hardware, memory
+- [Defects found and fixed](#defects-found-and-fixed)
 - [Overview](#overview)
-- [Quickstart](#quickstart)
-- [Experiments (task stages)](#experiments-task-stages)
+- [Quickstart](#quickstart) — setup, sparse attention, training, validation, statistics, curves
+- [Experiments](#experiments) — the presets and what each one tests
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
@@ -29,19 +32,422 @@
 - [CFM training, in brief](#cfm-training-in-brief)
 - [Goals](#goals)
 - [Expected deliverables](#expected-deliverables)
-- [Method](#method) 🚧
+- [Method](#method)
 - [Repository structure](#repository-structure)
-- [Installation](#installation) 🚧
-- [Usage](#usage) 🚧
-- [Training](#training) 🚧
+- [Installation](#installation)
+- [Usage](#usage)
+- [Training](#training)
 - [Configuration reference](#configuration-reference)
 - [Inference parameters, in plain words](#inference-parameters-in-plain-words)
-- [Evaluation](#evaluation) 🚧
-- [Results](#results) 🚧
+- [Evaluation](#evaluation)
+- [Results](#results)
 - [References](#references)
 - [Team](#team)
 - [Acknowledgments](#acknowledgments)
 - [License](#license) 🚧
+
+## Results, first scale point: SmolLM2-135M (August 2026)
+
+Ten training runs on SmolLM2-135M at 20k steps, three of them replicated across
+three seeds. Measured on 460 tasks from six benchmarks: 56,000 per-prompt
+observations at one seed, plus 144 further measurements across seeds at the
+common horizon. Full write-up, objective and mathematics:
+[EXPERIMENTS.md](EXPERIMENTS.md).
+
+**Headline.** Orthrus concludes that single-step projection is optimal, and
+measures it in tokens per forward: its Table 3 puts a two-pass variant at 3.53
+against 6.35 for one pass. **On that metric our measurements agree with the
+paper, for every configuration including our own** — extra decode passes always
+cost more than they return. What a continuous state changes is *acceptance*:
+trained on its own refinement, it keeps gaining as passes are added (1.58 → 2.51
+from one pass to four) where the masked drafter is flat (1.72 → 1.79) and an
+untrained continuous state collapses (1.56 → 1.23). Separately, the multi-step
+*training* term raises throughput at a single pass — by +3.1% on the continuous
+state, where the comparison is matched, and by +1.6% on the masked one once its
+control is matched too, against the +8.8% an unmatched comparison shows.
+Intervals below use the **training seed** as the unit of observation (three
+seeds, df = 2), so they describe the method rather than one trained model.
+
+**Scale, stated plainly.** The paper reports an average TPF of 3.89 on
+Qwen3-1.7B greedy — roughly 6.8 accepted tokens per cycle. This bench, on
+SmolLM2-135M, sits at 1.22 and 1.53. That is a different operating regime, and
+it is the *favourable* one for multi-step: an extra pass pays only when it adds
+more accepted tokens than the current TPF, which is a far higher bar at their
+point than at ours. Multi-step still fails to pay here.
+
+| contrast (three refinement passes, 20k steps) | Δ accepted tokens | 95% CI | p |
+|---|---|---|---|
+| multi-step training, continuous state | **+1.138** | ± 0.109 | 0.0005 |
+| best run vs reproduced Orthrus | **+0.835** | ± 0.085 | 0.0006 |
+| continuous state vs masking, same objective | +0.612 | ± 0.065 | 0.0006 |
+| masked + multi-step vs reproduced Orthrus | +0.223 | ± 0.021 | 0.0005 |
+
+The last row is a method against a published baseline, not an isolated
+mechanism, and it used to be labelled as one. Those two runs differ in three
+things at once — the output projection, the acceptance profile and the
+chain-tail weight — and against a control matched on all three the multi-step
+term is worth **+0.046**, not +0.223. Four fifths of the row is the bundle. The
+correction and its caveats are in
+[EXPERIMENTS.md](EXPERIMENTS.md); the other three rows are matched.
+
+Going from one refinement pass to four, acceptance grows by **+0.893** with a
+continuous state trained on the procedure, by +0.070 with masking, and **falls
+by 0.563** for the same continuous architecture left untrained on it — on all
+three seeds.
+
+**Two different things wear the same name, and they pull opposite ways.**
+Multi-step *training* — the loss term — **raises** throughput. Multi-step
+*decoding* — spending extra passes at inference — lowers it.
+
+At one pass, which is where every method is fastest, the masked + multi-step run
+is worth **+0.107 tokens per forward over the reproduced Orthrus (+8.8%, t = 129
+with the seed as the unit)**. That comparison carries the same three-way
+difference as the acceptance row above, so it measures the method rather than
+the term: against a control matched on projections, profile and tail — one seed,
+so a size and not an interval — the multi-step term alone is worth **+1.6%**. On
+the continuous state, where the comparison *is* matched, the term is worth
++0.038 (+3.1%). The best throughput measured in the study is masked +
+multi-step at a single pass: **1.327 against Orthrus's 1.219**.
+
+Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
+while acceptance grows slower than `n`, so every schedule beyond one pass drops
+below plain decoding. That is what the prefix-fixing lemma predicts — `TPF = 1`
+is a floor, not a speedup mechanism. The continuous state loses the least
+(1.257 → 0.675 against Orthrus's 1.219 → 0.507), which is exactly why its large
+acceptance advantage does not convert into speed.
+
+**Wall-clock is a separate question and is not settled here.** On this bench —
+MPS, a 135M backbone — a single pass runs at 1.211× plain decoding for masked +
+multi-step against 1.209× for Orthrus: the throughput gain does not show up in
+seconds, because at 135M a forward is dominated by fixed overhead rather than by
+arithmetic. Tokens per forward is the hardware-independent number; turning it
+into wall-clock needs the Qwen3-1.7B run, which has not happened.
+
+**A reversal worth noting.** At a single pass masking *wins* (−0.148 ± 0.047).
+The advantage of a continuous state appears only with refinement and grows with
+it: −0.148 → +0.612 → +0.675 at one, three and four passes.
+
+![acceptance and throughput vs refinement passes](results/figures/multistep.png)
+![paired contrasts with the seed as the unit](results/figures/contrasts.png)
+![acceptance during training, per experiment and seed](results/figures/curves_seeds.png)
+![per-benchmark breakdown](results/figures/per_benchmark.png)
+![measured horizon](results/figures/horizon.png)
+
+Training curves for every logged loss term and every logged metric, across all
+three seeds, are in [step 6 of the Quickstart](#6-training-curves-and-figures):
+colour is the experiment, line style is the seed, so how tightly the three
+styles of one colour overlap *is* the between-seed spread.
+
+Untrained multi-step refinement is not merely worse but *unpredictably* worse:
+at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
+every other run stays within 0.05.
+
+## Results, second scale point: Qwen3-0.6B (August 2026)
+
+**This is a scale check, not a second set of claims.** One training seed, so
+nothing here carries a between-seed interval and nothing here should be read as
+independent confirmation at the strength of the 135M study. What it can do — and
+does — is show that the mechanism survives a 4.4× larger backbone, and that the
+direction of every contrast is the same.
+
+Five configurations at a **matched budget of 10,000 optimizer steps**, effective
+batch 16 — 41M tokens, 0.231 per trainable parameter against the 135M bench's
+0.386. Measured exactly as the first scale point: 460 prompts from six
+benchmarks at four refinement schedules, 120 decode measurements, output
+identical to greedy AR in every one of them.
+
+**The signature reproduces at 0.6B.** Extra refinement passes keep paying only
+for the drafter trained on its own refinement; the other configurations are flat
+whatever their objective.
+
+| accepted tokens per cycle | 1 pass | 2 | 3 | 4 passes | growth |
+|---|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.837 | 1.850 | 1.883 | 1.900 | +0.062 ± 0.010 |
+| masked + multi-step training | 2.007 | 2.023 | 2.045 | 2.081 | +0.071 ± 0.013 |
+| continuous state, no multi-step | 1.705 | 1.724 | 1.749 | 1.749 | +0.035 ± 0.015 |
+| continuous + multi-step (Q,K,V,O) | 1.952 | 2.501 | 2.882 | 2.997 | +0.995 ± 0.048 |
+| **continuous + multi-step (Q,K,V)** | **2.088** | **2.772** | **3.288** | **3.557** | **+1.414 ± 0.053** |
+
+Multi-step training on the *masked* state grows no faster than Orthrus without
+it at all. The term is not what pays — the state that carries it is.
+
+The same measurements in throughput, which is what a deployment pays in. One
+pass is the operating point for every configuration; beyond it the extra
+forwards cost more than the acceptance they buy, and by four passes everything
+is below plain autoregressive decoding.
+
+| tokens per forward | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.419 | 0.950 | 0.721 | 0.580 |
+| masked + multi-step training | 1.504 | 1.008 | 0.761 | 0.616 |
+| continuous state, no multi-step | 1.353 | 0.908 | 0.687 | 0.550 |
+| continuous + multi-step (Q,K,V,O) | 1.476 | 1.167 | 0.971 | 0.799 |
+| **continuous + multi-step (Q,K,V)** | **1.544** | **1.257** | **1.072** | **0.911** |
+
+
+**The output projection was costing us, and dropping it removes the confound.**
+Every configuration except the reproduced baseline used to adapt Q, K, V *and
+O*, a third more trainable head than the paper's three projections — so "we beat
+Orthrus" was never a matched claim. Training the same continuous multi-step
+configuration on Q, K, V alone makes it **better**, not worse, and the
+comparison against the baseline is now like-for-like:
+
+| contrast | 1 pass | 4 passes |
+|---|---|---|
+| **continuous + multi-step vs Orthrus, same projections** | **+0.243** ± 0.025 | **+1.595** ± 0.059 |
+| cost of adapting O as well | +0.140 ± 0.027 | +0.559 ± 0.047 |
+| continuous vs masked, both multi-step | +0.081 ± 0.026 | +1.424 ± 0.053 |
+| multi-step training, continuous state (Q,K,V,O) | +0.241 ± 0.027 | +1.200 ± 0.054 |
+
+**Compared with 135M, at the same schedule.** The first scale point states its
+contrasts at three refinement passes, so these are the numbers to set beside
+them — not the four-pass column above, which would flatter this backbone:
+
+| contrast, three refinement passes | SmolLM2-135M | Qwen3-0.6B |
+|---|---|---|
+| multi-step training, continuous state (Q,K,V,O) | +1.138 ± 0.109 | +1.080 ± 0.049 |
+| best run vs reproduced Orthrus | +0.835 ± 0.085 | +0.936 ± 0.051 |
+| the same with matched projections (Q,K,V) | — | +1.356 ± 0.051 |
+
+The multi-step contrast is the same at both scales within its intervals — it
+does not shrink, and it does not grow either. What does grow is the margin over
+the baseline, and most of that comes from dropping the output projection.
+
+The earlier reversal on this backbone — an untrained-looking continuous branch
+on a laptop run — was undertraining, not a property of the method: that run saw
+0.058 tokens per trainable parameter, 6.5× less than the 135M bench.
+
+**Extra passes still do not pay in throughput, for any configuration.** Tokens
+per forward falls from 1.544 to 0.911 for the best run, below plain decoding by
+four passes.
+The break-even condition `A(n+1) − A(n) > TPF(n)` fails at every transition. One
+pass remains the operating point, and there the best run is **1.544 against
+Orthrus's 1.419** — +8.8%, the same margin the 135M bench reported for its own
+best single-pass configuration.
+
+**Limits, stated up front.** One seed, so the between-run intervals use the
+prompt as the unit of observation and do not carry between-seed spread; the
+growth contrasts are within-model and paired, which is what they are for. The
+Q,K,V run still differs from the baseline in position weights and a chain-tail
+weight even though the projections now match. And nothing has converged —
+validation loss is still falling for all of them at 10k, so this is a matched
+budget rather than a settled state. Whether O would catch up given more steps is
+open: it carries 49% more trainable parameters and is behind on held-out
+acceptance while *ahead* on teacher-forced agreement, which is the opposite of
+what a simply-undertrained model looks like, but two budgets would settle it and
+we measured one.
+
+![Qwen3-0.6B: acceptance and throughput vs refinement passes](results/figures/qwen06_passes.png)
+![Qwen3-0.6B: per-benchmark breakdown at four refinement passes](results/figures/qwen06_per_benchmark.png)
+![Qwen3-0.6B: acceptance as the training loop sees it and as decoding delivers it](results/figures/qwen06_acceptance.png)
+![Qwen3-0.6B: teacher-forced agreement and validation loss during training](results/figures/qwen06_training.png)
+
+The per-benchmark figure answers whether the average is carried by one dataset:
+it is not — the ordering is the same on all six, and the Q,K,V run leads
+everywhere. Whiskers there are 95% intervals over prompts within a benchmark,
+so they show measurement spread, not the between-seed spread the 135M figures
+carry.
+
+The last two figures are the caution. In-training teacher-forced agreement
+ranks the configurations differently from held-out decoding — it puts Orthrus
+first at every step, while decoding puts it fourth — which is the same proxy
+failure the 135M study documents, now visible on a second backbone. In-training
+acceptance is read from eight held-out sequences and is quantised to 1/8, so it
+shows a trajectory and nothing finer; the decode measurement beside it rests on
+460 prompts.
+
+The budget caveat this section ends on is lifted in the next one: the reproduced
+baseline and the Q,K,V flow map were both carried to 80,000 steps and measured
+again, with a decode schedule that stays inside the range the refinement term was
+trained on.
+
+## Results at a converged budget: Qwen3-0.6B to 80,000 steps (September 2026)
+
+**What this section adds.** The 10k section above is a matched-budget snapshot of
+five configurations; it ends by saying nothing has converged. This one takes the
+two configurations that matter — the reproduced Orthrus baseline and the flow map
+on the same three projections — to **80,000 optimizer steps each**, and measures
+them the same way. Orthrus spent 74.9 hours of training across nine sessions, the
+flow map 110.5 across twelve; the step counts are identical, which is what the
+comparison rests on. Two things are new besides the budget: a **decode schedule
+that stays inside the range the refinement term was trained on**, and the first
+wall-clock numbers from a real GPU rather than a laptop.
+
+**Acceptance.** Sixty measurements, 460 prompts from six benchmarks, every one
+bitwise-identical to greedy AR.
+
+| accepted tokens per cycle | 1 pass | 2 | 3 | 4 passes | growth |
+|---|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 2.201 | 2.215 | 2.258 | 2.312 | +0.096 ± 0.017 |
+| **continuous state + multi-step (Q,K,V)** | **2.576** | **3.265** | **3.740** | **4.189** | **+1.559 ± 0.066** |
+
+Paired by prompt, the margin is **+0.360 ± 0.035** at one pass (ahead on 81% of
+prompts), **+0.998 ± 0.047** at two (99%), **+1.423 ± 0.059** at three and
+**+1.823 ± 0.073** at four — the last two on **all 460 prompts without a single
+exception**. The per-benchmark breakdown at three passes is uniform: math500
++1.732, aime25 +1.742, aime24 +1.612, mbpp +1.323, gsm8k +1.294, humaneval
++1.190.
+
+**The margin did not shrink with training — it grew.** Against the 10k section:
+at one pass +0.243 → **+0.360**, at three +1.356 → **+1.423**. An intermediate
+measurement taken at 42k against 33k steps appeared to show the opposite, but
+those budgets were not matched and the apparent narrowing was the gap in steps,
+not a property of the method.
+
+**Throughput, and the schedule that was costing us a pass.** The four-pass
+schedule used in every earlier table enters the refinement chain at `s = 0.34`.
+Training places its two refinement entries in `[0.5, 0.75)` and `[0.75, 1)` —
+`train.selfcorrect_s_min` is 0.5 — so that entry asks the drafter to refine from
+a state it has never seen, where two thirds of the input is prior noise arriving
+through a frozen embedding. It costs **−0.733 ± 0.055** accepted tokens against
+the three-pass schedule, degrading 90–97% of the prompts on every one of the six
+benchmarks. Moving the same entry inside the trained range turns a loss into the
+best result of the campaign: **2.974 → 4.189**.
+
+Orthrus is the control that makes this an explanation rather than a story: it has
+no self-correction and no `s_min`, and its two four-pass schedules return **the
+identical number on every one of the 460 prompts** (`+0.000 ± 0.000`). Only the
+number of passes reaches it; where they start does not. That is also direct
+evidence, with no theory in it, that the continuous branch is a map in `s` rather
+than a repeated projection under another name.
+
+| tokens per forward | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.601 | 1.072 | 0.814 | 0.662 |
+| **continuous state + multi-step (Q,K,V)** | **1.788** | **1.422** | **1.185** | **1.038** |
+
+The break-even condition `A(n+1) − A(n) > TPF(n)` still fails at every transition
+for both arms, so **one pass remains the operating point** and the paper's
+conclusion about single-step projection stands. What changes is the penalty: the
+flow map stays above plain decoding at every schedule, where the baseline drops
+below it from three passes on.
+
+**Wall-clock, measured on a T4 rather than a laptop.** The 135M section reports
+that its throughput gain did not show up in seconds, because at that size a
+forward is dominated by fixed overhead. On a real GPU it does:
+
+| wall-clock speedup over plain decoding | 1 pass | 2 | 3 | 4 passes |
+|---|---|---|---|---|
+| Orthrus, reproduced (Q,K,V) | 1.347 | 0.906 | 0.693 | 0.564 |
+| **continuous state + multi-step (Q,K,V)** | **1.440** | **1.130** | **0.929** | **0.805** |
+
+Both arms are faster than autoregressive decoding at one pass; only the flow map
+is still faster at two. These numbers are a T4 at `float32` with the dense
+attention path, batch one — the regime in which decoding is bound by reading the
+weights, not by arithmetic.
+
+![Qwen3-0.6B at 80k: acceptance, throughput and wall-clock against refinement passes](results/figures/qwen06_80k_passes.png)
+![Qwen3-0.6B at 80k: the cost of a decode schedule that leaves the trained range](results/figures/qwen06_80k_schedule.png)
+![Qwen3-0.6B at 80k: both arms per benchmark, and the paired margin, at three refinement passes](results/figures/qwen06_80k_per_benchmark.png)
+
+**Limits, unchanged from the section above.** One training seed per arm, so the
+intervals use the prompt as the unit of observation and answer "will this hold on
+other tasks", never "will this hold on another training run". The two arms still
+differ in position weights and a chain-tail weight even though the projections
+match. And the four-pass column of every earlier table in this README — 10k
+included — was measured with the out-of-range schedule and therefore understates
+the method; the growth it reports for the flow map is roughly a quarter of what
+the corrected schedule delivers.
+
+## Porting to Qwen3-1.7B, the paper's own scale
+
+The four experiments that carry the claims have Qwen presets reproducing the
+paper's Table 4 hyperparameters exactly (2048 tokens, 256 anchor blocks, block
+size 32, two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup,
+gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
+
+```bash
+# reference point: Orthrus verbatim — W_Q, W_K, W_V only
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
+
+# masked drafter trained on its own refinement procedure
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep
+
+# continuous state, verifier alignment only — the ablation
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft
+
+# continuous state trained on its own refinement procedure — the main result
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep
+```
+
+Measure a checkpoint. `model.backbone.dtype=float32` is required for the
+losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
+agreement on near-ties. `decode.jumps` takes restart pairs; an integer expands
+to passes at `t<1` that nothing in the objective trains when the consistency
+terms are off.
+
+```bash
+./hf-auth.sh uv run python src/eval.py \
+    checkpoint=checkpoints/qwen-flow-selfcorrect/last.ckpt \
+    data=math500 decode.block_size=32 decode.n_prompts=100 \
+    "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+    model.backbone.dtype=float32 \
+    per_prompt_file=results/qwen-per-prompt.jsonl
+
+uv run python bench/analyze.py --data results   # CIs, Holm, RM-ANOVA, bootstrap
+```
+
+**Hardware the paper used, and what changes on an A100.** Orthrus trained on a
+single node of **8×H200** with FSDP-2, micro-batch 1 and 16 accumulation steps,
+using FlexAttention with the **FlashAttention-4** backend for its custom masks.
+FA4 needs Hopper or newer, so on an A100 it is simply unavailable — and this
+repository already defaults to `flex_attention_backend=triton`, which is the
+correct choice there. That is a speed and availability difference, not a
+fidelity one: the sparse and dense masks were checked against each other over
+4,981 (query, key) pairs with zero disagreement.
+
+Global batch 128 is micro-batch 1 with accumulation 128 on one device or 16 on
+eight, and the per-device footprint is identical, so a single A100 can hold the
+run — it simply takes eight times as long.
+
+**Memory, single device, micro-batch 1.** Weights and optimizer state come to
+**6.2 GiB**: 3.17 for the frozen bf16 backbone, 0.44 for the 235M trainable
+projections, and 2.62 for the fp32 master copy plus AdamW's two moments. What
+the arithmetic does not cover is activations, and there the diffusion path is
+**four times the length of the autoregressive one** — 256 blocks × 32 = 8,192
+rows against 2,048 tokens. That, not the weights, decides whether a 40 GB card
+is enough, and it should be measured rather than argued: run 20 steps with
+`trainer.accumulate_grad_batches=1` and read the peak.
+
+**One knob does not transfer.** `acceptance_profile` states the acceptance
+regime the position weights aim at. It is 0.8 on the 135M bench and 0.93 in the
+Qwen presets, interpolated from the paper's own numbers (TPF 6.35 at acceptance
+length 11.7 solves to a = 0.929). Getting it wrong is not free: at 0.93 the
+deep positions carry ~44% of the gradient mass, at 0.6 about 3%. Every run logs
+per-position acceptance, so derive it from the data and retrain if it moved.
+
+**Untested on this hardware.** Collective operations, the rank seed offset and
+the sparse FlexAttention path are no-ops on a single MPS device and have never
+been exercised. Run one short job before committing to a long one.
+
+## Defects found and fixed
+
+Each with a measured before and after:
+
+| | before | after |
+|---|---|---|
+| commit widths in multi-step training | `[16, 31]` — the second pass supervised a block with no masks left | `[10, 21]`, matching decode exactly |
+| validation schedule given as an integer | two passes of three ran at `t<1`, where no term provides gradient | restart pairs matching what is trained |
+| position weights across the two branches | different dtype, 2.828 vs 2.824 | bitwise identical |
+| mixed-benchmark validation | crashed on nested Hydra initialisation | works |
+| schedule parsing for pair form | crashed on `ListConfig` | all five input forms |
+| dead forward when consistency terms are off | 3 and 7 backbone forwards per step | 2 and 6; step time 0.18 s → 0.11 s |
+| time conditioning consumed the global RNG | one architecture saw different data at the same seed | reseed after model construction |
+| `eval.py` | measured a block-32 model at block 8; crashed writing paired schedules | fixed |
+| `min_jump_gap` | justification was wrong: the gradient at `s≈t` is `O(t−s)`, not zero | left at 0 |
+
+Portability: the CUDA path no longer refuses non-Qwen3 backbones; the
+finite-loss check and the crash-checkpoint decision are collective; the seed is
+offset by rank; all three teacher modes are chunked (6.09 GB → 0.75 GB at the
+paper preset); `val_check_interval` in the paper presets counted loader batches
+— 3.9 optimizer steps instead of 250.
+
+Losslessness needs `model.backbone.dtype=float32`: under bf16 the verifier's
+arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6).
+
+Rejected configurations live in [bucket/](bucket/) with their numbers.
+Objective assumptions that code cannot remove are in
+section 6 of [EXPERIMENTS.md](EXPERIMENTS.md), including one measured and found unsatisfied.
 
 ## Overview
 
@@ -53,133 +459,306 @@ Crucially, the AR model is what does the verifying, so it is kept **frozen throu
 
 ## Quickstart
 
+The full campaign, in the order it has to run. Every step is resumable on its
+own: training restarts from `last.ckpt`, and measurement skips any combination
+already present in its output file, so an interrupted sweep is re-launched with
+the same command.
+
+### 1. Setup (once)
+
 ```bash
-# 1. Setup (once)
 git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
 uv sync
-echo "HF_TOKEN=hf_..." > .env        # gated meta-llama access
-./hf-auth.sh                         # verify: prints your HF username
-
-# 2. Check inference works — the UNTRAINED drafter is already lossless (just slow)
-./hf-auth.sh uv run python main.py -p "Once upon a time"
-#    -> generation + [lossless vs greedy AR: PASS]
-
-# 3. Train FlowDraft (full-sequence recipe; GPU recommended)
-./hf-auth.sh uv run python src/train.py \
-    trainer.max_steps=10000 data.batch_size=8
-#    watch: loss/endpoint ↓, loss/ec ↓, loss/td sane, val/teacher_agreement ↑
-#    checkpoints (FP32 DF head + Adam moments; no frozen backbone) land in checkpoints/
-#    our ADDITION beyond the task — training in the exact inference geometry:
-#    append train.variant=flowdraft_block_wise
-#    epochs on top of streaming (nothing is downloaded ahead): a fixed pool of
-#    N samples repeated M times, each repetition in a new order —
-#    ./hf-auth.sh uv run python src/train.py \
-#        data.train_size=471952 trainer.max_epochs=2 trainer.max_steps=7375
-
-For multi-GPU training, let Lightning run DDP and specify the GPU count:
-
-```bash
-./hf-auth.sh uv run python src/train.py \
-    trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
-    data.batch_size=8 trainer.max_steps=10000
+echo "HF_TOKEN=hf_..." > .env          # gated backbone access
+./hf-auth.sh                           # verify: prints your HF username
 ```
 
-Training always disables `model.backbone.device_map`: Hugging Face device maps are inference sharding, while DDP needs one complete model replica per GPU. Streaming train and validation datasets are split into disjoint, equal rank shards (and then partitioned among DataLoader workers). The shown `data.batch_size` is per GPU; use `trainer.accumulate_grad_batches` to reach a larger effective global batch.
+Check inference before training anything — the **untrained** drafter is already
+lossless, just slow:
 
-## Sparse-attention setup
+```bash
+./hf-auth.sh uv run python main.py -p "Once upon a time"
+#   -> generation + [lossless vs greedy AR: PASS]
+```
 
-The paper-style `+experiment=orthrus` uses PyTorch **FlexAttention** for its
-256 isolated masked blocks. The stable default is FlexAttention's Triton
-backend on every CUDA architecture. It has the same sparse-mask semantics as
-the newer FlashAttention-4 path.
+### 2. Sparse attention: FlexAttention and FlashAttention-4
 
-FA4 can be tested as an explicit H100/H200/Blackwell performance opt-in with
-`model.adapter.flex_attention_backend=flash`. Install it manually on the CUDA
-node (it is deliberately not a project dependency, so CPU/macOS development
-environments remain lightweight):
+The masked baseline drafts up to 256 isolated blocks per step, so its attention
+mask is sparse by construction. Three backends implement the *same* mask —
+causal into the cached prefix, bidirectional within a block, nothing across
+blocks — and differ only in speed:
+
+| backend | override | where it runs |
+|---|---|---|
+| FlexAttention + Triton | `model.adapter.flex_attention_backend=triton` | every CUDA architecture; the stable default |
+| FlashAttention-4 | `model.adapter.flex_attention_backend=flash` | Hopper / Blackwell only (compute capability >= 9) |
+| dense additive mask | chosen automatically | CPU, Apple Silicon, CUDA builds without FlexAttention |
+
+FA4 ships as a prerelease and is deliberately **not** a project dependency, so
+CPU and macOS environments stay lightweight. On the CUDA node:
 
 ```bash
 uv pip install ninja packaging
-# FA4 is currently distributed as a prerelease.
 uv pip install --prerelease=allow --no-build-isolation "flash-attn-4[cu13]"
-```
 
-Verify the required training API before launching a run:
-
-```bash
+# verify BOTH before committing to a long run
 uv run python -c "from torch.nn.attention.flex_attention import flex_attention; print('FlexAttention: OK')"
 uv run python -c "import flash_attn; print('flash-attn: OK')"
 ```
 
-`flash-attn-4` accelerates the Hopper/Blackwell backend; FlexAttention is the
-required component for sparse baseline training. CPU, Apple Silicon, and
-CUDA builds without FlexAttention use neither of these paths.
+Then append `model.adapter.flex_attention_backend=flash` to the training
+commands below. Asking for `flash` on a pre-Hopper card is refused with a
+message rather than silently downgraded.
 
-# 4. Measure acceptance / TPF vs the AR baseline (lossless asserted bitwise)
-./hf-auth.sh uv run python src/eval.py checkpoint=checkpoints/last.ckpt
+### 3. Train every experiment
 
-# 5. Generate with the trained drafter (greedy; add --temperature for sampling)
-./hf-auth.sh uv run python main.py -p "..." \
-    --checkpoint checkpoints/last.ckpt --jumps 2
+One command per configuration, each self-contained. Every configuration lives in
+`src/configs/experiment/`; the command differs only in the preset name, because
+everything a comparison must hold fixed lives in the shared base the preset
+inherits.
+
+#### SmolLM2-135M — the first scale point
+
+Drop `model.adapter.flex_attention_backend` here: at this scale the dense mask
+is used and the override does nothing. To replicate a configuration on another
+seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
+
+```bash
+# Orthrus EXACTLY as published — not one of our additions is present. This is
+# the only point at which the reproduction is compared with the paper.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
+    output_dir=checkpoints/smollm_orthrus
+
+# Baseline plus the multi-step term, in the MASKED state. Against the line
+# above this is the multi-step effect where the state cannot carry a draft.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus_multistep \
+    output_dir=checkpoints/smollm_orthrus_multistep
+
+
+# Flow map WITHOUT multi-step: only the alignment on the jump that ends a
+# decode cycle. The ablation the main claim is measured against.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft \
+    output_dir=checkpoints/smollm_flowdraft
+
+# THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
+# procedure.
+./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
+    output_dir=checkpoints/smollm_flowdraft_multistep
+
 ```
+
+
+#### Qwen3-0.6B — the second scale point
+
+The bench geometry of the 135M runs on a larger backbone: block size 32, one
+anchor block, context 256, effective batch 16. Not the paper's setup — do not
+compare these against its Table 1. Trained on Kaggle T4s, which is why the
+batch is split: 16×1 where memory allows and 8×2 where it does not, the same
+16 either way.
+
+```bash
+# Orthrus at this scale: W_Q, W_K, W_V only, no position weights.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus \
+    output_dir=checkpoints/qwen06_orthrus
+
+# Masked state plus the multi-step term.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_multistep \
+    output_dir=checkpoints/qwen06_orthrus_multistep
+
+# Continuous state, verifier alignment only — the ablation the main claim is
+# measured against.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft \
+    output_dir=checkpoints/qwen06_flowdraft
+
+# Continuous state trained on its own refinement, adapting Q, K, V and O.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep \
+    output_dir=checkpoints/qwen06_flowdraft_multistep
+
+# THE SAME, on Q, K, V alone — the projection set the baseline uses. This is
+# the configuration that leads at this scale, and the one whose comparison
+# against Orthrus is like-for-like.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep_qkv \
+    output_dir=checkpoints/qwen06_flowdraft_multistep_qkv
+```
+
+#### Qwen3-1.7B — the four experiments that carry the claims
+
+At the paper's hyperparameters: 2048 tokens, 256 anchor blocks, block size 32,
+two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup, gradient
+clipping 1.0, global batch 128.
+
+```bash
+# Orthrus verbatim: the diffusion attention trains W_Q, W_K, W_V and nothing
+# else — no output projection, no per-head norms, no position weights.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
+    output_dir=checkpoints/qwen_orthrus \
+    model.adapter.flex_attention_backend=flash
+
+# Masked drafter trained on the state sequence its own decoding visits:
+# propose, freeze the most confident positions, re-mask the rest, repeat.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep \
+    output_dir=checkpoints/qwen_orthrus_multistep \
+    model.adapter.flex_attention_backend=flash
+
+# Continuous state, verifier alignment ONLY. The ablation that makes the
+# multi-step claim testable: this target does not depend on the drafter.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft \
+    output_dir=checkpoints/qwen_flowdraft \
+    model.adapter.flex_attention_backend=flash
+
+# THE MAIN RESULT. Continuous state trained on its own refinement procedure:
+# the drafter proposes, one frozen forward over that proposal supplies both
+# the target and the greedy verdict.
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
+    output_dir=checkpoints/qwen_flowdraft_multistep \
+    model.adapter.flex_attention_backend=flash
+```
+
+**Three presets are bases, not experiments.** `smollm_base`, `qwen06_base` and
+`qwen_base` hold what every configuration at that scale must agree on for a
+contrast to be readable, and are meant to be inherited rather than run. They
+*do* compose and start — which is the trap — but with none of the weights that
+define a contrast, so the run falls back to the repository defaults:
+`train.variant=flowdraft` (full-sequence geometry, not the bench's) and the
+trajectory-structure objective that §3.5 of [EXPERIMENTS.md](EXPERIMENTS.md)
+measured and rejected. Nothing errors; you simply do not get any of the
+configurations above.
+
+#### All of them in sequence
+
+Runs go **one at a time**: on a single device parallel runs contend for the same
+memory and the timings stop being comparable. The loop resumes anything already
+started.
+
+```bash
+EXPERIMENTS="smollm_orthrus smollm_orthrus_multistep \
+      smollm_flowdraft smollm_flowdraft_multistep"
+
+for seed in 42 43 44; do
+  out=checkpoints; [ $seed = 42 ] || out=checkpoints/s$seed
+  for exp in $EXPERIMENTS; do
+    resume=""
+    [ -f "$out/$exp/last.ckpt" ] && resume="resume_from_checkpoint=$out/$exp/last.ckpt"
+    ./hf-auth.sh uv run python src/train.py +experiment=$exp \
+        seed=$seed output_dir=$out/$exp $resume
+  done
+done
+```
+
+Watch `val/acceptance_decode` rise and `val/loss/verify_kl` fall. Checkpoints
+hold the FP32 drafter head and its Adam moments; the frozen backbone is not
+stored. For multi-GPU, hand the run to Lightning's DDP:
+
+```bash
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
+    trainer.accelerator=gpu trainer.devices=8 trainer.strategy=ddp
+```
+
+Training always disables `model.backbone.device_map` — Hugging Face device maps
+are inference sharding, while DDP needs one complete replica per GPU. Streaming
+train and validation datasets are split into disjoint, equal rank shards, then
+partitioned among DataLoader workers. `data.batch_size` is per GPU; reach a
+larger global batch with `trainer.accumulate_grad_batches`.
+
+### 4. Validate on every dataset
+
+Six benchmarks, 460 tasks. `model.backbone.dtype=float32` is **required** for
+the losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
+agreement on near-ties. `per_prompt_file` is what makes the statistics possible:
+without it only means are written, and no interval, contrast or ANOVA can be
+built from means alone.
+
+```bash
+CKPT=checkpoints/qwen_flowdraft_multistep/last.ckpt
+
+for ds in gsm8k:100 math500:100 humaneval:100 mbpp:100 aime24:30 aime25:30; do
+  ./hf-auth.sh uv run python src/eval.py \
+      checkpoint=$CKPT data=${ds%%:*} decode.n_prompts=${ds##*:} \
+      decode.block_size=32 decode.max_new_tokens=64 \
+      "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+      model.backbone.dtype=float32 \
+      results_file=results/aggregate.jsonl \
+      per_prompt_file=results/pp-qwen.jsonl
+done
+```
+
+AIME 24 and 25 hold 30 tasks each — that is the whole set, not a subsample.
+`decode.jumps` takes restart pairs; an integer expands to passes at `t < 1`, which
+nothing in the objective trains once the consistency terms are off. Sweep the
+schedule by repeating the loop with `decode.jumps=1`, `[[0,1],[0.5,1]]` and the
+four-pass form.
+
+### 5. Metrics and statistics
+
+```bash
+uv run python bench/analyze.py --data results
+```
+
+Prints, in order: acceptance per experiment with Student intervals; every paired
+contrast with Holm correction; repeated-measures ANOVA with the
+Greenhouse-Geisser correction; the per-dataset breakdown; stratified bootstrap,
+sign test and Wilcoxon across datasets; and rank stability across prompt folds
+by Kendall tau. The unit of observation is the **prompt**, and the header states
+plainly how many training seeds stand behind the numbers — resampling prompts
+answers "will this hold on other tasks", never "will this hold on another
+training run".
+
+Useful flags: `--step` (which snapshot), `--sched` (`n1`/`n2`/`n3`/`n4`),
+`--metric acceptance|tpf`, `--folds`.
+
+### 6. Training curves and figures
+
+```bash
+uv run python bench/curves.py     # every loss term, every metric, per seed
+```
+
+`bench/curves.py` reads the TensorBoard scalars each run writes under
+`checkpoints/**/lightning_logs/` and produces three figures — `curves_loss`,
+`curves_metrics` and `curves_seeds` — in which colour is the experiment and line
+style is the training seed, so "do the experiments differ" and "do the seeds
+agree" stay separate questions. Terms carrying weight zero are named in the
+caption instead of being drawn as a flat line on an invented axis.
+
+**`bench/figures.py` is stale and is deliberately not listed above.** It dates
+from the earlier 6000-step, five-configuration bench, its labels are in Russian,
+and it writes `contrasts.png` — so running it would overwrite a current figure
+with an outdated one. The four result figures in the study section
+(`multistep`, `contrasts`, `per_benchmark`, `horizon`) were produced by a script
+that was never committed and cannot presently be regenerated; their numbers were
+checked against `bench/analyze.py`, but the plotting code behind them is gone.
+
+![loss curves per experiment and seed](results/figures/curves_loss.png)
+![validation metrics per experiment and seed](results/figures/curves_metrics.png)
+
+Live monitoring during a run: `uv run tensorboard --logdir checkpoints`.
 
 Laptop debugging: `src/train.py` and `src/eval.py` also run on a small ungated
 backbone — append the hydra overrides
 `model.name=HuggingFaceTB/SmolLM2-135M-Instruct model.backbone.dtype=float32
 model.backbone.device_map=null`.
 
-## Experiments (task stages)
 
-Every stage of the project task is one preset in `src/configs/experiment/`. The
-**detailed walkthrough — what each stage means, which training curves to
-watch, expected behaviour, results-table rows, and the analysis pipeline —
-is the [Russian experiment walkthrough](README.ru.md).**
-The command summary:
+## Experiments
 
-```bash
-# Stage 1 — reproduce the Orthrus masked-diffusion baseline @ 0.5B
-./hf-auth.sh uv run python src/train.py +experiment=orthrus
+Four experiments across three backbones, each a preset in
+`src/configs/experiment/`, plus one projection ablation that exists only where
+it was measured. What each one tests, the loss written out term by term, the
+results and the statistics are in **[EXPERIMENTS.md](EXPERIMENTS.md)**; the
+commands that launch them are in
+[step 3 of the Quickstart](#3-train-every-experiment).
 
-# Stages 2-3 — flow-map drafter, staged VFM/ECLD (endpoint first, consistency ramped in)
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_staged
+| experiment | SmolLM2-135M | Qwen3-0.6B | Qwen3-1.7B |
+|---|---|---|---|
+| Orthrus, reproduced | `smollm_orthrus` | `qwen06_orthrus` | `qwen_orthrus` |
+| masked + multi-step | `smollm_orthrus_multistep` | `qwen06_orthrus_multistep` | `qwen_orthrus_multistep` |
+| continuous state, ablation | `smollm_flowdraft` | `qwen06_flowdraft` | `qwen_flowdraft` |
+| continuous state + multi-step | `smollm_flowdraft_multistep` | `qwen06_flowdraft_multistep` | `qwen_flowdraft_multistep` |
+| the same on Q,K,V alone | — | `qwen06_flowdraft_multistep_qkv` | — |
 
-# Stage 4 — lossless at sampling: coupled = bitwise; uncoupled = null-calibrated TV test
-./hf-auth.sh uv run python src/eval.py model=qwen3_1.7b checkpoint=<ckpt> decode.temperature=0.8
-./hf-auth.sh uv run python src/eval.py model=qwen3_1.7b checkpoint=<ckpt> decode.temperature=0.8 \
-    decode.coupled=false decode.equiv_samples=500
-
-# Stage 5 (ablations) — the contribution of each distillation term
-./hf-auth.sh uv run python src/train.py +experiment=ablate_teacher_only
-./hf-auth.sh uv run python src/train.py +experiment=ablate_consistency_only
-
-# Stage 5 (evaluation) — default: MATH-500, a dataset never seen in training
-#           (data=nemotron evaluates on the training distribution);
-#           block-size x jumps grid -> results/eval.jsonl -> report figures.
-#           NOTE: decode.block_size = total width K: one clean anchor + K-1
-#           drafted tokens per cycle — a knob of EVERY variant; it is unrelated to the
-#           flowdraft_block_wise TRAINING-geometry variant despite the similar name
-./hf-auth.sh uv run python src/eval.py -m model=qwen3_1.7b variant=flowdraft checkpoint=<ckpt> \
-    decode.block_size=4,8,16 decode.jumps=1,2,4
-uv run python src/plots.py
-
-# ADDITION (beyond the task) — FlowDraft retrained in the exact inference
-# geometry (block-causal), directly comparable with Orthrus
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_block_wise
-#   eval: same stage-5 commands with variant=orthrus / flowdraft_block_wise
-```
-
-Training curves land in TensorBoard (`uv run tensorboard --logdir checkpoints`);
-metric formulas and the training↔eval correspondence are spelled out in the [Russian guide](README.ru.md).
-
-To mirror the same metrics to Weights & Biases, authenticate once with
-`uv run wandb login` (or set `WANDB_API_KEY`) and enable the opt-in sink:
-
-```bash
-./hf-auth.sh uv run python src/train.py \
-    wandb.enabled=true wandb.project=flowdraft wandb.name=qwen2-flowdraft
-```
-
-Use `wandb.offline=true` to record locally and upload later with `wandb sync`.
+`smollm_base`, `qwen06_base` and `qwen_base` are the shared bases these inherit,
+not experiments. Presets that were measured and rejected — the trajectory-structure
+objective, the input gate, the Q/K/O projection set, the weight-profile controls
+— live in `bucket/` with their numbers, and are deliberately not shipped.
 
 ## Background: the decoding bottleneck
 
@@ -224,7 +803,7 @@ The drafter learns two complementary parts of a categorical flow map:
 - **Endpoint inference — *what endpoint belongs to the trajectory*.** The diagonal predictor is trained by categorical VFM against the clean endpoint used to construct the interpolant.
 - **Self-consistency — *how to jump*.** The reliable diagonal prediction at a transported state teaches the harder long-jump predictor through ECLD.
 
-The ECLD target is stop-gradiented. An AR-verifier KL can be enabled as a separate auxiliary with `train.ar_kl_weight`, but defaults to zero because it is not part of the paper's CFM objective.
+The ECLD target is stop-gradiented. Verifier alignment lives in `train.verify_kl_weight` (the pair the decode loop executes) and `train.selfcorrect_kl_weight` (the same alignment along the drafter's own jump schedule).
 
 The AR model remains frozen throughout. In paper-faithful CFM training it supplies the cached prefix for the block-wise geometry and validation targets; at inference it verifies every proposal, which is what guarantees losslessness.
 
@@ -246,7 +825,7 @@ The AR model remains frozen throughout. In paper-faithful CFM training it suppli
 One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained with VFM endpoint inference plus ECLD. Implemented; large-scale validation pending.
 
 - **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
-- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + endpoint_weight·endpoint + ar_kl_weight·AR_KL + λ·(4·EC + 2·TD)`
+- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL + endpoint_weight·endpoint + λ·(4·EC + 2·TD)`
   - **verify KL** — block-wise inference alignment: `KL(sg(p_AR) ‖ π_{0,1}(x_0))` on the exact one-jump query used by decoding.
   - **endpoint** — `CE(x1, π_{t,t}(x_t))`: the paper's categorical VFM diagonal objective. The paper-faithful evaluation point is `train.anchor_point=trajectory`; `landing` is retained as an experimental option.
   - **AR KL** — optional `KL(sg(p_AR) ‖ π_{t,t})`, separately weighted and off by default because it is not part of the CFM objective.
@@ -278,12 +857,11 @@ FlowDraft/
     ├── configs/                   # hydra configs
     │   ├── train.yaml             # training entrypoint config
     │   ├── eval.yaml              # evaluation entrypoint config
-    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | llama3_3b
+    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | smollm2_135m
     │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
-    │   └── experiment/            # one preset per task stage + additions:
-    │                              #   orthrus | flowdraft_staged | ablate_teacher_only |
-    │                              #   ablate_consistency_only | flowdraft_block_wise
-    ├── train.py                   # training entrypoint
+    │   └── experiment/            # one preset per experiment + 2 shared bases:
+    │                              #   qwen_* and smollm_* (4 experiments x 2 backbones)
+    │                                  ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
 ```
@@ -317,8 +895,8 @@ on-device, never in the batch.
 
 ```bash
 ./hf-auth.sh uv run python src/train.py                            # FlowDraft (the task's recipe)
-./hf-auth.sh uv run python src/train.py +experiment=orthrus       # task presets: orthrus |
-                                                                   #   flowdraft_staged | ablate_*
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus       # presets: qwen_orthrus |
+                                                                   #   qwen_flowdraft_multistep | ...
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
@@ -326,7 +904,7 @@ Variants: `flowdraft` is the full-sequence flow-map objective; `orthrus` is the
 paper-style block-causal Orthrus recipe (frozen AR cache plus independently
 anchored masked blocks); and `flowdraft_block_wise` trains the flow-map
 drafter in that inference geometry.
-Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`ar_kl_weight`/`lambda_ramp_steps`
+Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`selfcorrect_kl_weight`/`lambda_ramp_steps`
 (VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
 curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
@@ -345,7 +923,6 @@ Checkpointing has three independent outputs:
   step is not a periodic checkpoint boundary.
 
 An uncatchable process kill or a full filesystem cannot produce a final file.
-The Russian guide is maintained separately in `README.ru.md`.
 
 **Resume after interruption.** Use the newest periodic checkpoint after a hard
 interruption, or `last.ckpt` after a normal/handled termination. Resume the full
@@ -353,8 +930,8 @@ Lightning state—DF weights, AdamW, cosine schedule, global step, and
 callbacks—with:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=orthrus \
-    resume_from_checkpoint=checkpoints/orthrus/last.ckpt \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
+    resume_from_checkpoint=checkpoints/qwen_orthrus/last.ckpt \
     trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
     trainer.accumulate_grad_batches=64
 ```
@@ -367,7 +944,7 @@ shuffle, so it never leaks into training). Two ways to bound a repetition:
 ```bash
 # Orthrus paper preset: 600K packed sequences, 2 epochs, Qwen3-1.7B.
 # On 8 GPUs it uses micro-batch 1 and accumulation 16 (global batch 128):
-uv run python src/train.py +experiment=orthrus trainer.devices=8
+uv run python src/train.py +experiment=qwen_orthrus trainer.devices=8
 # or bound by steps per repetition instead of samples:
 uv run python src/train.py trainer.max_steps=-1 trainer.max_epochs=3 trainer.limit_train_batches=2000
 ```
@@ -387,7 +964,7 @@ The Orthrus paper preset uses 2 epochs over 600K packed 2048-token sequences,
 accumulation steps:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=orthrus \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
     trainer.accelerator=gpu trainer.devices=2 trainer.strategy=ddp \
     trainer.accumulate_grad_batches=64
 ```
@@ -410,8 +987,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `wandb.project` / `entity` / `name` | `flowdraft` / null / null | W&B destination and optional run name; null uses W&B defaults |
 | `wandb.group` / `tags` | null / [] | optional W&B organization metadata |
 | `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
-| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `flowdraft_block_wise` (inference-geometry CFM) \| `orthrus` (block-causal masked drafter) |
-| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
+| `train.variant` | `flowdraft` | which drafter to train: `flowdraft` (full-sequence CFM) \| `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions |
 | `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; packed block-wise FlowDraft defaults to 4 |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
 | `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
@@ -421,7 +997,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.time_sampling` | `paper` | how (s, t) pairs are drawn: `paper` \| `triangle` \| `sequential` |
 | `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
 | `train.endpoint_weight` | 1.0 | weight of categorical VFM endpoint CE; 0 = endpoint-off ablation |
-| `train.ar_kl_weight` | 0.0 | optional AR-verifier KL auxiliary; 0 keeps the objective paper-faithful |
+| `train.selfcorrect_kl_weight` | 0.0 | the multi-step term: the drafter's own jump schedule, each pass supervised by the frozen AR sweep over the pass before it |
 | `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
 | `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
 | `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
@@ -456,7 +1032,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `decode.coupled` | true | T>0: Gumbel-coupled sampling — bit-exact vs AR |
 | `decode.equiv_samples` | 0 | uncoupled only: N draws for the TV law-equivalence test; 0 = off |
 
-**`model/*` — backbone** (`qwen3_1.7b` default; `qwen2_0.5b` and `llama3_3b` remain available):
+**`model/*` — backbone** (`qwen3_1.7b` default; `qwen2_0.5b` is the brief's scale, `smollm2_135m` the bench):
 `name` (HF id), `backbone.dtype`, `backbone.device_map`,
 `backbone.attn_implementation` (`sdpa` default \| `flex_attention` GPU-only \| `eager`).
 
@@ -466,25 +1042,22 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 `train_size` (null = the whole stream; int N = a fixed pool of N samples, so
 `trainer.max_epochs` repeats exactly them), `batch_size`, `max_length`, `num_workers`.
 
-**`experiment/*` — one preset per task stage, plus the addition presets.**
+**`experiment/*` — one preset per experiment, plus the two shared bases.**
 Each sets its own `output_dir` and `train.checkpoint_name`, so runs never
 overwrite each other:
 
 | Preset | Sets | Checkpoints |
 | --- | --- | --- |
-| `orthrus` | `variant=orthrus` | `checkpoints/orthrus/orthrus-*.ckpt` |
-| `flowdraft_staged` | `variant=flowdraft`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-staged/flowdraft-staged-*.ckpt` |
-| `ablate_teacher_only` | `variant=flowdraft`, `lambda=0` (endpoint-only; legacy preset name) | `checkpoints/ablate-endpoint/ablate-endpoint-*.ckpt` |
-| `ablate_consistency_only` | `variant=flowdraft`, `endpoint_weight=0` | `checkpoints/ablate-consistency/ablate-consistency-*.ckpt` |
-| `flowdraft_block_wise` (addition) | `variant=flowdraft_block_wise`, `lambda_ramp_steps=2000` | `checkpoints/flowdraft-block-wise/flowdraft-block-wise-*.ckpt` |
-| `flowdraft_packed_full` | boundary-aware packed-2048 full-sequence FlowDraft | `checkpoints/flowdraft-packed-full/` |
-| `flowdraft_packed_blockwise` | boundary-aware packed-2048 inference-geometry FlowDraft | `checkpoints/flowdraft-packed-blockwise/` |
+| `*_orthrus` | `variant=orthrus`, no additions — the published baseline | `checkpoints/<name>/` |
+| `*_orthrus_multistep` | `variant=orthrus` + the multi-step term | `checkpoints/<name>/` |
+| `*_flowdraft` | `variant=flowdraft_block_wise`, verifier alignment only — the ablation | `checkpoints/<name>/` |
+| `*_flowdraft_multistep` | `variant=flowdraft_block_wise` + the multi-step term | `checkpoints/<name>/` |
 
 Your own experiment (e.g. the `anchor_point` study) — override name and dir
 so it gets its own shelf too:
 
 ```bash
-./hf-auth.sh uv run python src/train.py +experiment=flowdraft_staged \
+./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
     train.anchor_point=landing \
     output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
 ```
@@ -589,17 +1162,24 @@ generation prompt, with Qwen3 thinking disabled as in Orthrus) and decoded from 
 
 ## Results
 
-> 🚧 **TODO.** Fill in once experiments are done. All rows must be verified lossless.
+Accepted tokens per cycle at 20k steps, three refinement passes, averaged over
+three training seeds and 460 tasks. Every row was asserted **bitwise identical**
+to greedy autoregressive decoding.
 
-| Method | Acceptance length ↑ | TPF * | Throughput (tok/s) ↑ | Lossless |
-| --- | --- | --- | --- | --- |
-| AR baseline | — | — | — | ✅ (trivially) |
-| Orthrus (masked-diffusion drafter) | TBD | TBD | TBD | ✅ |
-| **FlowDraft** (flow-map drafter) | TBD | TBD | TBD | ✅ |
+| Method | Accepted tokens ↑ | TPF at 1 pass | Lossless |
+| --- | --- | --- | --- |
+| AR baseline | — | 1.000 | ✅ (trivially) |
+| Orthrus, reproduced | 1.537 | 1.219 | ✅ |
+| masked + multi-step | 1.760 | **1.326** | ✅ |
+| continuous state, no multi-step | 1.234 | 1.245 | ✅ |
+| **continuous state + multi-step** | **2.373** | 1.257 | ✅ |
 
-\* *TPF — tokens per forward pass: `N generated / N forwards`, one cycle = `jumps + 1` forwards (formulas: the [Russian guide](README.ru.md)).*
-
-**Ablations (TODO):** block size, jump count.
+Read the two columns together: multi-step training raises **acceptance** by a
+large, seed-stable margin and does **not** raise throughput, because a cycle of
+`n` refinement passes costs `n+1` forwards. Only single-pass decoding exceeds
+1.0 tokens per forward. Intervals, paired contrasts, ANOVA and the per-benchmark
+breakdown are in [EXPERIMENTS.md](EXPERIMENTS.md); the block-size and jump-count
+sweeps are [step 4 of the Quickstart](#4-validate-on-every-dataset).
 
 ## References
 

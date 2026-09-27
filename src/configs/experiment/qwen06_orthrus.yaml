@@ -1,0 +1,17 @@
+# @package _global_
+# Orthrus по статье, в стендовой геометрии на Qwen3-0.6B.
+# Зеркало `smollm_orthrus`: три проекции статьи, без весов позиций и без гейта.
+defaults:
+  - /experiment/qwen06_base
+  - _self_
+
+output_dir: checkpoints/qwen06_orthrus
+model:
+  adapter:
+    w_names: [q_proj, k_proj, v_proj]
+train:
+  variant: orthrus
+  teacher_target: soft
+  acceptance_profile: null
+  position_weights: null
+  teacher_chain_tail_weight: 1.0

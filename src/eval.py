@@ -77,9 +77,23 @@ def evaluate_prompt(model, prompt_ids, *, block_size, jumps, max_new_tokens,
             sum(fd["acceptance"]) / len(fd["acceptance"])
             if fd["acceptance"] else 0.0
         ),
-        # tokens per forward pass (cycle = jumps + 1 forwards; AR is ~1)
+        # End-to-end tokens per forward pass, prefill included and the final
+        # cycle charged in full even where its overflow was discarded. Honest
+        # for a generation of THIS length, but it therefore depends on
+        # max_new_tokens: two systems compare through it only at an identical
+        # setting. AR is ~1.
         "tpf": n_tokens / fd["n_forwards"],
         "tpf_ar": len(ar["new_tokens"]) / ar["n_forwards"],
+        # Steady-state rate: every token the draft cycles produced over the
+        # forwards those cycles cost, with the prefill excluded — both its
+        # forward AND the one token it materialises, which costs no cycle. This is the
+        # quantity the analytic bound (accepted + 1) / (jumps + 1) predicts, so
+        # a gap between the two says the measurement is off rather than the
+        # model. Length-independent, hence the one to compare across runs.
+        "tpf_steady": (
+            fd["produced_tokens"] / fd["cycle_forwards"]
+            if fd.get("cycle_forwards") else float("nan")
+        ),
         # wall-clock DIAGNOSTICS, not headline: hardware/kernel dependent
         # (default kernel is sdpa; try model.backbone.attn_implementation=flex_attention on GPU)
         "tokens_per_s": n_tokens / fd["seconds"],
@@ -283,12 +297,14 @@ def main(cfg: DictConfig) -> None:
         "train_lr": train_cfg.get("lr", None),
         "train_time_sampling": train_cfg.get("time_sampling", None),
         "train_lambda": train_cfg.get("lambda", None),
-        "train_ar_kl_weight": train_cfg.get("ar_kl_weight", None),
         "train_verify_kl_weight": train_cfg.get("verify_kl_weight", None),
         "train_anchors_per_sequence": train_cfg.get("anchors_per_sequence", None),
         "train_anchor_point": train_cfg.get("anchor_point", None),
+        "train_selfcorrect_kl_weight": train_cfg.get("selfcorrect_kl_weight", None),
         "block_size": dec.block_size,
-        "jumps": dec.jumps if isinstance(dec.jumps, int) else list(dec.jumps),
+        "jumps": dec.jumps if isinstance(dec.jumps, int) else OmegaConf.to_container(dec.jumps, resolve=True)
+        if OmegaConf.is_config(dec.jumps) else list(dec.jumps),
+        "fixed_prior": dec.get("fixed_prior", False),
         "temperature": dec.get("temperature", 0.0),
         "coupled": dec.get("coupled", True),
         "n_prompts": len(results),

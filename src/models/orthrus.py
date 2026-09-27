@@ -138,14 +138,173 @@ class Orthrus(FlowDraftBlockWise):
         gather = anchors[:, None] + torch.arange(drafted, device=ids.device)
         teacher_logits = teacher_full[:, gather]
         live = attention_mask[:, gather + 1].bool()
-        loss = self._masked_kl_chunked(teacher_logits, df_logits, live)
+        # Веса позиций dE/da_j — свойство МЕТРИКИ, а не ветви. Пока они стояли
+        # только у симплексных конфигураций, контраст «состояние» содержал внутри себя
+        # контраст «веса против без весов», а приёмка есть ровно та конъюнкция
+        # по префиксу, которую эти веса оптимизируют.
+        # Идентификаторы, а не точка симплекса: `_position_weights` берёт от
+        # них argmax, то есть их же. One-hot здесь был бы чистой тратой.
+        needs_w = (
+            bool(self.cfg.train.get("acceptance_profile", None))
+            or bool(self.cfg.train.get("position_weights", None))
+            or float(self.cfg.train.get("teacher_chain_tail_weight", 1.0)) != 1.0
+        )
+        pos_w = self._position_weights(
+            teacher_logits.flatten(1, 2),
+            ids[:, gather + 1].reshape(ids.size(0), -1),
+            live.flatten(1, 2),
+        ) if needs_w else None
+        loss = self._masked_kl_chunked(teacher_logits, df_logits, live, pos_w)
+        loss = loss + self._masked_selfcorrect(
+            df_logits, anchor_ids, attention_mask, cache, live,
+            dict(position_ids=position_ids, causal_limit=causal_limit,
+                 diffusion_block_size=width),
+            embed, mask_embed,
+        )
         return loss, df_logits, teacher_logits, live
 
-    def _masked_kl_chunked(self, teacher_logits, draft_logits, live):
+    @staticmethod
+    def _commit_width(drafted, step, steps):
+        """How many positions the schedule fixes after step `step` of `steps`.
+
+        One rule for training and for decoding. They used to differ -- training
+        committed half the block, decoding committed round(K*(step+1)/steps) --
+        so the state the decode loop reads was never the state the term was
+        trained on.
+        """
+        return max(1, round(drafted * (step + 1) / steps))
+
+    def _masked_selfcorrect(self, df_logits, anchor_ids, attention_mask, cache,
+                            live, df_kwargs, embed, mask_embed):
+        """Train the masked drafter for ITS OWN multi-step decoding procedure.
+
+        The paper reports that two denoising passes cost 44% of throughput and
+        concludes single-step projection is optimal. But the drafter is never
+        trained for the state the second pass reads: at inference the schedule
+        commits the confident positions and re-masks the rest, and nothing in
+        the objective has ever shown the model a half-committed block. This
+        term does, and it is the same Jacobi sweep the flow-map variant uses --
+        only the state is expressed in the one way masked diffusion can express
+        it, as a set of committed tokens beside a set of masks.
+
+        Written so the comparison it enables is clean. Running it against the
+        simplex-state version isolates two things that were confounded in every
+        run so far: how much of the multi-step gain comes from TRAINING for the
+        procedure, and how much from the state being continuous rather than
+        binary. If this term closes the gap on its own, the continuous state is
+        not load-bearing and the paper has to say so.
+        """
+        weight = float(self.cfg.train.get("selfcorrect_kl_weight", 0.0))
+        if weight <= 0.0 or not live.any():
+            return df_logits.sum() * 0.0
+        batch, count, drafted, vocab = df_logits.shape
+        flat_live = live.view(batch, -1)
+        # Столько же раундов, сколько у симплексной ветви. Раньше здесь был ОДИН
+        # форвард против её r раундов с r-1 дополнительными свипами верификатора:
+        # член назывался тем же, а доза отличалась в разы, и контраст ветвей
+        # мерил не состояние, а объём супервизии.
+        rounds = max(1, int(self.cfg.train.get("selfcorrect_rounds", 2)))
+        logits_cur = df_logits
+        # Множество зафиксированных позиций МОНОТОННО, а токены в нём заморожены
+        # -- ровно как в декоде (`_draft_block`: masked_fill по уверенности и
+        # where по committed). Пересборка с нуля на каждом раунде давала другую
+        # последовательность состояний: позиция, зафиксированная на шаге k,
+        # могла получить другой токен или выпасть из множества на k+1.
+        committed = torch.zeros(batch, count, drafted, dtype=torch.bool,
+                                device=df_logits.device)
+        tokens = torch.zeros(batch, count, drafted, dtype=torch.long,
+                             device=df_logits.device)
+        terms = []
+        for k in range(rounds):
+            with torch.no_grad():
+                step_ids = logits_cur.argmax(-1)
+                tokens = torch.where(committed, tokens, step_ids)
+                draft_ids = tokens.view(batch, -1)
+                target = self._verifier_response(
+                    draft_ids, anchor_ids, attention_mask, cache, df_kwargs
+                )
+                expected = target.argmax(-1)
+                accepted, known = self._greedy_verdict(
+                    draft_ids, expected, flat_live, count
+                )
+                # Расписание фиксирует самую уверенную долю и перемаскирует
+                # остальное; обучение обязано читать то же состояние, и с той же
+                # долей, что декод на шаге k из rounds.
+                # Знаменатель rounds+1, а не rounds: декод при jumps=n делает
+                # n-1 коммитов со знаменателем n. Со старым знаменателем
+                # последний раунд фиксировал ВЕСЬ блок -- состояние без единой
+                # маски, которого декод не читает никогда, и на него уходила
+                # половина веса члена.
+                keep = self._commit_width(drafted, k, rounds + 1)
+                # .float(), как в декоде: под bf16 уверенность в сыром dtype
+                # даёт ДРУГОЙ верхний коммит примерно на 0.3% блоков, то есть
+                # обучение и декод расходятся состояниями ровно там, где
+                # прогон и пойдёт (CUDA, precision=bf16-mixed).
+                confidence = logits_cur.float().softmax(-1).max(-1).values
+                order = confidence.masked_fill(
+                    committed, float("inf")).argsort(dim=-1, descending=True)
+                committed = committed.clone()
+                committed.scatter_(-1, order[..., :keep], True)
+                slots = torch.where(
+                    committed[..., None], embed(tokens),
+                    mask_embed.expand(batch, count, drafted, -1),
+                )
+                x_in = torch.cat(
+                    [embed(anchor_ids).unsqueeze(2), slots], dim=2
+                ).flatten(1, 2)
+            logits_next = self.orthrus(
+                inputs_embeds=x_in, use_df=True, past_key_values=cache, **df_kwargs
+            ).logits.view(batch, count, drafted + 1, -1)[:, :, :-1]
+            # Носитель члена — весь живой блок, БЕЗ вычёркивания. Копирование
+            # возможно там, где в слоте входа лежит токен, совпадающий с
+            # argmax таргета (форвард двунаправлен, строка j видит слот j), и
+            # это верно на принятых позициях. Но ровно то же верно и у
+            # симплексной ветви: её вход несёт (1-s)x0' + s*q_j, и при
+            # достаточном s argmax слота j — тот же черновик. Вычёркивать в
+            # одной ветви и приглушать в другой значит вложить в сравниваемый
+            # член ещё одну ось, которую ни один контроль не вычитает. Обе
+            # ветви приглушают одинаково: полный вес на позиции разрыва,
+            # `selfcorrect_tail_weight` везде ещё. Контроль на само это
+            # приглушение — конфигурации с tail = 1.0.
+            open_ = flat_live
+            if open_.any():
+                tail = float(self.cfg.train.get("selfcorrect_tail_weight", 0.5))
+                at_break = known & ~accepted
+                pos_w = torch.where(
+                    at_break, torch.ones_like(confidence.view(batch, -1)),
+                    confidence.new_full((), tail),
+                )
+                # Веса выживания dE/da_j — свойство метрики, поэтому стоят у
+                # обеих ветвей. Нормируется ПРОИЗВЕДЕНИЕ, как и там: на лосс
+                # порядок не влияет (член инвариантен к масштабу веса), но у
+                # этого порядка средний вес ровно 1.000 при любой приёмке.
+                surv = self._survival_weights(drafted, count, confidence)
+                if surv is not None:
+                    pos_w = pos_w * surv
+                terms.append(self._teacher_loss(
+                    target, logits_next.flatten(1, 2), open_,
+                    position_weight=pos_w / pos_w.mean().clamp_min(1e-6),
+                ))
+            logits_cur = logits_next.detach()
+        if not terms:
+            return df_logits.sum() * 0.0
+        return weight * torch.stack(terms).mean()
+
+    def _masked_kl_chunked(self, teacher_logits, draft_logits, live, position_weight=None):
+        """Chunked KL over the block, optionally weighted per position.
+
+        `position_weight` reallocates gradient WITHIN the block; it is
+        normalised by its own realised mass so the term's scale does not drift
+        with the data. Without it the baseline weights every drafted position
+        equally, while acceptance is a conjunction over the prefix — position j
+        is worth the probability of reaching it.
+        """
         vocab = draft_logits.size(-1)
         teacher_flat = teacher_logits.reshape(-1, vocab)
         draft_flat = draft_logits.reshape(-1, vocab)
         live_flat = live.reshape(-1).float()
+        if position_weight is not None:
+            live_flat = live_flat * position_weight.reshape(-1).to(live_flat.dtype)
         n_live = live_flat.sum()
 
         def term(draft_chunk, teacher_chunk, live_chunk):
@@ -154,7 +313,7 @@ class Orthrus(FlowDraftBlockWise):
             kl = (log_teacher.exp() * (log_teacher - log_draft)).sum(-1)
             return (kl * live_chunk).sum()
 
-        chunk = int(self.cfg.train.get("kl_chunk", 4096))
+        chunk = self._kl_chunk_rows(vocab)
         total = draft_flat.new_zeros((), dtype=torch.float32)
         for start in range(0, draft_flat.size(0), chunk):
             stop = start + chunk
@@ -169,8 +328,7 @@ class Orthrus(FlowDraftBlockWise):
 
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._masked_step(batch)
-        if not torch.isfinite(loss):
-            raise ValueError(f"non-finite loss at step {batch_idx}: {loss}")
+        self._assert_finite(loss, batch_idx)
         self.log("train/loss", loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -208,21 +366,37 @@ class Orthrus(FlowDraftBlockWise):
     def validation_step(self, batch, batch_idx):
         with self._frozen_val_rng(batch_idx):
             loss, df_logits, teacher_logits, live = self._masked_step(batch)
-            live_count = live.sum().to(dtype=torch.float64)
+            accum = self._accum_dtype(live.device)
+            live_count = live.sum().to(dtype=accum)
             loss_stats = torch.stack(
-                [loss.detach().to(torch.float64) * live_count, live_count]
+                [loss.detach().to(accum) * live_count, live_count]
             )
             loss_stats = self.trainer.strategy.reduce(loss_stats, reduce_op="sum")
-            if loss_stats[1].item() > 0:
-                # Already reduced across ranks. A skipped local batch carries
-                # zero weight instead of looking like a perfect zero-loss batch.
-                self.log(
-                    "val/loss",
-                    loss_stats[0] / loss_stats[1],
-                    prog_bar=True,
-                    sync_dist=False,
-                )
-
+            # Метрика логируется ВСЕГДА, даже когда валидационная эпоха не
+            # нашла ни одного валидного окна: EarlyStopping и ModelCheckpoint
+            # строятся со strict=True и падают с RuntimeError, если монитора
+            # нет. Заглушка выбирается по режиму монитора и заведомо не может
+            # оказаться лучшей: ноль здесь означал бы идеальный KL и увёл бы
+            # отбор чекпоинта на пустую эпоху.
+            has_live = loss_stats[1].item() > 0
+            if has_live:
+                val_loss = loss_stats[0] / loss_stats[1]
+                self._last_val_loss = float(val_loss)
+            else:
+                # Не гигантская заглушка: `self.log` на валидации усредняет по
+                # эпохе, и одно значение 1e30 из сотни батчей утащило бы среднее
+                # в 1e28 -- конечное, поэтому check_finite его не поймает.
+                # Повтор последнего валидного значения не двигает среднюю и не
+                # может стать «лучшей» точкой: она уже была. До первого
+                # валидного берём ln(V) -- лосс необученной равномерной головы.
+                import math
+                fallback = getattr(self, "_last_val_loss", None)
+                if fallback is None:
+                    fallback = math.log(max(int(df_logits.size(-1)), 2))
+                val_loss = torch.full((), float(fallback),
+                                      device=df_logits.device, dtype=accum)
+            self.log("val/loss", val_loss, prog_bar=True, sync_dist=False)
+            if has_live:
                 matches = df_logits.argmax(-1).eq(teacher_logits.argmax(-1)) & live
                 prefix_live = live.to(torch.int32).cumprod(dim=-1).bool()
                 prefix_matches = matches.to(torch.int32).cumprod(dim=-1).bool()
@@ -237,7 +411,7 @@ class Orthrus(FlowDraftBlockWise):
                     full_blocks.sum(),
                 ]
                 metric_stats = torch.cat(
-                    [part.reshape(-1).to(torch.float64) for part in metric_parts]
+                    [part.reshape(-1).to(self._accum_dtype(live.device)) for part in metric_parts]
                 )
                 metric_stats = self.trainer.strategy.reduce(
                     metric_stats, reduce_op="sum"
@@ -271,8 +445,27 @@ class Orthrus(FlowDraftBlockWise):
         return loss
 
     def _draft_block(self, cache, block_size, times, sample: bool = False, anchor_token=None):
-        if len(times) != 2:
-            raise ValueError("the masked baseline drafts in exactly one step: use jumps=1")
+        """Masked drafting in ``len(times)`` denoising steps.
+
+        One step is the paper's headline configuration. More than one is the
+        paper's OWN multi-step-denoising ablation, and it belongs here rather
+        than being refused: without it, a multi-step comparison would be
+        "the baseline cannot" when the truth is "the baseline can and reports
+        it costs 44% of throughput". Their conclusion — single-step projection
+        is optimal — is a result on this exact axis, and it is the thing a
+        flow-map drafter has to beat.
+
+        There is no continuous time to re-enter along, so the schedule's times
+        are used only for their COUNT, and the state between steps is the only
+        one masked diffusion can express: a position is either committed to a
+        token or masked again. Each step commits the most confident share of
+        the still-masked positions and re-masks the rest, which is the standard
+        confidence-ordered unmasking schedule. The proposal returned is the
+        final step's distribution, with committed positions pinned to the
+        one-hot the schedule fixed, so greedy verification reads exactly what
+        the schedule decided.
+        """
+        steps = len(times)
         embed = self.orthrus.model.get_input_embeddings()
         # Orthrus defines K as the complete parallel block, including its
         # clean anchor.  Thus a K=32 baseline proposal contains 31 fresh
@@ -280,28 +473,55 @@ class Orthrus(FlowDraftBlockWise):
         drafted = block_size - 1
         if drafted <= 0:
             raise ValueError("baseline block_size must be at least 2 (anchor + one mask)")
-        if anchor_token is not None:
-            anchor = embed(anchor_token.to(self._generation_device()).view(1, 1))
-            masks = self.orthrus.mask_embedding.to(
-                device=anchor.device, dtype=anchor.dtype
-            ).expand(1, drafted, -1)
-            x_in = torch.cat([anchor, masks], dim=1)
-        else:
-            masks = self.orthrus.mask_embedding.to(
-                device=self._generation_device(), dtype=embed.weight.dtype
-            ).expand(1, drafted, -1)
-            x_in = masks
-        mask = torch.ones(
-            1,
-            cache.get_seq_length() + x_in.size(1),
-            dtype=torch.long,
-            device=x_in.device,
+        device = self._generation_device()
+        mask_embed = self.orthrus.mask_embedding.to(
+            device=device, dtype=embed.weight.dtype
         )
-        logits = self.orthrus(
-            attention_mask=mask, inputs_embeds=x_in, use_df=True, past_key_values=cache
-        ).logits
-        # With a pending anchor, its output row predicts the first fresh token
-        # and the final mask row is unused (the standard causal-LM shift).
-        q = (logits[:, :-1] if anchor_token is not None else logits).float().softmax(-1)
+        anchor = (
+            embed(anchor_token.to(device).view(1, 1))
+            if anchor_token is not None else None
+        )
+        committed = torch.zeros(1, drafted, dtype=torch.bool, device=device)
+        tokens = torch.zeros(1, drafted, dtype=torch.long, device=device)
+        q = None
+        for step in range(steps):
+            slots = torch.where(
+                committed[..., None],
+                embed(tokens),
+                mask_embed.expand(1, drafted, -1),
+            )
+            x_in = slots if anchor is None else torch.cat([anchor, slots], dim=1)
+            attention = torch.ones(
+                1, cache.get_seq_length() + x_in.size(1),
+                dtype=torch.long, device=device,
+            )
+            logits = self.orthrus(
+                attention_mask=attention, inputs_embeds=x_in, use_df=True,
+                past_key_values=cache,
+            ).logits
+            # With a pending anchor, its output row predicts the first fresh
+            # token and the final mask row is unused (the causal-LM shift).
+            q = (logits[:, :-1] if anchor is not None else logits).float().softmax(-1)
+            step_ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
+            tokens = torch.where(committed, tokens, step_ids)
+            if step + 1 == steps:
+                break
+            # Commit the most confident share of what is still masked; the rest
+            # goes back under the mask and is redrawn with those commitments
+            # visible. This is what buys anything at all: the later positions
+            # get to condition on the earlier ones.
+            keep = self._commit_width(drafted, step, steps)
+            confidence = q.max(-1).values.masked_fill(committed, float("inf"))
+            order = confidence.argsort(dim=-1, descending=True)
+            committed = committed.clone()
+            committed[0, order[0, :keep]] = True
+        if committed.any():
+            # Pin the committed positions: verification must read the token the
+            # schedule fixed, not the last step's opinion about it.
+            q = torch.where(
+                committed[..., None],
+                F.one_hot(tokens, q.size(-1)).to(q.dtype),
+                q,
+            )
         ids = torch.multinomial(q[0], 1).view(1, -1) if sample else q.argmax(-1)
         return ids, q
