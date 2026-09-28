@@ -434,7 +434,7 @@ Each with a measured before and after:
 | dead forward when consistency terms are off | 3 and 7 backbone forwards per step | 2 and 6; step time 0.18 s → 0.11 s |
 | time conditioning consumed the global RNG | one architecture saw different data at the same seed | reseed after model construction |
 | `eval.py` | measured a block-32 model at block 8; crashed writing paired schedules | fixed |
-| `min_jump_gap` | justification was wrong: the gradient at `s≈t` is `O(t−s)`, not zero | left at 0 |
+| `min_jump_gap` | justification was wrong: the gradient at `s≈t` is `O(t−s)`, not zero | left at 0, later removed with the CFM terms |
 
 Portability: the CUDA path no longer refuses non-Qwen3 backbones; the
 finite-loss check and the crash-checkpoint decision are collective; the seed is
@@ -817,22 +817,19 @@ The AR model remains frozen throughout. In paper-faithful CFM training it suppli
 ## Expected deliverables
 
 1. Reproduction of the Orthrus lossless parallel decoder (masked-diffusion drafter).
-2. Implementation of the **Categorical Flow Map drafter** + VFM/ECLD training.
+2. Implementation of the **Categorical Flow Map drafter**, trained against the frozen verifier on its own decode chain.
 3. Evaluation: acceptance-length / TPF / throughput comparison, with verified losslessness and **block-size / jump-count ablations**.
 
 ## Method
 
-One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained with VFM endpoint inference plus ECLD. Implemented; large-scale validation pending.
+One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained against the frozen verifier: at the state every decode cycle enters, and along the drafter's own refinement chain.
 
 - **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
-- **Objective** (`FlowDraft.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL + endpoint_weight·endpoint + λ·(4·EC + 2·TD)`
-  - **verify KL** — block-wise inference alignment: `KL(sg(p_AR) ‖ π_{0,1}(x_0))` on the exact one-jump query used by decoding.
-  - **endpoint** — `CE(x1, π_{t,t}(x_t))`: the paper's categorical VFM diagonal objective. The paper-faithful evaluation point is `train.anchor_point=trajectory`; `landing` is retained as an experimental option.
-  - **AR KL** — optional `KL(sg(p_AR) ‖ π_{t,t})`, separately weighted and off by default because it is not part of the CFM objective.
-  - **EC** — eq. (18) of *Categorical Flow Maps*: `CE(sg(π_{t,t}(X_{s,t}(x_s))), π_{s,t}(x_s))` — jumps learn from the diagonal at their own landing point; truth flows `x1 → π_{t,t} → π_{s,t}`.
-  - **TD** — eq. (16): temporal drift `‖∂_t π_{s,t}‖²`.
-  - Time pairs `(s, t)` per sample (`train.time_sampling`): `paper` (default: t~U, s~U[0,t]) | `triangle` | `sequential`.
-- **Training geometries** (`train.variant`): `flowdraft` noises the full sequence; `flowdraft_block_wise` trains FlowDraft in the exact inference geometry; and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
+- **Objective** (`FlowDraftBlockWise.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL`
+  - **verify KL** — `KL(sg(p_AR) ‖ π_{0,1}(x_0))` at the pure prior, the state every decode cycle enters, against the AR distribution conditioned on the accepted prefix.
+  - **self-correction KL** — the drafter walks its own refinement chain, and each pass is trained on the frozen verifier's answer to the draft of the pass before it. This is the multi-step term.
+  - The three consistency terms of *Categorical Flow Maps* — endpoint on the diagonal, EC and TD — carried zero weight in every preset and were removed; they and the reasons are in `bucket/cfm_terms`.
+- **Training geometries** (`train.variant`): `flowdraft_block_wise` trains FlowDraft in the exact inference geometry, and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
 - **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ## Repository structure
@@ -900,12 +897,11 @@ on-device, never in the batch.
 ./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
 ```
 
-Variants: `flowdraft` is the full-sequence flow-map objective; `orthrus` is the
-paper-style block-causal Orthrus recipe (frozen AR cache plus independently
-anchored masked blocks); and `flowdraft_block_wise` trains the flow-map
-drafter in that inference geometry.
-Knobs live in `configs/train.yaml`: `lambda`/`endpoint_weight`/`selfcorrect_kl_weight`/`lambda_ramp_steps`
-(VFM/ECLD balance + staging), `anchor_point`, `time_sampling`,
+Variants: `orthrus` is the paper-style block-causal Orthrus recipe (frozen AR
+cache plus independently anchored masked blocks), and `flowdraft_block_wise`
+trains the flow-map drafter in that inference geometry.
+Knobs live in `configs/train.yaml`: `verify_kl_weight`/`selfcorrect_kl_weight`
+(the two terms), `selfcorrect_rounds`/`selfcorrect_s_min` (the refinement chain),
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
 curves + checkpoint monitor), `early_stop_patience`, optimizer, Lightning
 `trainer.*`. Checkpoints store the FP32 DF head + its Adam moments; the frozen
@@ -994,13 +990,8 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
 | `train.lr_schedule` | `cosine` | `cosine` (linear warmup → cosine decay to 0; needs a finite `trainer.max_steps` or `limit_train_batches`+`max_epochs`) \| `constant` |
 | `train.warmup_ratio` | 0.05 | cosine only: fraction of total steps spent warming up |
-| `train.time_sampling` | `paper` | how (s, t) pairs are drawn: `paper` \| `triangle` \| `sequential` |
-| `train.lambda` | 1.0 | weight of the consistency part (4·EC + 2·TD) |
-| `train.endpoint_weight` | 1.0 | weight of categorical VFM endpoint CE; 0 = endpoint-off ablation |
 | `train.selfcorrect_kl_weight` | 0.0 | the multi-step term: the drafter's own jump schedule, each pass supervised by the frozen AR sweep over the pass before it |
 | `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
-| `train.lambda_ramp_steps` | 0 | staged distillation: lambda 0 → `lambda` over N steps; 0 = static |
-| `train.anchor_point` | `trajectory` | where the anchor evaluates the diagonal: `trajectory` = π_{t,t}(x_t) \| `landing` = π_{t,t}(X_{s,t}(x_s)) |
 | `train.checkpoint_name` | `flowdraft-{step:07d}` | checkpoint filename pattern — set your own per experiment (quote on CLI: `'train.checkpoint_name="my-run-{step:07d}"'`) |
 | `train.checkpoint_every_n_steps` | 1000 | unconditional recovery snapshot interval in optimizer steps; all periodic snapshots are retained |
 | `train.checkpoint_save_top_k` | 2 | how many best validation-metric checkpoints to retain |
@@ -1053,13 +1044,13 @@ overwrite each other:
 | `*_flowdraft` | `variant=flowdraft_block_wise`, verifier alignment only — the ablation | `checkpoints/<name>/` |
 | `*_flowdraft_multistep` | `variant=flowdraft_block_wise` + the multi-step term | `checkpoints/<name>/` |
 
-Your own experiment (e.g. the `anchor_point` study) — override name and dir
-so it gets its own shelf too:
+Your own experiment (e.g. where the refinement chain may enter) — override
+name and dir so it gets its own shelf too:
 
 ```bash
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
-    train.anchor_point=landing \
-    output_dir=checkpoints/anchor-landing 'train.checkpoint_name="anchor-landing-{step:07d}"'
+    train.selfcorrect_s_min=0.0 \
+    output_dir=checkpoints/smin-0 'train.checkpoint_name="smin-0-{step:07d}"'
 ```
 
 ## Inference parameters, in plain words

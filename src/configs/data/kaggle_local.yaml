@@ -1,0 +1,16 @@
+dataset: parquet
+revision: null
+splits: [chat, code, math]
+streaming: true
+shuffle_buffer: 256
+pack_sequences: true
+pad_to_max_length: true
+val_size: 8
+train_size: 89000   # строк; null запрещён при упаковке
+batch_size: 16
+max_length: 256
+num_workers: 0
+data_files:
+  chat: [/private/tmp/claude-501/-Users-js-Desktop-FlowDraft/4668fad4-bb6a-448e-a8e7-1058da7a5758/scratchpad/nemo/chat.parquet]
+  code: [/private/tmp/claude-501/-Users-js-Desktop-FlowDraft/4668fad4-bb6a-448e-a8e7-1058da7a5758/scratchpad/nemo/code.parquet]
+  math: [/private/tmp/claude-501/-Users-js-Desktop-FlowDraft/4668fad4-bb6a-448e-a8e7-1058da7a5758/scratchpad/nemo/math.parquet]

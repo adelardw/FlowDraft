@@ -295,11 +295,8 @@ def main(cfg: DictConfig) -> None:
         "training_device_hours": getattr(model, "checkpoint_device_hours", None),
         "attention_backend": cfg.model.backbone.get("attn_implementation", None),
         "train_lr": train_cfg.get("lr", None),
-        "train_time_sampling": train_cfg.get("time_sampling", None),
-        "train_lambda": train_cfg.get("lambda", None),
         "train_verify_kl_weight": train_cfg.get("verify_kl_weight", None),
         "train_anchors_per_sequence": train_cfg.get("anchors_per_sequence", None),
-        "train_anchor_point": train_cfg.get("anchor_point", None),
         "train_selfcorrect_kl_weight": train_cfg.get("selfcorrect_kl_weight", None),
         "block_size": dec.block_size,
         "jumps": dec.jumps if isinstance(dec.jumps, int) else OmegaConf.to_container(dec.jumps, resolve=True)

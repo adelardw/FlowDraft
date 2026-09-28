@@ -20,12 +20,12 @@ class FlowDraftBlockWise(FlowDraft):
          CLEAN in-block anchor (the decode loop's pending correction/bonus
          token, whose K/V are not in the cache while drafting), positions
          ``p+1 .. p+K-1`` are noised and drafted;
-      3. every DF forward of the loss (last-jump verifier alignment, draft,
-         anchor, EC expert, TD) runs WITH the cache AND the clean anchor at
-         in-block position 0. Multiple blocks are isolated with the same
-         dual-pass mask used by Orthrus.
+      3. every DF forward of the loss (the verifier alignment at the entry
+         state, and the refinement passes) runs WITH the cache AND the clean
+         anchor at in-block position 0. Multiple blocks are isolated with the
+         same dual-pass mask used by Orthrus.
 
-    Same losses, samplers, knobs and checkpoints as the parent; extra knobs:
+    Knobs:
     ``train.block_size`` (K = anchor + K-1 drafts), ``train.anchors_per_sequence``,
     ``train.verify_kl_weight``, ``train.teacher_chain_tail_weight``,
     ``train.position_weights`` and ``train.min_prefix``.
@@ -707,38 +707,20 @@ class FlowDraftBlockWise(FlowDraft):
             df_kwargs,
         ) = prepared
         x1 = self.df_processor.to_simplex(block_ids, attention_mask=block_mask)
-        x_s, x_t, s, t = self.sample_trajectory(x1, block_mask)
-        # Форвард на общей паре (s, t) нужен ТОЛЬКО членам CFM: log_draft входит
-        # в EC, а pi -- в точку приземления x_jump. При endpoint_weight = 0 и
-        # lambda = 0 его выход в лосс не входит вовсе, и градиент по нему ровно
-        # нулевой (проверено retain_grad). Это был мёртвый форвард: 1 из 3 у
-        # конфигурации только с verify_kl и 1 из 7 у конфигураций с самокоррекцией, то есть
-        # 33% и 14% всей работы шага. Заодно он делал число форвардов у ветвей
-        # разным (7 против 6) без всякой причины.
-        draft_logits = None
-        if self._needs_trajectory_forward():
-            draft_logits = self._df_forward(
-                x_s, anchor, ctx_mask, cache, s, t, df_kwargs
-            )
         count = int(self.cfg.train.get("anchors_per_sequence", 1))
         # The decode loop enters every cycle at the pure prior, s = 0, so that
         # is the only state this term should be evaluated at.
         verify_input = self.sample_prior(x1, block_mask)
-        verify_s = torch.zeros_like(s)
-        ones = torch.ones_like(t)
+        verify_s = torch.zeros(x1.size(0), device=x1.device)
+        ones = torch.ones_like(verify_s)
         verify_logits = self._df_forward(
             verify_input, anchor, ctx_mask, cache, verify_s, ones, df_kwargs
         )
 
         shared = dict(
             teacher_logits=teacher_logits,
-            draft_logits=draft_logits,
             verify_logits=verify_logits,
-            x_s=x_s,
-            x_t=x_t,
             x1=x1,
-            s=s,
-            t=t,
             ctx_mask=ctx_mask,
             block_mask=block_mask,
             cache=cache,
@@ -795,19 +777,6 @@ class FlowDraftBlockWise(FlowDraft):
                 "and train.log_train_acceptance"
             )
 
-    def _needs_trajectory_forward(self):
-        """Нужен ли форвард на общей паре (s, t).
-
-        Его выход читают только члены CFM: `log_draft` -> EC, `pi` -> точка
-        приземления `x_jump` -> EC и TD, и `x_t` -> диагональ endpoint. При
-        нулевых `endpoint_weight` и `lambda` в лосс не входит ничего из этого.
-        Условие конфиговое, а не батчевое, поэтому одинаково на всех рангах.
-        """
-        if float(self.cfg.train.get("endpoint_weight",
-                                    self.cfg.train.get("anchor_weight", 1.0))):
-            return True
-        return bool(float(self.cfg.train.get("lambda", 1.0)))
-
     def _needs_verifier_response(self):
         """Is any enabled term paying for the on-policy AR forward?"""
         return (
@@ -819,13 +788,8 @@ class FlowDraftBlockWise(FlowDraft):
     def compute_loss(
         self,
         teacher_logits,
-        draft_logits,
         verify_logits,
-        x_s,
-        x_t,
         x1,
-        s,
-        t,
         ctx_mask,
         block_mask,
         cache,
@@ -841,14 +805,12 @@ class FlowDraftBlockWise(FlowDraft):
         log_on_step=True,
         log_on_epoch=False,
     ):
-        """The parent's three terms in block geometry.
+        """Verifier alignment at the entry state plus the refinement chain.
 
-        Differences from the full-sequence variant: no one-position shift (teacher
-        is pre-aligned in ``_shared_step``), the live mask is the block's
-        own, and every DF forward carries the clean-prefix cache AND the
+        The teacher is pre-aligned in ``_shared_step``, the live mask is the
+        block's own, and every DF forward carries the clean-prefix cache AND the
         clean in-block anchor (via :meth:`_df_forward`).
         """
-        eps = float(self.cfg.train.get("gamma_clamp", 1e-4))
         live = block_mask.bool()
         if not live.any():
             # the whole block landed in padding: a zero step wired into the
@@ -857,11 +819,6 @@ class FlowDraftBlockWise(FlowDraft):
             self._log_zero_terms(metric_prefix, on_step=log_on_step,
                                  on_epoch=log_on_epoch)
             return verify_logits.sum() * 0.0
-        # `verify_logits` считается всегда, поэтому графово связанный ноль
-        # берётся из него: раньше он брался из `draft_logits`, которого при
-        # выключенных членах CFM больше нет.
-        log_draft = (F.log_softmax(draft_logits.float(), -1)
-                     if draft_logits is not None else None)
         # Verifier alignment on the jump the decode loop finishes with.
         #   KL input:  π^θ_{0,1}(x_0) — the pure prior at s = 0, i.e.
         #              the state the decode loop enters every cycle at.
@@ -873,81 +830,7 @@ class FlowDraftBlockWise(FlowDraft):
             verify_logits, live, position_weight=pos_w,
         )
 
-        # Landing point of the jump — the EC-target input. Detached: the
-        # jump's single teacher is ECLD.
-        pi = gamma = x_jump = None
-        if log_draft is not None:
-            pi = log_draft.exp()
-            gamma = ((t - s) / (1.0 - s).clamp(min=eps))[:, None, None]
-            x_jump = x_s + gamma * (pi - x_s)
-            x_jump = (x_jump * block_mask[..., None].to(x_jump.dtype)).detach()
-
-        # --- categorical VFM endpoint likelihood on the diagonal, plus the two
-        # consistency terms. Each costs a DF forward, and each was being paid
-        # for unconditionally and then multiplied by a weight that is zero in
-        # the measured working point -- three forwards out of eight spent on
-        # terms that contribute nothing. Skip them when their weight is zero;
-        # the graph-connected zero keeps every parameter in DDP's reduction.
-        lam = self._lambda()
-        endpoint_weight = self.cfg.train.get(
-            "endpoint_weight", self.cfg.train.get("anchor_weight", 1.0)
-        )
         zero = verify_logits.sum() * 0.0
-        endpoint, ec, td = zero, zero, zero
-        ec_kl = None
-        anchor_point = self.cfg.train.get("anchor_point", "trajectory")
-        diag_logits = None
-        if endpoint_weight or lam:
-            anchor_input = {"trajectory": x_t, "landing": x_jump}.get(anchor_point)
-            if anchor_input is None:
-                raise ValueError(
-                    f"unknown anchor_point='{anchor_point}' (trajectory | landing)"
-                )
-            diag_logits = self._df_forward(
-                anchor_input, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
-            )
-        if endpoint_weight:
-            endpoint_nll = F.cross_entropy(
-                diag_logits.float().transpose(1, 2),
-                x1.argmax(-1),
-                reduction="none",
-            )
-            endpoint = endpoint_nll[live].mean()
-        if lam:
-            # --- L_CE-EC — eq. (18) in "Categorical Flow Maps" (Roos et al.):
-            # the jump must agree with the stop-grad expert at its landing point.
-            if anchor_point == "landing":
-                tgt = diag_logits.detach().float().softmax(-1)
-            else:
-                with torch.no_grad():
-                    tgt = self._df_forward(
-                        x_jump, anchor, ctx_mask, cache, s=t, t=t, df_kwargs=df_kwargs
-                    ).float().softmax(-1)
-            # Логируется KL, а не CE: CE = KL + H(tgt) никогда не достигает
-            # нуля, поэтому записанное значение доминируется энтропией таргета
-            # и с verify_kl несравнимо. Градиент тот же -- tgt отцеплен.
-            #
-            # Гейта по гамме здесь НЕТ, и это проверено, а не принято на веру.
-            # При t -> s таргет и предсказание приходят из одного вызова сети,
-            # то есть tgt = sg(p), и градиент CE по логитам равен p - sg(p) =
-            # РОВНО НОЛЬ (замер: |dCE/dlogits|_inf = 1.9e-9). Вырожденные
-            # розыгрыши не портят обучение, они в него просто не входят.
-            # Отбрасывать их означало бы лишь домножить член на 1/P(gamma>eps)
-            # = 1.19 без всякой причины.
-            ce = -(tgt * log_draft).sum(-1)
-            ec = ce[live].mean()
-            # KL = CE - H(tgt). Считается ЗДЕСЬ и подключается к метрикам ниже:
-            # значение раньше присваивалось в атрибут, который никто не читал,
-            # и логировалась всё та же CE. Тензор, не float, — приведение к
-            # питоновскому числу синхронизировало бы хост на каждом шаге.
-            ec_kl = (ce + (tgt * tgt.clamp_min(1e-12).log()).sum(-1))[live].mean().detach()
-
-            td = self._td_term(
-                pi, gamma, s, t, live,
-                forward_dt=lambda dt: self._df_forward(
-                    x_s, anchor, ctx_mask, cache, s=s, t=t + dt, df_kwargs=df_kwargs
-                ),
-            )
 
         selfcorrect_kl = None
         if onpolicy_logits is not None:
@@ -960,19 +843,10 @@ class FlowDraftBlockWise(FlowDraft):
             selfcorrect_kl = zero
 
         verify_kl_weight = self.cfg.train.get("verify_kl_weight", 0.0)
-        loss = (
-            verify_kl_weight * verify_kl
-            + selfcorrect_kl_weight * selfcorrect_kl
-            + endpoint_weight * endpoint
-            + lam * (4.0 * ec + 2.0 * td)
-        )
+        loss = verify_kl_weight * verify_kl + selfcorrect_kl_weight * selfcorrect_kl
         metrics = {
-            f"{metric_prefix}/endpoint": endpoint,
             f"{metric_prefix}/verify_kl": verify_kl,
             f"{metric_prefix}/selfcorrect_kl": selfcorrect_kl,
-            f"{metric_prefix}/ec": ec_kl if ec_kl is not None else ec,
-            f"{metric_prefix}/td": td,
-            f"{metric_prefix}/lambda": lam,
         }
         if accepted is not None:
             # The on-policy forward makes the training-time acceptance curve
@@ -1005,7 +879,7 @@ class FlowDraftBlockWise(FlowDraft):
         (`_needs_verifier_response`), а не из того, что нашлось в этом батче.
         """
         zero = torch.zeros((), device=self.device)
-        names = ["endpoint", "verify_kl", "selfcorrect_kl", "ec", "td", "lambda"]
+        names = ["verify_kl", "selfcorrect_kl"]
         if self._needs_verifier_response():
             names.append("accepted")
         self.log_dict(

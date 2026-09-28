@@ -25,13 +25,8 @@ class FlowDraftIdem(FlowDraftBlockWise):
     def compute_loss(
         self,
         teacher_logits,
-        draft_logits,
         verify_logits,
-        x_s,
-        x_t,
         x1,
-        s,
-        t,
         ctx_mask,
         block_mask,
         cache,
@@ -48,7 +43,7 @@ class FlowDraftIdem(FlowDraftBlockWise):
         log_on_epoch=False,
     ):
         loss = super().compute_loss(
-            teacher_logits, draft_logits, verify_logits, x_s, x_t, x1, s, t,
+            teacher_logits, verify_logits, x1,
             ctx_mask, block_mask, cache, anchor, anchor_ids, df_kwargs,
             onpolicy_logits=onpolicy_logits, expected=expected,
             accepted=accepted, known=known, metric_prefix=metric_prefix,

@@ -46,34 +46,16 @@ train:
   # For the self-correction state the second argument is a softmax, not a
   # one-hot, so the discunif threshold there is 1/(1 + q_max), not 0.5.
   prior_type: discunif          # discunif | gaussian | dirichlet
-  time_sampling: paper          # paper: t~U[0,1], s~U[0,t] | triangle | sequential
-  terminal_time_fraction: 0.0   # share of the batch forced onto t = 1, the only
-                                # pair the decode loop executes
-  anchor_point: trajectory      # diagonal input: trajectory pi_{t,t}(x_t) | landing
   gamma_clamp: 1.0e-4           # floor on (1-s) in gamma = (t-s)/(1-s), bounding
                                 # gamma at 1e4 as s -> 1. NOT a precision guard:
                                 # s comes from fp32 rand, and by Sterbenz 1-s is
                                 # exact for s in [0.5,1] in any binary format. A
                                 # coarser floor would break gamma = 1 at t = 1:
                                 # at 1e-2 that identity already fails for s > 0.99
-  td_min_step: 0.01             # minimum finite-difference probe for the drift term
-  min_jump_gap: 0.0             # floor on t - s. Affects exactly ONE configuration --
-                                # the only one with endpoint_weight or lambda
-                                # non-zero; elsewhere the (s,t) forward is not
-                                # computed at all (measured: loss identical at
-                                # gap 0 / 0.05 / 0.2 for nine of ten configurations,
-                                # 11.564 / 11.530 / 11.286 for the tenth).
-                                # Kept at 0: the gradient at s ~ t is NOT zero,
-                                # it is O(t - s), so those pairs are weak rather
-                                # than useless, and there is no evidence that
-                                # excluding them helps. Raising it changes what
-                                # that configuration means and needs its own control
 
   # --- objective ----------------------------------------------------------
   #   loss = verify_kl_weight   * KL(p_AR || pi_{0,1}(x0))
   #        + selfcorrect_kl_w   * KL(p_AR(.|draft) || pi_{s,1}(x_s carrying draft))
-  #        + endpoint_weight    * CE(x1, pi_{t,t})
-  #        + lambda * (4*EC + 2*TD)
   verify_kl_weight: 0.0
   selfcorrect_kl_weight: 0.0    # the multi-step term: walks the jump schedule, each
                                 # refinement pass supervised by the AR sweep of the refinement pass before it
@@ -83,9 +65,6 @@ train:
                                 # -- the Jacobi operator -- and s near 0 buries the draft
                                 # under prior noise at a frozen embedding
   selfcorrect_tail_weight: 0.5  # trust in positions past the verifier's break
-  endpoint_weight: 1.0
-  lambda: 1.0                   # ECLD weight
-  lambda_ramp_steps: 0          # ramp lambda 0 -> lambda over N steps; 0 = static
 
   teacher_target: soft          # soft KL | hard CE(argmax) | tv (= sampled acceptance)
   teacher_source: corpus        # what p_AR is conditioned on. corpus = the packed
