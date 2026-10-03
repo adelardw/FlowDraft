@@ -81,9 +81,9 @@ ICML и в ARR одновременно.
 | Кампания | Конфиг | Горизонт | Состояние на 3.10 |
 |---|---|---|---|
 | idem | `qwen06_flowdraft_multistep_qkv_idem` | 80k | сессия 8, с шага 44 035 |
-| FlowDraft Q,K,V,O | `qwen06_flowdraft_multistep` | 100k | сессия 1 запущена 3.10 |
-| Orthrus Q,K,V,O | `qwen06_orthrus_qkvo` | 100k | стартует после замера C9 на том же аккаунте |
-| Замер выпуска | Orthrus-Qwen3-1.7B | — | идёт, C9 |
+| FlowDraft Q,K,V,O | `qwen06_flowdraft_multistep` | 100k | сессия 1 запущена 3.10 в 18:29 |
+| Orthrus Q,K,V,O | `qwen06_orthrus_qkvo` | 100k | сессия 1 запущена 3.10 в 19:49 |
+| Замер выпуска | Orthrus-Qwen3-1.7B | — | готово 3.10, C9 и E11: таблица 1 воспроизводится |
 
 Кампании ведёт `ops/campaign80k.py`. Состояние каждой — в
 `kaggle_out/<слаг>/state.json`, лог — в `kaggle_out/camp_*.log`.
