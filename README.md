@@ -17,6 +17,7 @@
 
 ## Table of contents
 
+- [Research log](docs/README.md) — goals and plan, a ledger of every comparison, and the evidence behind each finding (in Russian)
 - [Results, first scale point: SmolLM2-135M](#results-first-scale-point-smollm2-135m-august-2026) — ten runs, three seeds, the multi-step claims
 - [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
 - [Results at a converged budget: Qwen3-0.6B to 80,000 steps](#results-at-a-converged-budget-qwen3-06b-to-80000-steps-september-2026) — both arms to convergence, and the schedule that was costing a pass
