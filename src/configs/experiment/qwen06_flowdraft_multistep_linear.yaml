@@ -1,0 +1,16 @@
+# @package _global_
+# Лучшая многошаговая конфигурация (Q, K, V, O) с гибридным диффузионным видом —
+# тот же план линеаризации, что у LinearOrthrus (`qwen06_linear_base`).
+#
+# Пара к `qwen06_flowdraft_multistep`: отличается ровно вариантом и планом.
+# Вместе с парой Orthrus это сетка 2×2: {Orthrus, многошаговая} × {полный,
+# гибридный вид}, все на 100k шагов.
+#   uv run python src/train.py +experiment=qwen06_flowdraft_multistep_linear
+defaults:
+  - /experiment/qwen06_flowdraft_multistep
+  - /experiment/qwen06_linear_base
+  - _self_
+
+output_dir: checkpoints/qwen06_flowdraft_multistep_linear
+train:
+  variant: flowdraft_block_wise_linear

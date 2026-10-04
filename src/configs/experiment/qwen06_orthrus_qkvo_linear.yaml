@@ -1,0 +1,16 @@
+# @package _global_
+# LinearOrthrus: Orthrus с Q, K, V, O и гибридным диффузионным видом — в слоях
+# плана (`qwen06_linear_base`) компонент заменён на W x + b, дистиллированное к
+# тому, что замороженный компонент считает на входе драфтера.
+#
+# Пара к `qwen06_orthrus_qkvo`: отличается ровно вариантом и планом, поэтому
+# разность приёмки и скорости относится к линеаризации и ни к чему ещё.
+#   uv run python src/train.py +experiment=qwen06_orthrus_qkvo_linear
+defaults:
+  - /experiment/qwen06_orthrus_qkvo
+  - /experiment/qwen06_linear_base
+  - _self_
+
+output_dir: checkpoints/qwen06_orthrus_qkvo_linear
+train:
+  variant: orthrus_linear
