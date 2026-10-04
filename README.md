@@ -352,7 +352,7 @@ the corrected schedule delivers.
 
 ## Porting to Qwen3-1.7B, the paper's own scale
 
-The four experiments that carry the claims have Qwen presets reproducing the
+The baseline and the method have Qwen presets reproducing the
 paper's Table 4 hyperparameters exactly (2048 tokens, 256 anchor blocks, block
 size 32, two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup,
 gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
@@ -360,12 +360,6 @@ gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 ```bash
 # reference point: Orthrus verbatim — W_Q, W_K, W_V only
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
-
-# masked drafter trained on its own refinement procedure
-./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep
-
-# continuous state, verifier alignment only — the ablation
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft
 
 # continuous state trained on its own refinement procedure — the main result
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep
@@ -530,17 +524,6 @@ seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
 ./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
     output_dir=checkpoints/smollm_orthrus
 
-# Baseline plus the multi-step term, in the MASKED state. Against the line
-# above this is the multi-step effect where the state cannot carry a draft.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus_multistep \
-    output_dir=checkpoints/smollm_orthrus_multistep
-
-
-# Flow map WITHOUT multi-step: only the alignment on the jump that ends a
-# decode cycle. The ablation the main claim is measured against.
-./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft \
-    output_dir=checkpoints/smollm_flowdraft
-
 # THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
 # procedure.
 ./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
@@ -562,15 +545,6 @@ batch is split: 16×1 where memory allows and 8×2 where it does not, the same
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus \
     output_dir=checkpoints/qwen06_orthrus
 
-# Masked state plus the multi-step term.
-./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_multistep \
-    output_dir=checkpoints/qwen06_orthrus_multistep
-
-# Continuous state, verifier alignment only — the ablation the main claim is
-# measured against.
-./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft \
-    output_dir=checkpoints/qwen06_flowdraft
-
 # Continuous state trained on its own refinement, adapting Q, K, V and O.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep \
     output_dir=checkpoints/qwen06_flowdraft_multistep
@@ -580,9 +554,21 @@ batch is split: 16×1 where memory allows and 8×2 where it does not, the same
 # against Orthrus is like-for-like.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep_qkv \
     output_dir=checkpoints/qwen06_flowdraft_multistep_qkv
+
+# Orthrus as RELEASED: the authors' weights train W_O too, so this adds it.
+# Paired with qwen06_flowdraft_multistep above (also Q, K, V, O), 100k steps.
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_qkvo \
+    output_dir=checkpoints/qwen06_orthrus_qkvo
+
+# The same two with a hybrid diffusion view: 18 components replaced by linear
+# maps distilled from what the frozen components compute (EXPERIMENTS.md §7.2).
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_qkvo_linear \
+    output_dir=checkpoints/qwen06_orthrus_qkvo_linear
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep_linear \
+    output_dir=checkpoints/qwen06_flowdraft_multistep_linear
 ```
 
-#### Qwen3-1.7B — the four experiments that carry the claims
+#### Qwen3-1.7B — the baseline and the method
 
 At the paper's hyperparameters: 2048 tokens, 256 anchor blocks, block size 32,
 two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup, gradient
@@ -593,18 +579,6 @@ clipping 1.0, global batch 128.
 # else — no output projection, no per-head norms, no position weights.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus \
     output_dir=checkpoints/qwen_orthrus \
-    model.adapter.flex_attention_backend=flash
-
-# Masked drafter trained on the state sequence its own decoding visits:
-# propose, freeze the most confident positions, re-mask the rest, repeat.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_multistep \
-    output_dir=checkpoints/qwen_orthrus_multistep \
-    model.adapter.flex_attention_backend=flash
-
-# Continuous state, verifier alignment ONLY. The ablation that makes the
-# multi-step claim testable: this target does not depend on the drafter.
-./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft \
-    output_dir=checkpoints/qwen_flowdraft \
     model.adapter.flex_attention_backend=flash
 
 # THE MAIN RESULT. Continuous state trained on its own refinement procedure:
@@ -621,8 +595,8 @@ contrast to be readable, and are meant to be inherited rather than run. They
 *do* compose and start — which is the trap — but with none of the weights that
 define a contrast, so the run falls back to the repository defaults:
 `train.variant=flowdraft` (full-sequence geometry, not the bench's) and the
-trajectory-structure objective that §3.5 of [EXPERIMENTS.md](EXPERIMENTS.md)
-measured and rejected. Nothing errors; you simply do not get any of the
+trajectory-structure objective that [EXPERIMENTS.md](EXPERIMENTS.md) §8
+lists as measured and rejected. Nothing errors; you simply do not get any of the
 configurations above.
 
 #### All of them in sequence
@@ -632,8 +606,7 @@ memory and the timings stop being comparable. The loop resumes anything already
 started.
 
 ```bash
-EXPERIMENTS="smollm_orthrus smollm_orthrus_multistep \
-      smollm_flowdraft smollm_flowdraft_multistep"
+EXPERIMENTS="smollm_orthrus smollm_flowdraft_multistep"
 
 for seed in 42 43 44; do
   out=checkpoints; [ $seed = 42 ] || out=checkpoints/s$seed
@@ -751,10 +724,10 @@ commands that launch them are in
 | experiment | SmolLM2-135M | Qwen3-0.6B | Qwen3-1.7B |
 |---|---|---|---|
 | Orthrus, reproduced | `smollm_orthrus` | `qwen06_orthrus` | `qwen_orthrus` |
-| masked + multi-step | `smollm_orthrus_multistep` | `qwen06_orthrus_multistep` | `qwen_orthrus_multistep` |
-| continuous state, ablation | `smollm_flowdraft` | `qwen06_flowdraft` | `qwen_flowdraft` |
 | continuous state + multi-step | `smollm_flowdraft_multistep` | `qwen06_flowdraft_multistep` | `qwen_flowdraft_multistep` |
 | the same on Q,K,V alone | — | `qwen06_flowdraft_multistep_qkv` | — |
+| Orthrus as released, Q,K,V,O | — | `qwen06_orthrus_qkvo` | — |
+| hybrid diffusion view (Orthrus / the method) | — | `qwen06_orthrus_qkvo_linear` / `qwen06_flowdraft_multistep_linear` | — |
 
 `smollm_base`, `qwen06_base` and `qwen_base` are the shared bases these inherit,
 not experiments. Presets that were measured and rejected — the trajectory-structure
@@ -1041,9 +1014,13 @@ overwrite each other:
 | Preset | Sets | Checkpoints |
 | --- | --- | --- |
 | `*_orthrus` | `variant=orthrus`, no additions — the published baseline | `checkpoints/<name>/` |
-| `*_orthrus_multistep` | `variant=orthrus` + the multi-step term | `checkpoints/<name>/` |
-| `*_flowdraft` | `variant=flowdraft_block_wise`, verifier alignment only — the ablation | `checkpoints/<name>/` |
 | `*_flowdraft_multistep` | `variant=flowdraft_block_wise` + the multi-step term | `checkpoints/<name>/` |
+| `*_linear` | the same with a hybrid diffusion view (`variant=orthrus_linear` / `flowdraft_block_wise_linear`) | `checkpoints/<name>/` |
+
+The masked drafter trained on its own refinement (`*_orthrus_multistep`), the
+continuous ablation without it (`*_flowdraft`) and the idempotence term were
+measured and rejected; their presets and code are in `bucket/`, and the
+measurements stay in the results sections above.
 
 Your own experiment (e.g. where the refinement chain may enter) — override
 name and dir so it gets its own shelf too:
