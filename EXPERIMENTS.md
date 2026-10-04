@@ -678,6 +678,63 @@ quota.
 
 ---
 
+### 7.8 Reinforcement learning from the verifier (idea, not scheduled)
+
+The AR model is a verifier with a verifiable reward, the drafter is the
+policy, prompts are the environment. On a state $(\mathrm{ctx}, \text{anchor})$
+taken from the AR model's own greedy continuation — the states decoding
+actually visits — the one-pass drafter is a policy over blocks,
+
+```math
+\pi_\theta(d \mid \mathrm{ctx}) = \prod_{j=1}^{K-1} q_{\theta,j}(d_j),
+\qquad
+c_j(d) = \mathbf 1\big[d_j = \arg\max p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}, d_{<j})\big],
+\qquad
+R(d) = A(d) = \sum_{j=1}^{K-1}\prod_{i\le j} c_i(d),
+```
+
+and all $c_j$ come from one AR forward over the block. A GRPO step samples $G$
+blocks per state and normalises the reward within the group:
+
+```math
+\hat A_g = \frac{R(d^{(g)}) - \mathrm{mean}_h R(d^{(h)})}{\mathrm{std}_h R(d^{(h)})},
+\qquad
+\mathcal L_{\mathrm{RL}} = -\frac{1}{G}\sum_{g=1}^{G}\hat A_g \sum_{j \le A(d^{(g)}) + 1}\log q_{\theta,j}\big(d^{(g)}_j\big)
+\;+\; \beta\,\mathrm{KL}\big(\pi_\theta \,\|\, \pi_{\mathrm{ref}}\big).
+```
+
+Positions after the first rejection do not enter: they cannot change $R$.
+Because the one-pass drafter is mean-field, a single drafter forward gives $q$
+for all $G$ samples, and the $G$ verifications are one batched AR forward over
+the block — about the cost of the current teacher pass.
+
+**What the verifier gives beyond a reward.** It returns the whole
+$p_{\mathrm{AR}}(\cdot\mid\mathrm{ctx}, d_{<j})$ at every position of the
+drafter's own block — a dense, on-policy target. Distilling towards it reaches
+the same optimum as the reward (match the greedy chain) with far less variance;
+the method's multi-step term already does this on its own drafts. RL with the
+scalar $A$ alone discards that information. What RL adds is optimising $E[A]$
+itself — the conjunction — instead of a per-position surrogate.
+
+**Where it is the right tool.**
+1. *The multi-step chain end to end.* The multi-step term is a DAgger step
+   through an argmax and is not the gradient of anything (§9). A score-function
+   gradient of $E[A_n]$ over the sampled $n$-pass procedure is unbiased, and
+   trains the passes to cooperate — the first to leave drafts the second
+   repairs best.
+2. *Learned halting.* Whether to spend another pass or verify now is a discrete
+   decision with a delayed reward (tokens per forward); a learned rule could
+   make extra passes pay where the fixed schedule cannot.
+3. *Not* sampled decoding: there the expected acceptance,
+   $\sum_v \min(q_j(v), p_j(v))$ per position, is closed-form and
+   differentiable, so it can be optimised directly (§7.7).
+
+**How it would run.** A fine-tuning stage on a supervised checkpoint, with a
+control that continues supervised training for the same number of steps —
+otherwise any gain is just more steps. Prior art to check first: online
+speculative decoding and DistillSpec (on-policy distillation of drafters);
+reinforcement learning of drafters specifically has not been searched.
+
 ## 8. Rejected ideas
 
 Measured and dropped. Their full sections moved to
