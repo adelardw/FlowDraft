@@ -8,7 +8,7 @@
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 -->
 
-> **Status: two scale points measured, one of them to a converged budget.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not run** — those presets are written and reviewed but never exercised.
+> **Status: two scale points measured, one of them to a converged budget.** SmolLM2-135M — ten training runs at 20k steps, three replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; decoding is bitwise-lossless at greedy and, via Gumbel coupling, at sampling. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not been trained here**; the authors' released Orthrus-Qwen3-1.7B, measured in this harness, reproduces the paper's Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit the token budget. A Q,K,V,O pair and a hybrid diffusion view are training to 100k steps.
 
 **Summer of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
@@ -197,7 +197,8 @@ comparison against the baseline is now like-for-like:
 |---|---|---|
 | **continuous + multi-step vs Orthrus, same projections** | **+0.243** ± 0.025 | **+1.595** ± 0.059 |
 | cost of adapting O as well | +0.140 ± 0.027 | +0.559 ± 0.047 |
-| continuous vs masked, both multi-step | +0.081 ± 0.026 | +1.424 ± 0.053 |
+| continuous (Q,K,V) vs masked (Q,K,V,O), both multi-step — projections differ | +0.081 ± 0.026 | +1.424 ± 0.053 |
+| continuous vs masked, both multi-step, both Q,K,V,O | −0.059 ± 0.025 | +0.865 ± 0.050 |
 | multi-step training, continuous state (Q,K,V,O) | +0.241 ± 0.027 | +1.200 ± 0.054 |
 
 **Compared with 135M, at the same schedule.** The first scale point states its
@@ -358,7 +359,8 @@ size 32, two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup,
 gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 
 ```bash
-# reference point: Orthrus verbatim — W_Q, W_K, W_V only
+# reference point: Orthrus as the paper's text describes it — W_Q, W_K, W_V only
+# (the released weights also train W_O; on Qwen3-0.6B that is qwen06_orthrus_qkvo)
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
 
 # continuous state trained on its own refinement procedure — the main result
@@ -411,9 +413,10 @@ length 11.7 solves to a = 0.929). Getting it wrong is not free: at 0.93 the
 deep positions carry ~44% of the gradient mass, at 0.6 about 3%. Every run logs
 per-position acceptance, so derive it from the data and retrain if it moved.
 
-**Untested on this hardware.** Collective operations, the rank seed offset and
-the sparse FlexAttention path are no-ops on a single MPS device and have never
-been exercised. Run one short job before committing to a long one.
+**Exercised on one device only.** The sparse FlexAttention path has run on a
+T4 (`FLOWDRAFT_DF_ATTENTION=auto`); collective operations and the rank seed
+offset have never run on more than one device. Run one short job before
+committing to a long one.
 
 ## Defects found and fixed
 
@@ -440,9 +443,10 @@ paper preset); `val_check_interval` in the paper presets counted loader batches
 Losslessness needs `model.backbone.dtype=float32`: under bf16 the verifier's
 arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6).
 
-Rejected configurations live in [bucket/](bucket/) with their numbers.
-Objective assumptions that code cannot remove are in
-section 6 of [EXPERIMENTS.md](EXPERIMENTS.md), including one measured and found unsatisfied.
+Rejected configurations are kept outside the repository (`bucket/`, not
+shipped); their numbers are in §8 of [EXPERIMENTS.md](EXPERIMENTS.md). Objective
+assumptions that code cannot remove are in §9, including one measured and found
+unsatisfied.
 
 ## Overview
 
@@ -462,7 +466,7 @@ the same command.
 ### 1. Setup (once)
 
 ```bash
-git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+git clone https://github.com/adelardw/FlowDraft.git && cd FlowDraft
 uv sync
 echo "HF_TOKEN=hf_..." > .env          # gated backbone access
 ./hf-auth.sh                           # verify: prints your HF username
@@ -589,15 +593,14 @@ clipping 1.0, global batch 128.
     model.adapter.flex_attention_backend=flash
 ```
 
-**Three presets are bases, not experiments.** `smollm_base`, `qwen06_base` and
+**Four presets are bases, not experiments.** `smollm_base`, `qwen06_base` and
 `qwen_base` hold what every configuration at that scale must agree on for a
-contrast to be readable, and are meant to be inherited rather than run. They
-*do* compose and start — which is the trap — but with none of the weights that
-define a contrast, so the run falls back to the repository defaults:
-`train.variant=flowdraft` (full-sequence geometry, not the bench's) and the
-trajectory-structure objective that [EXPERIMENTS.md](EXPERIMENTS.md) §8
-lists as measured and rejected. Nothing errors; you simply do not get any of the
-configurations above.
+contrast to be readable; `qwen06_linear_base` holds the linearization plan the two
+hybrid runs share. They are meant to be inherited rather than run. Run on its
+own, a base falls back to the repository default `train.variant=flowdraft` — the
+full-sequence geometry whose only loss was the trajectory-structure objective,
+measured and rejected ([EXPERIMENTS.md](EXPERIMENTS.md) §8) — and training stops
+with an error that says so.
 
 #### All of them in sequence
 
@@ -714,9 +717,9 @@ model.backbone.device_map=null`.
 
 ## Experiments
 
-Four experiments across three backbones, each a preset in
-`src/configs/experiment/`, plus one projection ablation that exists only where
-it was measured. What each one tests, the loss written out term by term, the
+The baseline and the method across three backbones, each a preset in
+`src/configs/experiment/`; on Qwen3-0.6B also the method on Q, K, V alone,
+Orthrus as its weights are released (Q, K, V, O) and the hybrid diffusion view. What each one tests, the loss written out term by term, the
 results and the statistics are in **[EXPERIMENTS.md](EXPERIMENTS.md)**; the
 commands that launch them are in
 [step 3 of the Quickstart](#3-train-every-experiment).
@@ -729,10 +732,13 @@ commands that launch them are in
 | Orthrus as released, Q,K,V,O | — | `qwen06_orthrus_qkvo` | — |
 | hybrid diffusion view (Orthrus / the method) | — | `qwen06_orthrus_qkvo_linear` / `qwen06_flowdraft_multistep_linear` | — |
 
-`smollm_base`, `qwen06_base` and `qwen_base` are the shared bases these inherit,
-not experiments. Presets that were measured and rejected — the trajectory-structure
-objective, the input gate, the Q/K/O projection set, the weight-profile controls
-— live in `bucket/` with their numbers, and are deliberately not shipped.
+`smollm_base`, `qwen06_base`, `qwen_base` and `qwen06_linear_base` are the shared
+bases these inherit, not experiments. Presets that were measured and rejected —
+the masked drafter trained on its own refinement, the continuous state without
+it, the trajectory-structure objective, the input gate, the Q/K/O projection
+set, the weight-profile controls and the idempotence term — are kept outside the
+repository and deliberately not shipped; their numbers are in
+[EXPERIMENTS.md](EXPERIMENTS.md) §8.
 
 ## Background: the decoding bottleneck
 
@@ -762,7 +768,7 @@ FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 - **Categorical Flow Maps** [Roos et al., 2026] learn the *integrated, correlated* endpoint distribution on the simplex and generate in **one or few jumps**.
 - Use it as the drafter: a **higher-fidelity joint proposal** over the block — at the **same pass count**.
 - Verification is unchanged → output stays **strictly lossless**; the drafter only affects *speed*, never *quality*.
-- **Novelty:** a flow-map drafter inside Orthrus, trained with categorical VFM endpoint inference and flow-map consistency while retaining optional verifier alignment.
+- **Novelty:** a flow-map drafter inside Orthrus, trained on its own refinement chain against the frozen verifier. The flow-map consistency losses it started from were measured, found harmful and dropped ([EXPERIMENTS.md](EXPERIMENTS.md) §8).
 
 **Why it matters**
 
@@ -771,6 +777,10 @@ FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 3. **Foundations** — connects flow-map distillation to fast, faithful LLM inference.
 
 ## CFM training, in brief
+
+*Where the project started. The self-consistency part below was measured, cost
+−0.114 accepted tokens, and was removed; the objective in use is under
+[Method](#method).*
 
 The drafter learns two complementary parts of a categorical flow map:
 
@@ -782,6 +792,9 @@ The ECLD target is stop-gradiented. Verifier alignment lives in `train.verify_kl
 The AR model remains frozen throughout. In paper-faithful CFM training it supplies the cached prefix for the block-wise geometry and validation targets; at inference it verifies every proposal, which is what guarantees losslessness.
 
 ## Goals
+
+*The original project brief. What was kept and what was measured and dropped is
+in [EXPERIMENTS.md](EXPERIMENTS.md) §8.*
 
 1. **Reproduce Orthrus** (frozen AR + masked-diffusion drafter, shared KV cache, lossless loop) at a tractable scale.
 2. **Implement a flow-map drafter** (simplex endpoint head, 1–few jumps).
@@ -798,12 +811,12 @@ The AR model remains frozen throughout. In paper-faithful CFM training it suppli
 
 One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained against the frozen verifier: at the state every decode cycle enters, and along the drafter's own refinement chain.
 
-- **Adapter** (`src/models/base/df_adapter.py`): every `q/k/v_proj` gets a trainable twin initialized as a copy of the frozen AR weight (~14% of a 3B backbone). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); norms / MLP / `o_proj` / embeddings / LM head and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
+- **Adapter** (`src/models/base/df_adapter.py`): every projection named in `model.adapter.w_names` — `q/k/v_proj`, plus `o_proj` in the Q,K,V,O presets — gets a trainable twin initialized as a copy of the frozen AR weight (117M parameters for Q, K, V on Qwen3-0.6B). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); everything else — norms, MLP, embeddings, LM head — and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path runs **unmasked** (bidirectional; CFM needs no attention mask beyond padding) and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
 - **Objective** (`FlowDraftBlockWise.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL`
   - **verify KL** — `KL(sg(p_AR) ‖ π_{0,1}(x_0))` at the pure prior, the state every decode cycle enters, against the AR distribution conditioned on the accepted prefix.
   - **self-correction KL** — the drafter walks its own refinement chain, and each pass is trained on the frozen verifier's answer to the draft of the pass before it. This is the multi-step term.
   - The three consistency terms of *Categorical Flow Maps* — endpoint on the diagonal, EC and TD — carried zero weight in every preset and were removed; they and the reasons are in `bucket/cfm_terms`.
-- **Training geometries** (`train.variant`): `flowdraft_block_wise` trains FlowDraft in the exact inference geometry, and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass.
+- **Training geometries** (`train.variant`): `flowdraft_block_wise` trains FlowDraft in the exact inference geometry, and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass. `orthrus_linear` and `flowdraft_block_wise_linear` (`src/models/linear_orthrus.py`) add a hybrid diffusion view: planned components replaced by linear maps distilled from the frozen ones ([EXPERIMENTS.md](EXPERIMENTS.md) §7.2).
 - **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
 
 ## Repository structure
@@ -811,8 +824,13 @@ One frozen backbone, two attention paths (the Orthrus host), and a Categorical F
 ```text
 FlowDraft/
 ├── main.py                        # playground CLI (typer): generate from your prompts
-├── hf-auth.sh                     # HF_TOKEN from .env -> env (gated Llama)
+├── hf-auth.sh                     # HF_TOKEN from .env -> env (optional for the public backbones)
 ├── pyproject.toml                 # uv project; installed as an editable `src` package
+├── EXPERIMENTS.md                 # the baseline, the method, upcoming runs — with the mathematics
+├── RESEARCHERS.md                 # research themes: prior work, hypotheses, sources
+├── docs/                          # research log: comparison ledger, evidence, related work
+├── tools/                         # paired contrasts, checks against the released Orthrus, probes
+├── results/                       # per-prompt measurements behind every reported number
 └── src/
     ├── models/
     │   ├── base/df_adapter.py     # FlowDraftAttentionAdapter: frozen AR + trainable DF twins
@@ -821,6 +839,7 @@ FlowDraft/
     │   ├── factory.py             # build_lit: variant selection + checkpoint loading
     │   ├── flowdraft.py           # FlowDraft: loss, training, lossless generate
     │   ├── flowdraft_block_wise.py        # FlowDraft in the inference geometry
+    │   ├── linear_orthrus.py      # hybrid diffusion view for Orthrus and FlowDraft
     │   └── orthrus.py             # Orthrus masked drafter, block-causal
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
     ├── data/dataloaders.py        # streaming Dataset / collate / DataLoader;
@@ -828,11 +847,11 @@ FlowDraft/
     ├── configs/                   # hydra configs
     │   ├── train.yaml             # training entrypoint config
     │   ├── eval.yaml              # evaluation entrypoint config
-    │   ├── model/                 # qwen3_1.7b (default) | qwen2_0.5b | smollm2_135m
-    │   ├── data/                  # nemotron (training) | math500 (eval, unseen in training)
-    │   └── experiment/            # one preset per experiment + 2 shared bases:
-    │                              #   qwen_* and smollm_* (4 experiments x 2 backbones)
-    │                                  ├── train.py                   # training entrypoint
+    │   ├── model/                 # qwen3_1.7b (default) | qwen3_0.6b | qwen2_0.5b | smollm2_135m
+    │   ├── data/                  # nemotron (training) | gsm8k, math500, humaneval, mbpp, aime24, aime25
+    │   ├── benchmark/             # orthrus: the paper-style evaluation protocol
+    │   └── experiment/            # one preset per experiment + shared bases (smollm_*, qwen06_*, qwen_*)
+    ├── train.py                   # training entrypoint
     ├── eval.py                    # dataset evaluation: acceptance / TPF / NLL -> results/eval.jsonl
     └── plots.py                   # report figures: frontier / TPF bars / TPF-vs-K
 ```
@@ -840,9 +859,9 @@ FlowDraft/
 ## Installation
 
 ```bash
-git clone https://github.com/<org>/FlowDraft.git && cd FlowDraft
+git clone https://github.com/adelardw/FlowDraft.git && cd FlowDraft
 uv sync
-echo "HF_TOKEN=hf_..." > .env     # gated meta-llama access
+echo "HF_TOKEN=hf_..." > .env     # optional: the backbones are public; a token raises Hub rate limits
 ./hf-auth.sh                      # verify the token authenticates
 ```
 
@@ -865,15 +884,15 @@ with the tokenizer's chat template (`src/data/dataloaders.py`). Batch contract:
 on-device, never in the batch.
 
 ```bash
-./hf-auth.sh uv run python src/train.py                            # FlowDraft (the task's recipe)
-./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus       # presets: qwen_orthrus |
-                                                                   #   qwen_flowdraft_multistep | ...
-./hf-auth.sh uv run python src/train.py train.variant=flowdraft_block_wise   # ADDITION: inference geometry
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus                  # the baseline, Qwen3-0.6B
+./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep_qkv   # the method, Qwen3-0.6B
 ```
 
 Variants: `orthrus` is the paper-style block-causal Orthrus recipe (frozen AR
 cache plus independently anchored masked blocks), and `flowdraft_block_wise`
-trains the flow-map drafter in that inference geometry.
+trains the flow-map drafter in that inference geometry; the `*_linear` variants
+add the hybrid diffusion view. The full-sequence `flowdraft` variant has no loss
+left and refuses to train.
 Knobs live in `configs/train.yaml`: `verify_kl_weight`/`selfcorrect_kl_weight`
 (the two terms), `selfcorrect_rounds`/`selfcorrect_s_min` (the refinement chain),
 `block_size`/`min_prefix`, `val_decode_prompts` (val-time decode -> `val/tpf`
@@ -1086,7 +1105,7 @@ evaluation config. Use `checkpoint_config=false` only for a legacy checkpoint
 without metadata, together with explicit matching `model=... variant=...`.
 
 ```bash
-./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # variant=flowdraft is the default
+./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # model and variant are restored from the checkpoint
 # block-size / jump-count ablation grid (hydra multirun):
 ./hf-auth.sh uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4
 ```
@@ -1096,7 +1115,7 @@ Main metrics (mean ± std over `n_prompts`): **acceptance** per cycle and
 speedup vs AR are reported as diagnostics (hardware/kernel dependent). The
 attention kernel is a config switch (`model.backbone.attn_implementation`):
 `eager` (canonical evaluation default) | `sdpa` (fused throughput audit) |
-`flex_attention` (compiled block masks, GPU only) | `eager` (reference).
+`flex_attention` (compiled block masks, GPU only).
 **Continuation NLL** under the frozen teacher is computed in sampling mode
 only (at greedy the output is bitwise equal to AR, so it measures nothing).
 
@@ -1114,10 +1133,10 @@ Orthrus baseline (use the checkpoint belonging to each variant):
 ```bash
 ./hf-auth.sh uv run python src/eval.py -m +benchmark=orthrus \
     data=gsm8k,math500,aime24,aime25,humaneval,mbpp \
-    variant=flowdraft checkpoint=/absolute/path/flowdraft.ckpt
+    checkpoint=/absolute/path/flowdraft.ckpt
 ./hf-auth.sh uv run python src/eval.py -m +benchmark=orthrus \
     data=gsm8k,math500,aime24,aime25,humaneval,mbpp \
-    variant=orthrus checkpoint=/absolute/path/orthrus.ckpt
+    checkpoint=/absolute/path/orthrus.ckpt
 ```
 
 Every prompt is decoded by the selected drafter and by plain AR; bitwise
@@ -1131,8 +1150,9 @@ generation prompt, with Qwen3 thinking disabled as in Orthrus) and decoded from 
 
 ## Results
 
-Accepted tokens per cycle at 20k steps, three refinement passes, averaged over
-three training seeds and 460 tasks. Every row was asserted **bitwise identical**
+SmolLM2-135M, accepted tokens per cycle at 20k steps, three refinement passes,
+averaged over three training seeds and 460 tasks; Qwen3-0.6B is in
+[Results at a converged budget](#results-at-a-converged-budget-qwen3-06b-to-80000-steps-september-2026). Every row was asserted **bitwise identical**
 to greedy autoregressive decoding.
 
 | Method | Accepted tokens ↑ | TPF at 1 pass | Lossless |
