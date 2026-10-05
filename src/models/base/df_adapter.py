@@ -415,6 +415,17 @@ class FlowDraftAttentionAdapter(nn.Module):
                 f"DF path expects simplex input [B, T, V={embed.num_embeddings}], "
                 f"got {tuple(input_ids.shape)}"
             )
+        if not input_ids.requires_grad:
+            # A row that is a VERTEX of the simplex — one entry 1, the rest 0 —
+            # embeds to one row of E, and the dense product reads all V x d of
+            # E to produce it. At one decoding pass every drafted row is a vertex
+            # (the random-token prior) and so is the anchor, and that product
+            # then costs about as much as the output layer. Nonnegative entries
+            # with maximum 1 and sum 1 are exactly a vertex; the lookup returns
+            # the same values the product does (1 * E_r plus exact zeros).
+            top, index = input_ids.max(dim=-1)
+            if bool((top == 1).all()) and bool((input_ids.sum(dim=-1) == 1).all()):
+                return embed(index)
         return input_ids.to(embed.weight.dtype) @ embed.weight
 
     @staticmethod
