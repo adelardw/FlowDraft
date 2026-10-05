@@ -735,6 +735,85 @@ otherwise any gain is just more steps. Prior art to check first: online
 speculative decoding and DistillSpec (on-policy distillation of drafters);
 reinforcement learning of drafters specifically has not been searched.
 
+### 7.9 Next project: vision-language models
+
+Prior work and the models checked for a T4 are in
+[docs/related-work.md](docs/related-work.md).
+
+**What is already done, and what is not.** A drafter that reads a compressed
+or pruned image while verification reads the full one is published several
+times over (Sparse-to-Dense, DREAM, SpecVLM, ViSpec, HAWK). It would also save
+little here: a SmolLM2-135M token costs $30 \cdot 2 \cdot 3 \cdot 64 = 11{,}520$
+cached values, so even ~1,088 image tokens are about 25 MB against ~512 MB of
+weights — about 5% of a drafting pass. A one-pass block-diffusion drafter for
+VLMs exists too (GLANCE). What is open: the method of §3.2 — a drafter inside
+the model on its own KV cache, trained on its own refinement chain — and
+whether **extra passes pay on low-entropy tasks** such as OCR and documents,
+where the answer is fixed by the image. GLANCE and GravityOCR draft in one
+pass only.
+
+**Setting.** SmolVLM-256M, whose language part is SmolLM2-135M — the first
+scale point of this study — then SmolVLM-500M. The context is
+$[\,v_1 \dots v_m;\ \text{prompt};\ \text{generated}\,]$ with $m$ image tokens
+($m = 64$ without tiling); the drafter attends to the shared cache, image keys
+included, exactly as in §3. Training answers are regenerated greedily by the
+target itself (The Cauldron: chartqa, st_vqa, infographic_vqa, textcaps).
+
+**Hypothesis.** A one-pass drafter is mean-field: position $j$ never sees the
+tokens drafted at $1 \dots j-1$. When the target's entropy $\bar H$ on a task
+is low, those tokens are nearly determined by the image, and a refinement pass
+that reads the draft should recover most of what one pass misses. So
+$A(2) - A(1)$ should grow as $\bar H$ falls, and the break-even
+$A(n+1) - A(n) > \mathrm{TPF}(n)$ of §3.2 should be met on OCR before it is met
+on captions.
+
+| | experiment | measures |
+|---|---|---|
+| V1 | Orthrus against the method on SmolVLM-256M, by task | $A(n)$ and TPF for one to four passes (n4v) |
+| V2 | $A(2) - A(1)$ against the target's mean entropy per task | the hypothesis above |
+| V3 | the drafter's attention to image keys masked | how much of the acceptance is visual — to compare with the −4.2% reported by the survey 2608.20743 |
+
+The external point of comparison on the same model is HAWK: 2.60× under greedy
+decoding on SmolVLM-256M.
+
+### 7.10 Next project: vision-language-action models
+
+**Why lossless matters more here.** Changing a robot policy forces new
+rollouts to measure its success rate. A lossless drafter leaves the policy
+unchanged: under greedy decoding the action sequence is identical token for
+token, so the success rate is identical by construction, and speed can be
+measured **offline on recorded trajectories, without a simulator**. Published
+VLA speculative decoding has moved to relaxed acceptance (Spec-VLA, KERV,
+HeiSD) and gave this up; the exact baseline to beat is PD-VLA, training-free
+Jacobi decoding of an action chunk.
+
+**Setting.** VLA-0-Smol: SmolVLM2-500M that writes an action chunk as text —
+$H = 8$ future steps, each dimension discretised into bins and written as
+digits; LIBERO 94.1%; slow because it decodes autoregressively. A chunk is
+$N \approx H \cdot D \cdot (\text{digits} + 1)$ tokens. Per chunk, plain decoding
+costs $N$ forwards after the prefill; a drafter with cycles of $n$ passes costs
+
+```math
+T_{\text{chunk}} \;=\; T_{\text{prefill}} + \frac{N}{\mathrm{TPF}_n}\; t_{\text{fwd}},
+\qquad
+\mathrm{TPF}_n = \frac{A_n + 1}{n + 1}.
+```
+
+**Hypothesis.** Action text is far more predictable than prose: neighbouring
+steps of a smooth trajectory repeat most digits, so acceptance should be much
+higher than on language, and the break-even for a second pass much easier to
+meet.
+
+| | experiment | measures |
+|---|---|---|
+| A1 | Orthrus and the method inside VLA-0-Smol, trained on `lerobot/libero` (1,693 episodes) with the target's own chunks | $A(n)$, TPF and latency per chunk, offline |
+| A2 | against PD-VLA (Jacobi) and plain decoding on the same states | forwards and wall-clock per chunk |
+| A3 | a short LIBERO run on Kaggle (EGL, ~35 s per episode) | that actions are identical token for token — a check, not the metric |
+
+Flow-matching VLAs (π0, SmolVLA) with 1–2 steps instead of 10 are left out:
+in 2026 that direction is crowded (SnapFlow, One-Step Flow Policy, MP1,
+AdaVLA) and it needs simulator success rates.
+
 ## 8. Rejected ideas
 
 Measured and dropped. Their full sections moved to
