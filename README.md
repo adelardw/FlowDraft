@@ -300,8 +300,8 @@ schedule used in every earlier table enters the refinement chain at `s = 0.34`.
 Training places its two refinement entries in `[0.5, 0.75)` and `[0.75, 1)` —
 `train.selfcorrect_s_min` is 0.5 — so that entry asks the drafter to refine from
 a state it has never seen, where two thirds of the input is prior noise arriving
-through a frozen embedding. It costs **−0.733 ± 0.055** accepted tokens against
-the three-pass schedule, degrading 90–97% of the prompts on every one of the six
+through a frozen embedding. It costs **−0.762 ± 0.050** accepted tokens against
+the three-pass schedule, degrading 92–100% of the prompts on every one of the six
 benchmarks. Moving the same entry inside the trained range turns a loss into the
 best result of the campaign: **2.974 → 4.189**.
 

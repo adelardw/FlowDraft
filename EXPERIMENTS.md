@@ -394,7 +394,7 @@ $[s_{\min}, 1)$:
 | n4v | 0 · 0.5 · 0.7 · 0.85 | **4.189** | 2.312 |
 
 The entry at $s = 0.34$ asks the drafter to refine a state it never saw in
-training and costs −0.733 ± 0.055 accepted tokens against three passes. Orthrus
+training and costs −0.762 ± 0.050 accepted tokens against three passes, lower on 94% of prompts. Orthrus
 has no $s$ and returns the identical number on all 460 prompts under both
 schedules — direct evidence that the method's drafter is a map in $s$, not a
 repeated projection under another name. Accepted tokens averaged over the six
@@ -430,7 +430,7 @@ steps. The weaker regime is the one that *favours* multi-step, since a pass
 pays only when it adds more accepted tokens than the current TPF.
 
 The gap is not the harness. The released Orthrus-Qwen3-1.7B, measured with
-this code, matches Table 1 within −6.4…+2.5% on the four sets whose answers end
+this code, matches Table 1 within −6.4…+2.6% on the four sets whose answers end
 inside the 512-token budget (§5.4). What separates the numbers is training: a
 smaller model, about 189 times fewer supervised blocks, answers not regenerated
 by the target model, and no output projection in the text's version
