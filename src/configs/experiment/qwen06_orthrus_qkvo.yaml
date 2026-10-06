@@ -1,0 +1,22 @@
+# @package _global_
+# Orthrus с выходной проекцией: Q, K, V и O — набор, который обучают
+# ВЫПУЩЕННЫЕ веса авторов.
+#
+# Зачем. Статья пишет «только Q, K, V», и `qwen06_orthrus` следует тексту. Но в
+# chiennv/Orthrus-Qwen3-1.7B двойник o_proj ушёл от инициализации на 0.34 по
+# относительной норме — столько же, сколько q/k/v, — а их «16% параметров»
+# сходится только с Q, K, V, O. Значит, опубликованный бейзлайн сильнее
+# описанного на целую проекцию. Нормы q/k у них сдвинуты на 0.001-0.002, то
+# есть практически не обучены, и сюда не включены — как и в парной ветке.
+#
+# Пара к `qwen06_flowdraft_multistep` (тот же набор Q, K, V, O). Отличается от
+# родителя ровно набором проекций.
+#   uv run python src/train.py +experiment=qwen06_orthrus_qkvo
+defaults:
+  - /experiment/qwen06_orthrus
+  - _self_
+
+output_dir: checkpoints/qwen06_orthrus_qkvo
+model:
+  adapter:
+    w_names: [q_proj, k_proj, v_proj, o_proj]
