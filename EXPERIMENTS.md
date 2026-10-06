@@ -29,8 +29,9 @@ Two quantities, and they must not be conflated:
 - **Tokens per forward** `TPF = (A + 1) / (n + 1)` where `n` is the number of
   drafter passes in a cycle. This is speed. Plain decoding gives exactly 1.
 
-The drafter may take several **refinement passes** per cycle: propose, freeze the
-positions it is most confident about, rewrite the rest, repeat. Each pass costs
+The drafter may take several **refinement passes** per cycle: propose, then
+rewrite the draft from what it proposed, repeat — a masked drafter freezes the
+positions it is most confident about, a continuous one may revise all of them. Each pass costs
 one forward, so rising quality fights rising cost.
 
 ### Two drafters
@@ -201,8 +202,8 @@ bidirectional-within-block $\mathbf 1[k\ge L]\cdot\mathbf 1[\lfloor q/K\rfloor=\
 appear verbatim in both the sparse FlexAttention path and the dense fallback.
 
 **Geometry.** Every trained run here, Orthrus included, uses the bench
-geometry: block size $K = 32$, one anchor block per sequence, context 256,
-effective batch 16. The paper's Table 4 ($L = 2048$, 256 anchor blocks, two
+geometry: block size $K = 32$, one anchor block per sequence, context 256; the
+effective batch is 16 on Qwen3-0.6B and 2 on SmolLM2-135M. The paper's Table 4 ($L = 2048$, 256 anchor blocks, two
 epochs over 600K examples, global batch 128) is reproduced in the Qwen3-1.7B
 presets (`qwen_orthrus`), which were never trained.
 
@@ -315,8 +316,10 @@ the term exists to prevent.
 
 #### Where this term came from
 
-It is not lifted from a paper. It was derived here, and the order matters: the
-**negative** result came first.
+It is not lifted from a paper. It was derived in this project, and the order
+matters: the **negative** result came first — it was first written up in the
+project's SMILES 2026 report with V. Tekaev and N. Nikonov
+(<https://openreview.net/forum?id=OwQPRxYdZj>).
 
 **1 — Multi-step cannot come from the noise.** With a deterministic verifier, a
 mean-field endpoint parameterisation and $x_0 \perp x_1 \mid \mathrm{ctx}$, the
@@ -425,8 +428,8 @@ the objective. Every run here uses the bench geometry instead (§3.1), so the
 absolute numbers are not comparable to the paper's; contrasts within this set
 are. The size of the gap is worth naming: the paper reports an average TPF of
 3.89 on Qwen3-1.7B under greedy decoding, about 6.8 accepted tokens per cycle,
-where Orthrus runs at 1.22 on SmolLM2-135M and 1.60 on Qwen3-0.6B after 80k
-steps. The weaker regime is the one that *favours* multi-step, since a pass
+where Orthrus runs at 1.22 on SmolLM2-135M and 1.54 on Qwen3-0.6B after 80k
+steps, all three end to end. The weaker regime is the one that *favours* multi-step, since a pass
 pays only when it adds more accepted tokens than the current TPF.
 
 The gap is not the harness. The released Orthrus-Qwen3-1.7B, measured with
@@ -455,16 +458,18 @@ never taught multi-step refinement.
 
 Intervals use the **training seed** as the unit of observation (three seeds,
 `df = 2`, `t₀.₉₇₅ = 4.30`), so they describe the method, not one trained model.
-At three refinement passes the method leads Orthrus by **+0.835 ± 0.085**
-accepted tokens (`t = 42.3`, `p = 0.0006`; per seed 0.870 / 0.834 / 0.802).
+At three refinement passes the method (Q, K, V, O at this scale) leads Orthrus
+(Q, K, V) by **+0.835 ± 0.085** accepted tokens (`t = 42.3`, `p = 0.0006`; per seed 0.870 / 0.834 / 0.802).
 
 | | Orthrus | the method |
 |---|---|---|
 | growth from one pass to four | +0.071 ± 0.019 | **+0.893 ± 0.085** |
-| tokens per forward, 1 / 3 / 4 passes | 1.219 / 0.628 / 0.507 | **1.257** / 0.824 / 0.675 |
-| between-seed σ of acceptance, 1 / 3 / 4 passes | 0.004 / 0.001 / 0.001 | 0.007 / 0.032 / 0.043 |
+| tokens per forward (end to end), 1 / 3 / 4 passes | 1.219 / 0.628 / 0.507 | **1.257** / 0.824 / 0.675 |
+| between-seed σ of acceptance, 1 / 3 / 4 passes | 0.007 / 0.005 / 0.001 | 0.015 / 0.032 / 0.043 |
 
-At one pass the method is worth +0.038 tokens per forward (+3.1%, `t = 6.9`).
+At one pass the method is worth +0.038 end-to-end tokens per forward (+3.1%,
+`t = 6.9`); the multi-step term alone, against the same state without it, is
+worth +0.011 ± 0.007 (+0.9%).
 Wall-clock is not settled at this size: on MPS a 135M forward is dominated by
 fixed overhead.
 
@@ -487,8 +492,8 @@ method (§3.2).
 | the method | **2.576** | **3.265** | **3.740** | **4.189** | **+1.559 ± 0.066** |
 
 Paired by prompt: **+0.360 ± 0.035** at one pass (ahead on 81% of prompts),
-+0.998 ± 0.047 at two (99%), +1.423 ± 0.059 at three and +1.823 ± 0.073 at four
-— the last two on all 460 prompts.
++0.998 ± 0.047 at two (99%), +1.423 ± 0.059 at three (459 of 460 prompts) and
++1.823 ± 0.073 at four (all 460).
 
 | | 1 pass | 2 | 3 | 4 (n4v) |
 |---|---|---|---|---|
@@ -509,8 +514,9 @@ seed, so the prompt is the unit. Tokens per forward is the steady-state rate.
 
 ### 5.4 Context: the released Orthrus-Qwen3-1.7B in this harness
 
-180 tasks, generations up to 512 tokens, one pass, verified per cycle against
-the authors' own code (docs/evidence.md, entry E3).
+180 tasks, generations up to 512 tokens, one pass, every output bitwise identical
+to plain decoding; the decoding loop itself was checked cycle by cycle against
+the authors' code on six prompts (docs/evidence.md, entry E3).
 
 | | gsm8k | math500 | humaneval | mbpp | aime24 | aime25 |
 |---|---|---|---|---|---|---|
@@ -825,9 +831,9 @@ rejected terms are in `bucket/`.
 | Masked drafter trained on its own refinement (`*_orthrus_multistep`) | 135M: +0.223 ± 0.021 over Orthrus, but only +0.046 against a control matched on projections, position weights and tail weight. 0.6B, 10k: grows from one pass to four by +0.071 ± 0.013 — no faster than Orthrus (+0.062 ± 0.010) | the same term on a continuous state — the method |
 | Continuous state without the multi-step term (`*_flowdraft`, the ablation) | 135M: loses 0.563 ± 0.526 going from one pass to four; 0.6B, 10k: 1.705 at one pass against Orthrus's 1.837 | the method; at 135M the multi-step term is worth +1.138 ± 0.109 at three passes |
 | Flow-consistency terms: endpoint, EC, TD | −0.114 [−0.150, −0.078] at 135M | the two-term loss of §3.2 |
-| Multiplicative time conditioning | +0.027 [−0.006, +0.060], p = 0.23 | additive conditioning |
+| Multiplicative time conditioning on top of the additive one | +0.027 [−0.006, +0.060], p = 0.11 | additive conditioning alone |
 | Freezing the value projection | −0.244 [−0.281, −0.207] | training $W_V$ |
-| Equal position weights | continuous −0.043 [−0.074, −0.012]; masked −0.005 | the weights $\partial\mathbb E[A]/\partial a_j$ of §2 |
+| No extra chain weight on the first rejected position (`selfcorrect_tail_weight` 1.0) | continuous −0.043 [−0.074, −0.012]; masked −0.005 | chain weight 1 at the first rejection and 0.5 elsewhere, times $\partial\mathbb E[A]/\partial a_j$ |
 | Idempotence term (`flowdraft_idem`) | at 10k, inside the trained range, +0.007 ± 0.025 at one pass; at 50k the same decode acceptance as without it. Stopped at step 50,651 | decode entries kept inside the trained range (§3.2) |
 | Taylor expansion of the drafter's attention, first and second order | 83–97% of the attention mass sits on keys with $\lvert\delta\rvert > 1.5$; with every layer replaced acceptance falls to about 0 | linear maps fitted to the attention output (§7.2) |
 | Linearizing the drafter without training: attention, MLP, whole layers, mixed | never faster than the full drafter; the best is parity | the trained hybrid view of §7.2 |
@@ -855,7 +861,7 @@ rejected terms are in `bucket/`.
 | The chain-validity gate is exact **pointwise at a fixed context**. At decode the whole prefix is self-generated, not corpus text; nothing in the objective addresses that shift. | proven pointwise, including at the break position; the distribution shift is untreated |
 | The prefix-fixing lemma is proven for a **token** operator. The map reads `(1−s)x₀′ + s·q`, so "realises `T` exactly" must hold for every prior draw and every `s`. | `s_min = 0.5` removes the region where recovery is provably impossible; it does not establish recovery elsewhere |
 | The multi-step term is **DAgger**: `argmax` kills the target gradient, the detach kills the input gradient, and the input distribution's dependence on `θ` is discarded. The sum is therefore not the gradient of any scalar function of `θ`. | no potential, hence no convergence guarantee. Convergence was observed on every curve across three seeds; it is not implied by anything |
-| Relieving the input requires a **saturating region** reachable by additive conditioning: `verify_kl` at `s = 0` wants `∂π/∂x = 0`, the multi-step term wants the opposite. | **measured and unsatisfied** — response is damped only at amplitudes 81–325× the median embedding norm, far outside what training reaches. The multiplicative gate built to relieve it gave +0.027 (p = 0.23) |
+| Relieving the input requires a **saturating region** reachable by additive conditioning: `verify_kl` at `s = 0` wants `∂π/∂x = 0`, the multi-step term wants the opposite. | **measured and unsatisfied** — response is damped only at amplitudes 81–325× the median embedding norm, far outside what training reaches. The multiplicative gate built to relieve it gave +0.027 (p = 0.11) |
 
 Two of these are measurable rather than permanent: the coupling constant `κ_j`
 and the input Jacobian at a trained checkpoint. Neither was measured.
