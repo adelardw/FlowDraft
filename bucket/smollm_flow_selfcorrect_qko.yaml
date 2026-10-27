@@ -1,0 +1,21 @@
+# @package _global_
+# Обучаются Q, K, O — значения (V) остаются замороженными.
+#
+# Логика: V несёт СОДЕРЖИМОЕ, выученное замороженной моделью, и трогать его
+# незачем. Q и K решают, что на что смотрит; O сводит признаки многоголового
+# внимания, то есть решает, что из этого выходит наружу. Тюнится маршрутизация
+# и сборка, а не сам материал.
+#
+# Это третий вариант, отличный и от статьи, и от нашего текущего:
+#   статья:  Q, K, V        (17.22М)
+#   у нас:   Q, K, V, O     (27.17М)
+#   здесь:   Q, K, O        (23.85М)
+#   uv run python src/train.py +experiment=smollm_flow_selfcorrect_qko
+defaults:
+  - /experiment/smollm_flow_selfcorrect
+  - _self_
+
+output_dir: checkpoints/smollm-flow-selfcorrect-qko
+model:
+  adapter:
+    w_names: [q_proj, k_proj, o_proj]
