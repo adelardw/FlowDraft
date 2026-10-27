@@ -1,20 +1,31 @@
-# FlowDraft: Training a Parallel Drafter on Its Own Refinement Chain
+# Training a Lossless Block Drafter on Its Own Refinement Chain
 
-> Raising the **acceptance ceiling** of lossless parallel decoding by upgrading the *drafter* to a **Categorical Flow Map** — faster generation, provably identical output.
+> A controlled study of the drafter's training objective inside Orthrus. Each refinement pass is supervised by the frozen verifier's response to the drafter's own draft; that term — not the drafting state — is what raises acceptance at the operating point of one drafter pass per cycle. Every output stays bitwise identical to greedy decoding.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13%2B-blue)
 
-> **Status: two scale points measured, one of them to its full 80k-step schedule.** SmolLM2-135M — ten training runs at 20k steps, four replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; every greedy generation is bitwise identical to plain decoding, and sampling was measured with standard speculative sampling, lossless in distribution. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not been trained here**; the authors' released Orthrus-Qwen3-1.7B, measured in this harness, reproduces the paper's Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit the token budget. A Q,K,V,O pair and a hybrid diffusion view are training to 100k steps.
+> **About the name.** FlowDraft is the name the project has carried since SMILES 2026, where it began as a drafter built on categorical flow maps, and it is kept for continuity with the reports and posters that use it. The flow-map consistency losses were measured, cost −0.114 accepted tokens and were removed (`bucket/cfm_terms`); what remains of that idea is a continuous drafting state on the vocabulary simplex. The contribution is the training term.
+
+> **Status: two scale points measured, one of them to its full 80k-step schedule.** SmolLM2-135M — ten training runs at 20k steps, four replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; every greedy generation is bitwise identical to plain decoding, and sampling was measured with standard speculative sampling, lossless in distribution. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not been trained here**; the authors' released Orthrus-Qwen3-1.7B, measured in this harness, reproduces the paper's Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit the token budget. The Q,K,V,O pair at 100k steps is measured — the margin is the same, +0.381 ± 0.033 accepted tokens at one pass; the hybrid diffusion view is training to 100k, and a 2×2 grid on what the training term teaches (`qwen06_orthrus_onpolicy`) is queued on Kaggle.
 
 **Summer School of Machine Learning at Skoltech (SMILES) · Applied AI Center**
 
 ---
 
+## Main findings
+
+Measured on 460 prompts from six math and code benchmarks; intervals are 95%, paired by prompt at 0.6B and by seed at 135M.
+
+- **At one pass, the gain comes from the training term, not from the drafting state.** On Qwen3-0.6B at 10k steps the chain term adds **+0.241 ± 0.027** accepted tokens per cycle with everything else fixed. Given the term, a masked drafter is at least as good at one pass as a continuous one: −0.059 ± 0.025 for the continuous state at 0.6B, −0.148 ± 0.047 over three seeds at 135M.
+- **The continuous state is what makes refinement work, and refinement does not pay.** With the term, the continuous state gains +0.78 accepted tokens over the masked one at three passes. No extra pass meets the break-even condition `A(n+1) − A(n) > TPF(n)`: each costs a forward of the model. A refinement pass costing a fraction `c` of a forward would pay at our 80k acceptances only for `c < 0.385`.
+- **Matched pairs against our Orthrus reproduction.** On Q,K,V at 80k steps: **2.576 vs 2.201** accepted tokens at one pass, +0.360 ± 0.035, ahead on 81% of prompts; tokens per forward 1.788 vs 1.601; wall clock 1.44× vs 1.35× on a T4. On Q,K,V,O at 100k steps: **2.467 vs 2.070**, +0.381 ± 0.033 (87%). The lead holds under speculative sampling, on 512-token generations, on every benchmark and at equal training GPU-hours (interpolated between checkpoints, one seed).
+- **The harness is checked against the released Orthrus-Qwen3-1.7B:** its Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit a 512-token budget.
+- **Closest work** — Draft-OPD, DEdit, DistillSpec and others — is laid out under [The idea](#the-idea). What is specific here: the label is the verifier's verdict on the draft the refinement pass *reads* (one Jacobi step), and the study separates the objective from the state.
 
 ## Table of contents
 
-- [Research log](docs/README.md) — goals and plan, a ledger of every comparison, and the evidence behind each finding (in Russian)
+- [Main findings](#main-findings)
 - [Results, first scale point: SmolLM2-135M](#results-first-scale-point-smollm2-135m-august-2026) — ten runs, three seeds, the multi-step claims
 - [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
 - [Results at the full budget: Qwen3-0.6B to 80,000 steps](#results-at-the-full-budget-qwen3-06b-to-80000-steps-september-2026) — both drafters to the end of their schedule, and the schedule that was costing a pass
@@ -26,10 +37,7 @@
 - [Background: the decoding bottleneck](#background-the-decoding-bottleneck)
 - [Host framework: Orthrus](#host-framework-orthrus)
 - [The problem](#the-problem)
-- [Key idea: a Categorical Flow Map drafter](#key-idea-a-categorical-flow-map-drafter)
-- [CFM training, in brief](#cfm-training-in-brief)
-- [Goals](#goals)
-- [Expected deliverables](#expected-deliverables)
+- [The idea](#the-idea) — the training term, the two drafting states, the closest work
 - [Method](#method)
 - [Repository structure](#repository-structure)
 - [Installation](#installation)
@@ -115,8 +123,8 @@ pass: **1.326 against Orthrus's 1.219**.
 
 Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
 while acceptance grows slower than `n`, so by three passes every configuration
-is below plain decoding (at two passes, measured on seed 42 only, the flow map
-is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
+is below plain decoding (at two passes, measured on seed 42 only, the continuous
+drafter with the chain term is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
 et al., 2023) says why refinement alone is no speedup mechanism: a pass that
 realised the Jacobi sweep exactly would guarantee only `TPF = 1`, the speed of
 plain decoding. The continuous state loses the least
@@ -266,7 +274,7 @@ shows a trajectory and nothing finer; the decode measurement beside it rests on
 460 prompts.
 
 The budget caveat this section ends on is lifted in the next one: the reproduced
-baseline and the Q,K,V flow map were both carried to 80,000 steps and measured
+baseline and the continuous drafter on Q,K,V were both carried to 80,000 steps and measured
 again, with a decode schedule that stays inside the range the refinement term was
 trained on.
 
@@ -274,10 +282,10 @@ trained on.
 
 **What this section adds.** The 10k section above is a matched-budget snapshot of
 five configurations; it ends by saying nothing has converged. This one takes the
-two configurations that matter — the reproduced Orthrus baseline and the flow map
-on the same three projections — to **80,000 optimizer steps each**, and measures
+two configurations that matter — the reproduced Orthrus baseline and the continuous
+drafter with the chain term on the same three projections — to **80,000 optimizer steps each**, and measures
 them the same way. Orthrus spent 74.9 hours of training across nine sessions, the
-flow map 110.5 across twelve; the step counts are identical, which is what the
+the continuous drafter 110.5 across twelve; the step counts are identical, which is what the
 comparison rests on. Two things are new besides the budget: a **decode schedule
 that stays inside the range the refinement term was trained on**, and the first
 wall-clock numbers from a real GPU rather than a laptop.
@@ -327,7 +335,7 @@ than a repeated projection under another name.
 The break-even condition `A(n+1) − A(n) > TPF(n)` still fails at every transition
 for both drafters, so **one pass remains the operating point** and the paper's
 conclusion about single-step projection stands. What changes is the penalty: the
-flow map stays above plain decoding in tokens per forward at every schedule,
+continuous drafter stays above plain decoding in tokens per forward at every schedule,
 where the baseline drops below it from three passes on.
 
 **Wall-clock, measured on a T4 rather than a laptop.** The 135M section reports
@@ -339,8 +347,8 @@ forward is dominated by fixed overhead. On a real GPU it does:
 | Orthrus, reproduced (Q,K,V) | 1.347 | 0.906 | 0.693 | 0.564 |
 | **continuous state + multi-step (Q,K,V)** | **1.440** | **1.130** | **0.929** | **0.805** |
 
-Both drafters are faster than autoregressive decoding at one pass; only the flow map
-is still faster at two. These numbers are a T4 at `float32` with the dense
+Both drafters are faster than autoregressive decoding at one pass; only the continuous
+drafter is still faster at two. These numbers are a T4 at `float32` with the dense
 attention path, batch one — the regime in which decoding is bound by reading the
 weights, not by arithmetic.
 
@@ -451,8 +459,8 @@ paper preset); `val_check_interval` in the paper presets counted loader batches
 Losslessness needs `model.backbone.dtype=float32`: under bf16 the verifier's
 arithmetic breaks bitwise agreement on near-ties (5 of 6 vs 6 of 6).
 
-Rejected configurations are kept outside the repository (`bucket/`, not
-shipped); their numbers are in §8 of [EXPERIMENTS.md](EXPERIMENTS.md). Objective
+Rejected configurations are kept out of the source tree, in `bucket/`, and are
+not loaded by any preset; their numbers are in §8 of [EXPERIMENTS.md](EXPERIMENTS.md). Objective
 assumptions that code cannot remove are in §9, including one measured and found
 unsatisfied.
 
@@ -460,7 +468,7 @@ unsatisfied.
 
 Autoregressive (AR) LLMs decode strictly sequentially: generating *L* tokens costs *L* forward passes, which is memory-bandwidth bound. Diffusion LMs can draft whole blocks in parallel, but they drift from the AR distribution and lose quality. Speculative-style verification restores quality: draft a block in parallel, then verify it against the AR model in a single pass and keep only the tokens the AR model would have produced — this is **lossless**.
 
-**FlowDraft** upgrades the *drafter* inside a lossless parallel-decoding loop. The throughput of any verify-based system is governed by its **acceptance length** — the number of drafted tokens accepted per cycle. We replace the single-step masked-diffusion drafter with a **Categorical Flow Map** drafter that keeps the draft as a continuous state and is trained on its own refinement chain, so that a refinement pass can improve the draft it receives. Verification is left untouched, so the output stays strictly lossless — the drafter affects only **speed**, never **quality**.
+This project studies the *training objective* of the drafter inside a lossless parallel-decoding loop, Orthrus. The throughput of any verify-based system is governed by its **acceptance length** — the number of drafted tokens accepted per cycle. Orthrus trains its drafter by distillation on the training text, so the drafter never sees a block it drafted itself. We add one term: the drafter runs its own refinement chain, and each pass is supervised by the frozen verifier's response to the draft it reads. The term applies to Orthrus's masked state and to a continuous state on the vocabulary simplex, so objective and state can be measured apart. Verification is left untouched, so the output stays strictly lossless — the drafter affects only **speed**, never **quality**.
 
 Crucially, the AR model is what does the verifying, so it is kept **frozen throughout**. Keeping it untouched is exactly what makes the output provably identical to the base model; it is what the word *lossless* rests on.
 
@@ -537,8 +545,8 @@ seed, add `seed=43 output_dir=checkpoints/s43/<name>`.
 ./hf-auth.sh uv run python src/train.py +experiment=smollm_orthrus \
     output_dir=checkpoints/smollm_orthrus
 
-# THE MAIN CLAIM at bench scale: flow map trained on its own multi-step
-# procedure.
+# THE MAIN CLAIM at bench scale: the continuous drafter trained on its own
+# refinement chain.
 ./hf-auth.sh uv run python src/train.py +experiment=smollm_flowdraft_multistep \
     output_dir=checkpoints/smollm_flowdraft_multistep
 
@@ -712,8 +720,8 @@ agree" stay separate questions. Terms carrying weight zero are named in the
 caption instead of being drawn as a flat line on an invented axis.
 
 **`bench/figures.py` is stale and is deliberately not listed above.** It dates
-from the earlier 6000-step, five-configuration bench, its labels are in Russian,
-and it writes `contrasts.png` — so running it would overwrite a current figure
+from the earlier 6000-step, five-configuration bench, and it writes
+`contrasts.png` — so running it would overwrite a current figure
 with an outdated one. The four result figures of the 135M section
 (`multistep`, `contrasts`, `per_benchmark`, `horizon`) are rebuilt from the
 per-prompt data by `bench/smollm_figures.py`; the Qwen3-0.6B figures come from
@@ -746,14 +754,17 @@ commands that launch them are in
 | the same on Q,K,V alone | — | `qwen06_flowdraft_multistep_qkv` | — |
 | Orthrus as released, Q,K,V,O | — | `qwen06_orthrus_qkvo` | — |
 | hybrid diffusion view (Orthrus / the method) | — | `qwen06_orthrus_qkvo_linear` / `qwen06_flowdraft_multistep_linear` | — |
+| masked drafter + one on-policy term: the 2×2 grid `none` / `opd` / `chain_tf` / `chain` | — | `qwen06_orthrus_onpolicy` | — |
 
 `smollm_base`, `qwen06_base`, `qwen_base` and `qwen06_linear_base` are the shared
 bases these inherit, not experiments. Presets that were measured and rejected —
 the masked drafter trained on its own refinement, the continuous state without
 it, the trajectory-structure objective, the input gate, the Q/K/O projection
-set, the weight-profile controls and the idempotence term — are kept outside the
-repository and deliberately not shipped; their numbers are in
-[EXPERIMENTS.md](EXPERIMENTS.md) §8.
+set, the weight-profile controls and the idempotence term — are kept in
+`bucket/`, outside the source tree; their numbers are in
+[EXPERIMENTS.md](EXPERIMENTS.md) §8. The masked drafter trained on its own
+refinement is back as one cell of the 2×2 grid, in its own module
+(`src/models/orthrus_onpolicy.py`).
 
 ## Background: the decoding bottleneck
 
@@ -778,60 +789,32 @@ FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 - Refining the draft would help, but **adding a step costs a forward pass** and lowers throughput.
 - We need a **better proposal per pass**, not more passes.
 
-## Key idea: a Categorical Flow Map drafter
+## The idea
 
-*The pitch of the original project brief. Measured since: the drafter is
-mean-field, a continuous state alone does not beat masking at one pass, and
-what pays is training it on its own refinement chain — see the results
-sections.*
+*What the measurements left of the original brief. The brief's pitch — a
+categorical flow-map drafter with consistency losses — is kept in
+`bucket/README_superseded_sections.md`.*
 
-- **Categorical Flow Maps** [Roos et al., 2026] learn the *integrated, correlated* endpoint distribution on the simplex and generate in **one or few jumps**.
-- Use it as the drafter: a **higher-fidelity joint proposal** over the block — at the **same pass count**.
-- Verification is unchanged → output stays **strictly lossless**; the drafter only affects *speed*, never *quality*.
-- **Novelty:** a flow-map drafter inside Orthrus, trained on its own refinement chain against the frozen verifier. The flow-map consistency losses it started from were measured, found harmful and dropped ([EXPERIMENTS.md](EXPERIMENTS.md) §8).
+- **What the drafter is trained on.** Orthrus distils its drafter on the training text: at every position the target is the frozen model's next-token distribution given the *true* preceding tokens. The drafter never sees a block it drafted, and nothing tells it how the verifier would judge one.
+- **The chain term.** Run the drafter's own refinement chain and supervise each pass with the verifier's response to the draft it reads, `p_AR(· | ctx, a, d_<j)` — one parallel Jacobi sweep of the greedy chain, imitated on the states the decoder actually produces (a DAgger step). The verification forward computes this target anyway.
+- **Two drafting states.** *Masked:* the most confident positions are committed and the rest re-masked, as in Orthrus's multi-step decoding. *Continuous:* a point on the vocabulary simplex that mixes fresh noise with the previous draft at a level `s ≥ 0.5`, so every position can still change.
+- **Why noise cannot help a single pass.** With a deterministic verifier the Bayes-optimal one-pass drafter ignores its noise input, so a refinement pass can gain only from the drafter's own previous draft. Flow-map consistency losses train on interpolants toward the training text, which contain the answer and never the draft — that is why they were dropped.
+- **When a pass pays.** Only if it adds more accepted tokens than the current tokens per forward; if a refinement pass costs a fraction `c` of a forward, the second pass pays at our 80k acceptances for `c < 0.385`. Inside Orthrus `c = 1`.
 
-**Why it matters**
+### Closest work
 
-1. **Efficiency** — higher acceptance length = higher throughput, for free.
-2. **Fidelity** — speedup with **zero** quality loss (verification guarantees it).
-3. **Foundations** — connects flow-map distillation to fast, faithful LLM inference.
-
-## CFM training, in brief
-
-*Where the project started. The self-consistency part below was measured, cost
-−0.114 accepted tokens, and was removed; the objective in use is under
-[Method](#method).*
-
-The drafter learns two complementary parts of a categorical flow map:
-
-- **Endpoint inference — *what endpoint belongs to the trajectory*.** The diagonal predictor is trained by categorical VFM against the clean endpoint used to construct the interpolant.
-- **Self-consistency — *how to jump*.** The reliable diagonal prediction at a transported state teaches the harder long-jump predictor through ECLD.
-
-The ECLD target is stop-gradiented. Verifier alignment lives in `train.verify_kl_weight` (the pair the decode loop executes) and `train.selfcorrect_kl_weight` (the same alignment along the drafter's own jump schedule).
-
-The AR model remains frozen throughout. In paper-faithful CFM training it supplies the cached prefix for the block-wise geometry and validation targets; at inference it verifies every proposal, which is what guarantees losslessness.
-
-## Goals
-
-*The original project brief. What was kept and what was measured and dropped is
-in [EXPERIMENTS.md](EXPERIMENTS.md) §8.*
-
-1. **Reproduce Orthrus** (frozen AR + masked-diffusion drafter, shared KV cache, lossless loop) at a tractable scale.
-2. **Implement a flow-map drafter** (simplex endpoint head, 1–few jumps).
-3. **Develop the dual distillation objective** (AR-teacher distribution + flow-map consistency).
-4. **Evaluate & compare:** AR baseline vs. masked-diffusion Orthrus vs. flow-map drafter — on acceptance length, TPF, and throughput — all verified lossless.
-
-## Expected deliverables
-
-*From the same brief; the objective in use is under [Method](#method).*
-
-1. Reproduction of the Orthrus lossless parallel decoder (masked-diffusion drafter).
-2. Implementation of the **Categorical Flow Map drafter** + dual distillation training.
-3. Evaluation: acceptance-length / TPF / throughput comparison, with verified losslessness and **block-size / jump-count ablations**.
+| work | what it shares with the chain term | what differs |
+|---|---|---|
+| DistillSpec (ICLR 2024), Online Speculative Decoding (ICML 2024) | the target model's distributions on the drafter's own tokens as labels | autoregressive drafters, no refinement |
+| Draft-OPD (EMNLP 2026, arXiv 2605.29343) | the same label for a block drafter's own block | a single pass: it labels the pass's own output, not the draft the next pass reads |
+| DEdit (arXiv 2609.38510, Sept 2026; concurrent) | a second pass that reads the drafter's own detached proposal | labels are fixed target-generated text, with ground truth mixed into the proposal; passes run through a small separate drafter, so they are cheap |
+| VAT (arXiv 2608.30135), Acceptance-Aware Draft Training (arXiv 2609.24150) | weighting by sequential verification; optimising the expected accepted length, also with GRPO | single-pass objectives — related to our position weights, not to the chain |
+| CLLM (ICML 2024), Jacobi Forcing (ICML 2026) | training on Jacobi trajectories | the target itself is fine-tuned to jump to the fixed point |
+| EAGLE-3, HASS, GRIFFIN | a draft head fed its own features during training | labels from the training text; one position at a time |
 
 ## Method
 
-One frozen backbone, two attention paths (the Orthrus host), and a Categorical Flow Map drafter trained against the frozen verifier: at the state every decode cycle enters, and along the drafter's own refinement chain.
+One frozen backbone, two attention paths (the Orthrus host), and a drafter trained against the frozen verifier: at the state every decode cycle enters, and along the drafter's own refinement chain.
 
 - **Adapter** (`src/models/base/df_adapter.py`): every projection named in `model.adapter.w_names` — `q/k/v_proj`, plus `o_proj` in the Q,K,V,O presets — gets a trainable twin initialized as a copy of the frozen AR weight (117M parameters for Q, K, V on Qwen3-0.6B). Routing is stateless (`torch.func.functional_call`, the backbone module tree is never modified); everything else — norms, MLP, embeddings, LM head — and one KV cache are shared. The cache is AR-only by contract: the drafter reads the committed prefix, its own K/V are cropped right after each forward. The DF path reads the cached prefix and attends bidirectionally within its block (the dual-pass mask), and is conditioned on the jump times `(s, t)` via a zero-initialized sinusoidal time embedding (`fte.py`).
 - **Objective** (`FlowDraftBlockWise.compute_loss`): `loss = verify_kl_weight·verify_KL + selfcorrect_kl_weight·selfcorrect_KL`
@@ -854,6 +837,8 @@ FlowDraft/
 ├── TODO.md                        # the plan of the upcoming runs
 ├── LICENSE                        # MIT
 ├── tools/                         # paired contrasts, checks against the released Orthrus, probes
+├── bench/                         # SmolLM2-135M bench: runs, measurement, statistics, figures
+├── bucket/                        # measured and dropped: presets, code and README sections, with reasons
 ├── results/                       # per-prompt measurements behind the Qwen3-0.6B numbers
 ├── data/measurements/             # per-prompt measurements behind the SmolLM2-135M numbers
 └── src/
@@ -865,7 +850,8 @@ FlowDraft/
     │   ├── flowdraft.py           # FlowDraft base: lossless generate (the full-sequence variant has no loss)
     │   ├── flowdraft_block_wise.py        # FlowDraft in the inference geometry
     │   ├── linear_orthrus.py      # hybrid diffusion view for Orthrus and FlowDraft
-    │   └── orthrus.py             # Orthrus masked drafter, block-causal
+    │   ├── orthrus.py             # Orthrus masked drafter, block-causal
+    │   └── orthrus_onpolicy.py    # masked drafter + one on-policy term (the 2×2 grid)
     ├── preprocessor/df_processor.py   # tokenization + one-hot simplex endpoints
     ├── data/dataloaders.py        # streaming Dataset / collate / DataLoader;
     │                              #   EpochShuffled: repetitions in a new order (epochs)
@@ -915,8 +901,10 @@ on-device, never in the batch.
 
 Variants: `orthrus` is the paper-style block-causal Orthrus recipe (frozen AR
 cache plus independently anchored masked blocks), and `flowdraft_block_wise`
-trains the flow-map drafter in that inference geometry; the `*_linear` variants
-add the hybrid diffusion view. The full-sequence `flowdraft` variant has no loss
+trains the continuous drafter in that inference geometry; the `*_linear` variants
+add the hybrid diffusion view; `orthrus_onpolicy` is the masked drafter with one
+on-policy term (`train.onpolicy_term`: `none`, `opd`, `chain_tf`, `chain`) for
+the 2×2 study. The full-sequence `flowdraft` variant has no loss
 left and refuses to train.
 Knobs live in `configs/train.yaml`: `verify_kl_weight`/`selfcorrect_kl_weight`
 (the two terms), `selfcorrect_rounds`/`selfcorrect_s_min` (the refinement chain),
@@ -1215,7 +1203,7 @@ jump-count grid is under [Evaluation](#evaluation).
 
 - Daan Roos, Oscar Davis, Floor Eijkelboom, Michael M. Bronstein, Max Welling, İsmail İlkan Ceylan, Luca Ambrogioni, Jan-Willem van de Meent. *Categorical Flow Maps.* ICML 2026. [arXiv:2602.12233](https://arxiv.org/abs/2602.12233) · code: [olsdavis/semicat](https://github.com/olsdavis/semicat)
 - Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham, Ryan A. Rossi, Franck Dernoncourt, Thien Huu Nguyen. *Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion.* 2026. [arXiv:2605.12825](https://arxiv.org/abs/2605.12825) · code and weights: [chiennv2000/orthrus](https://github.com/chiennv2000/orthrus)
-- Yaroslav Sergaev, Viacheslav Tekaev, Nikita Nikonov. *FlowDraft: A Categorical Flow-Map Drafter for Lossless Parallel Decoding.* Summer School of Machine Learning at Skoltech (SMILES 2026), accepted. [OpenReview](https://openreview.net/forum?id=OwQPRxYdZj) — the earlier version of this project, on Qwen3-1.7B
+- Yaroslav Sergaev, Viacheslav Tekaev, Nikita Nikonov. *FlowDraft.* Report of the team project. Summer School of Machine Learning at Skoltech (SMILES 2026), accepted. [OpenReview](https://openreview.net/forum?id=OwQPRxYdZj) — the earlier version of this project, on Qwen3-1.7B
 - Yaniv Leviathan, Matan Kalman, Yossi Matias. *Fast Inference from Transformers via Speculative Decoding.* ICML 2023. [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)
 - Andrea Santilli, Silvio Severino, Emilian Postolache, Valentino Maiorca, Michele Mancusi, Riccardo Marin, Emanuele Rodolà. *Accelerating Transformer Inference for Translation via Parallel Decoding.* ACL 2023. [doi:10.18653/v1/2023.acl-long.689](https://doi.org/10.18653/v1/2023.acl-long.689)
 
