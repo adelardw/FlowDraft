@@ -1,0 +1,18 @@
+# @package _global_
+# Orthrus on Qwen3-1.7B with the output projection: the set the RELEASED
+# weights train (chiennv/Orthrus-Qwen3-1.7B moved o_proj as far as q/k/v, and
+# the paper's "about 16% of parameters" matches Q, K, V, O).
+#
+# Paired with `qwen_flowdraft_multistep`, which adapts Q, K, V, O and the
+# per-head norms (the model's default set), so the norms are listed here too:
+# the pair differs in the objective only. The released norms barely moved
+# (0.001-0.002), so they cost nothing to include.
+#   ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus_qkvo
+defaults:
+  - /experiment/qwen_orthrus
+  - _self_
+
+output_dir: checkpoints/qwen_orthrus_qkvo
+model:
+  adapter:
+    w_names: [q_proj, k_proj, v_proj, o_proj, q_norm, k_norm]
