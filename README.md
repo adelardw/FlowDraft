@@ -17,8 +17,8 @@
 
 Measured on 460 prompts from six math and code benchmarks; intervals are 95%, paired by prompt at 0.6B and by seed at 135M.
 
-- **At one pass, the gain comes from the training term, not from the drafting state.** On Qwen3-0.6B at 10k steps the chain term adds **+0.241 ± 0.027** accepted tokens per cycle with everything else fixed. Given the term, a masked drafter is at least as good at one pass as a continuous one: −0.059 ± 0.025 for the continuous state at 0.6B, −0.148 ± 0.047 over three seeds at 135M.
-- **The continuous state is what makes refinement work, and refinement does not pay.** With the term, the continuous state gains +0.78 accepted tokens over the masked one at three passes. No extra pass meets the break-even condition `A(n+1) − A(n) > TPF(n)`: each costs a forward of the model. A refinement pass costing a fraction `c` of a forward would pay at our 80k acceptances only for `c < 0.385`.
+- **At one pass, the gain comes from the training term, not from the drafting state.** On Qwen3-0.6B at 10k steps the multistep term adds **+0.241 ± 0.027** accepted tokens per cycle with everything else fixed. Given the term, a masked drafter is at least as good at one pass as a continuous one: −0.059 ± 0.025 for the continuous state at 0.6B, −0.148 ± 0.047 over three seeds at 135M.
+- **The continuous state is what makes refinement work, and refinement does not pay.** With the term, the continuous state gains +0.78 accepted tokens over the masked one at three passes. No extra pass meets the break-even condition `A(n+1) − A(n) > TPF(n)`: each costs a forward of the model. A refinement pass costing a fraction `c` of a forward would pay at our 80k acceptances only for `c < 0.386`.
 - **Matched pairs against our Orthrus reproduction.** On Q,K,V at 80k steps: **2.576 vs 2.201** accepted tokens at one pass, +0.360 ± 0.035, ahead on 81% of prompts; tokens per forward 1.788 vs 1.601; wall clock 1.44× vs 1.35× on a T4. On Q,K,V,O at 100k steps: **2.467 vs 2.070**, +0.381 ± 0.033 (87%). The lead holds under speculative sampling, on 512-token generations, on every benchmark and at equal training GPU-hours (interpolated between checkpoints, one seed).
 - **The harness is checked against the released Orthrus-Qwen3-1.7B:** its Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit a 512-token budget.
 - **Closest work** — Draft-OPD, DEdit, DistillSpec and others — is laid out under [The idea](#the-idea). What is specific here: the label is the verifier's verdict on the draft the refinement pass *reads* (one Jacobi step), and the study separates the objective from the state.
@@ -124,7 +124,7 @@ pass: **1.326 against Orthrus's 1.219**.
 Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
 while acceptance grows slower than `n`, so by three passes every configuration
 is below plain decoding (at two passes, measured on seed 42 only, the continuous
-drafter with the chain term is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
+drafter with the multistep term is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
 et al., 2023) says why refinement alone is no speedup mechanism: a pass that
 realised the Jacobi sweep exactly would guarantee only `TPF = 1`, the speed of
 plain decoding. The continuous state loses the least
@@ -283,7 +283,7 @@ trained on.
 **What this section adds.** The 10k section above is a matched-budget snapshot of
 five configurations; it ends by saying nothing has converged. This one takes the
 two configurations that matter — the reproduced Orthrus baseline and the continuous
-drafter with the chain term on the same three projections — to **80,000 optimizer steps each**, and measures
+drafter with the multistep term (FlowDraft multistep) on the same three projections — to **80,000 optimizer steps each**, and measures
 them the same way. Orthrus spent 74.9 hours of training across nine sessions, the
 the continuous drafter 110.5 across twelve; the step counts are identical, which is what the
 comparison rests on. Two things are new besides the budget: a **decode schedule
@@ -796,14 +796,14 @@ categorical flow-map drafter with consistency losses — is kept in
 `bucket/README_superseded_sections.md`.*
 
 - **What the drafter is trained on.** Orthrus distils its drafter on the training text: at every position the target is the frozen model's next-token distribution given the *true* preceding tokens. The drafter never sees a block it drafted, and nothing tells it how the verifier would judge one.
-- **The chain term.** Run the drafter's own refinement chain and supervise each pass with the verifier's response to the draft it reads, `p_AR(· | ctx, a, d_<j)` — one parallel Jacobi sweep of the greedy chain, imitated on the states the decoder actually produces (a DAgger step). The verification forward computes this target anyway.
+- **The multistep term.** Run the drafter's own refinement passes and supervise each pass with the verifier's response to the draft it reads, `p_AR(· | ctx, a, d_<j)` — one parallel Jacobi sweep of the greedy chain, computed on the drafts the decoder actually produces. The verification forward computes this target anyway.
 - **Two drafting states.** *Masked:* the most confident positions are committed and the rest re-masked, as in Orthrus's multi-step decoding. *Continuous:* a point on the vocabulary simplex that mixes fresh noise with the previous draft at a level `s ≥ 0.5`, so every position can still change.
 - **Why noise cannot help a single pass.** With a deterministic verifier the Bayes-optimal one-pass drafter ignores its noise input, so a refinement pass can gain only from the drafter's own previous draft. Flow-map consistency losses train on interpolants toward the training text, which contain the answer and never the draft — that is why they were dropped.
-- **When a pass pays.** Only if it adds more accepted tokens than the current tokens per forward; if a refinement pass costs a fraction `c` of a forward, the second pass pays at our 80k acceptances for `c < 0.385`. Inside Orthrus `c = 1`.
+- **When a pass pays.** Only if it adds more accepted tokens than the current tokens per forward; if a refinement pass costs a fraction `c` of a forward, the second pass pays at our 80k acceptances for `c < 0.386`. Inside Orthrus `c = 1`.
 
 ### Closest work
 
-| work | what it shares with the chain term | what differs |
+| work | what it shares with the multistep term | what differs |
 |---|---|---|
 | DistillSpec (ICLR 2024), Online Speculative Decoding (ICML 2024) | the target model's distributions on the drafter's own tokens as labels | autoregressive drafters, no refinement |
 | Draft-OPD (EMNLP 2026, arXiv 2605.29343) | the same label for a block drafter's own block | a single pass: it labels the pass's own output, not the draft the next pass reads |
