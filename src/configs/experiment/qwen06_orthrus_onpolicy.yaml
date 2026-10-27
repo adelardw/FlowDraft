@@ -1,0 +1,28 @@
+# @package _global_
+# Маскирующий драфтер с одним он-полиси членом — сетка 2×2 «что учит член цепочки».
+# Член выбирается ключом train.onpolicy_term, остальное у всех четырёх ячеек общее:
+#   none     — только одношаговый KL (с весами позиций и гейтом из qwen06_base);
+#   opd      — KL input: собственный блок одного прохода; KL target: p_AR(·|ctx, a, d_<j)
+#              на нём же; прямой KL на принятых, обратный с весом γ^(j−1) на отвергнутых;
+#   chain_tf — KL input: раунды уточнения по собственному блоку (коммит уверенных,
+#              остальное под маской); KL target: p_AR(·|ctx, a, y_<j) по обучающему тексту;
+#   chain    — те же раунды; KL target: p_AR(·|ctx, a, d_<j), ответ верификатора на блок.
+# Проекции Q, K, V — как у главной пары на 80k.
+#   uv run python src/train.py +experiment=qwen06_orthrus_onpolicy train.onpolicy_term=opd \
+#       output_dir=checkpoints/qwen06_orthrus_onpolicy_opd
+defaults:
+  - /experiment/qwen06_base
+  - _self_
+
+output_dir: checkpoints/qwen06_orthrus_onpolicy
+model:
+  adapter:
+    w_names: [q_proj, k_proj, v_proj]
+train:
+  variant: orthrus_onpolicy
+  onpolicy_term: chain
+  onpolicy_weight: 1.0
+  opd_gamma: 0.8
+  selfcorrect_kl_weight: 1.0
+  selfcorrect_rounds: 2
+  selfcorrect_tail_weight: 0.5

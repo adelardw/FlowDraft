@@ -190,10 +190,12 @@ def build_lit(
         from src.models.linear_orthrus import LinearFlowDraft as Module
     elif canonical_variant == "flowdraft":
         from src.models.flowdraft import FlowDraft as Module
+    elif canonical_variant == "orthrus_onpolicy":
+        from src.models.orthrus_onpolicy import OrthrusOnPolicy as Module
     else:
         raise ValueError(
             f"unknown variant='{requested_variant}' (flowdraft | flowdraft_block_wise | "
-            "orthrus | orthrus_linear | flowdraft_block_wise_linear)"
+            "orthrus | orthrus_linear | flowdraft_block_wise_linear | orthrus_onpolicy)"
         )
 
     model = Module(cfg)
