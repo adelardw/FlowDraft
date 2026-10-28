@@ -199,9 +199,6 @@ paper/
 *.synctex.gz
 PROVENANCE.md
 
-# Rejected work kept out of the tree
-bucket/
-
 # Локальные артефакты стенда, которые не должны ехать в репозиторий
 .work/papers/          # PDF источников — не наши, 4.3 МБ
 .work/rollback/        # снимки состояния сессии
@@ -211,8 +208,7 @@ results/eval-prompts.jsonl   # построчный дамп eval, гигаба�
 # Черновики сессии: не несущее, воспроизведение живёт в bench/
 .work/
 
-# Стенд и корзина — локальные, в репозиторий не идут
-bench/
+# Построчные дампы стенда: тяжёлые, пересобираются скриптами bench/
 results/measure-per-prompt.jsonl
 data/measurements/*.jsonl
 
