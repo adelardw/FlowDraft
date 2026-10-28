@@ -26,11 +26,16 @@ from scipy import stats  # noqa: E402
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e8e7e3"
 SLOT = ["#8b8a85", "#eb6834", "#eda100", "#2a78d6"]
 NEG = SLOT[1]
-CONFIGS = [("smollm_orthrus", "Orthrus, reproduced (Q,K,V)"),
-           ("smollm_orthrus_multistep", "masked + multi-step training (Q,K,V,O)"),
-           ("smollm_flowdraft", "continuous state, no multi-step training (Q,K,V,O)"),
-           ("smollm_flowdraft_multistep", "continuous state + multi-step training (Q,K,V,O)")]
-COLOR = {c: SLOT[i] for i, (c, _) in enumerate(CONFIGS)}
+ALL = [("smollm_orthrus", "Orthrus (Q,K,V)"),
+       ("smollm_orthrus_multistep", "Orthrus multistep (Q,K,V,O)"),
+       ("smollm_flowdraft", "FlowDraft (Q,K,V,O)"),
+       ("smollm_flowdraft_multistep", "FlowDraft multistep (Q,K,V,O)")]
+COLOR = {c: SLOT[i] for i, (c, _) in enumerate(ALL)}
+# The figures compare only runs that are matched: the three that train Q,K,V,O
+# with the same position weights and differ in nothing but the state and the
+# multistep term. Orthrus trains Q,K,V without the weights, so it is matched
+# to none of them and is left out (its numbers are in the README text).
+CONFIGS = ALL[1:]
 SCHED = {"1": 1, "[[0, 1], [0.5, 1], [0.75, 1]]": 3, "[[0, 1], [0.34, 1], [0.67, 1], [0.9, 1]]": 4}
 PASSES = [1, 3, 4]
 SEEDS = [42, 43, 44]
@@ -81,8 +86,8 @@ def multistep():
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.0), facecolor=SURFACE)
     for ax, metric, ylabel, title in (
         (axes[0], "acceptance", "accepted tokens out of 31",
-         "Acceptance grows with refinement passes only for\nthe continuous state trained on them"),
-        (axes[1], "tpf", "tokens per forward, end to end", "Throughput pays for every extra pass"),
+         "Acceptance grows with refinement passes only for\nFlowDraft multistep"),
+        (axes[1], "tpf", "tokens per forward, end to end", "Every extra pass costs throughput"),
     ):
         style(ax)
         ax.axvspan(3.6, 4.4, color="#f0efeb", zorder=0, lw=0)
@@ -99,9 +104,10 @@ def multistep():
     axes[1].axhline(1.0, color=INK2, lw=1.0, zorder=1)
     axes[1].text(3.5, 1.02, "plain autoregressive decoding", ha="right", va="bottom", fontsize=8.5, color=INK2)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False, fontsize=9.5,
+    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False, fontsize=9.5,
                labelcolor=INK2, bbox_to_anchor=(0.5, -0.06))
-    fig.suptitle("SmolLM2-135M · 460 tasks · three training seeds · error bars are seed-to-seed 95% CI",
+    fig.suptitle("SmolLM2-135M · the three configurations on Q,K,V,O with position weights · 460 tasks · "
+                 "three training seeds · error bars are seed-to-seed 95% CI",
                  x=0.01, ha="left", fontsize=10, color=INK2)
     fig.tight_layout(rect=(0, 0.06, 1, 0.97))
     fig.savefig("results/figures/multistep.png", dpi=160, bbox_inches="tight", facecolor=SURFACE)
@@ -110,11 +116,9 @@ def multistep():
 
 
 def contrasts():
-    rows = [("smollm_flowdraft_multistep", "smollm_flowdraft", "multi-step term, continuous state\n(matched)"),
-            ("smollm_flowdraft_multistep", "smollm_orthrus", "continuous + multi-step (Q,K,V,O)\nvs Orthrus (Q,K,V)"),
-            ("smollm_flowdraft_multistep", "smollm_orthrus_multistep", "continuous vs masked, both with\nthe term (matched)"),
-            ("smollm_orthrus_multistep", "smollm_orthrus", "masked + multi-step (Q,K,V,O)\nvs Orthrus (Q,K,V)")]
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.2), facecolor=SURFACE, sharey=True)
+    rows = [("smollm_flowdraft_multistep", "smollm_flowdraft", "multistep term\nFlowDraft multistep − FlowDraft"),
+            ("smollm_flowdraft_multistep", "smollm_orthrus_multistep", "continuous state\nFlowDraft multistep − Orthrus multistep")]
+    fig, axes = plt.subplots(1, 3, figsize=(15.5, 2.9), facecolor=SURFACE, sharey=True)
     for ax, n in zip(axes, PASSES):
         style(ax)
         ax.grid(axis="y", visible=False)
@@ -132,10 +136,10 @@ def contrasts():
     axes[0].set_yticks(range(len(rows)))
     axes[0].set_yticklabels([r[2] for r in rows], color=INK2, fontsize=9)
     axes[0].invert_yaxis()
-    fig.suptitle("Paired contrasts with the SEED as the unit of observation (df = 2) · 20k steps · rows 1 and 3 "
-                 "are matched; rows 2 and 4 also differ in O, the position weights and the tail weight",
+    fig.suptitle("Paired contrasts with the SEED as the unit of observation (df = 2) · 20k steps · each changes one "
+                 "factor: both runs train Q,K,V,O with the same position weights",
                  x=0.01, ha="left", fontsize=10, color=INK2)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig("results/figures/contrasts.png", dpi=160, bbox_inches="tight", facecolor=SURFACE)
     plt.close(fig)
     print("-> results/figures/contrasts.png")
@@ -145,20 +149,20 @@ def per_benchmark():
     fig, ax = plt.subplots(figsize=(12.5, 5.4), facecolor=SURFACE)
     style(ax)
     ax.grid(axis="x", visible=False)
-    w = 0.2
+    w = 0.26
     for i, (cfg, label) in enumerate(CONFIGS):
         for j, ds in enumerate(DATASETS):
             m, h = seed_ci(seed_means(cfg, 3, "acceptance", datasets=[ds]))
-            ax.bar(j + (i - 1.5) * w, m, w * 0.92, color=COLOR[cfg], label=label if j == 0 else None, zorder=3)
-            ax.errorbar(j + (i - 1.5) * w, m, yerr=h, color=INK2, lw=1.2, capsize=3, zorder=4)
+            ax.bar(j + (i - 1) * w, m, w * 0.92, color=COLOR[cfg], label=label if j == 0 else None, zorder=3)
+            ax.errorbar(j + (i - 1) * w, m, yerr=h, color=INK2, lw=1.2, capsize=3, zorder=4)
     ax.set_xticks(range(len(DATASETS)))
     ax.set_xticklabels(DATASETS, color=INK2, fontsize=10)
     ax.set_ylabel("accepted tokens out of 31", color=INK2, fontsize=10)
     ax.set_title("The effect holds on every benchmark, three refinement passes", color=INK, fontsize=12, loc="left")
-    ax.legend(frameon=False, fontsize=9.5, labelcolor=INK2, ncol=2, loc="upper left")
+    ax.legend(frameon=False, fontsize=9.5, labelcolor=INK2, ncol=3, loc="upper left")
     ax.set_ylim(0, 3.3)
-    fig.text(0.5, -0.02, "SmolLM2-135M at 20k steps, three training seeds. Bars are seed means; whiskers are "
-             "95% intervals with the seed as the unit.", ha="center", color=INK2, fontsize=9)
+    fig.text(0.5, -0.02, "SmolLM2-135M at 20k steps, three training seeds, the three configurations on Q,K,V,O. "
+             "Bars are seed means; whiskers are 95% intervals with the seed as the unit.", ha="center", color=INK2, fontsize=9)
     fig.tight_layout()
     fig.savefig("results/figures/per_benchmark.png", dpi=160, bbox_inches="tight", facecolor=SURFACE)
     plt.close(fig)
@@ -182,9 +186,9 @@ def horizon():
     ax.set_ylabel("accepted tokens out of 31, three passes", color=INK2, fontsize=10)
     ax.set_title("Measured horizon: eight of ten runs peak at the budget limit", color=INK, fontsize=12, loc="left")
     handles, labels = ax.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.045), ncol=2, frameon=False,
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.045), ncol=3, frameon=False,
                fontsize=9.5, labelcolor=INK2)
-    fig.text(0.5, 0.0, "Seed 42, the only seed measured at 10k and 16k; four of the ten configurations shown. "
+    fig.text(0.5, 0.0, "Seed 42, the only seed measured at 10k and 16k; the three configurations on Q,K,V,O of the ten. "
              "Whiskers are 95% intervals over the 460 prompts.", ha="center", va="bottom", color=INK2, fontsize=9)
     fig.tight_layout(rect=(0, 0.12, 1, 1))
     fig.savefig("results/figures/horizon.png", dpi=160, bbox_inches="tight", facecolor=SURFACE)

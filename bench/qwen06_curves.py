@@ -22,16 +22,24 @@ SLOT = ["#8b8a85", "#eb6834", "#eda100", "#2a78d6"]
 # Пятая запись — та же конфигурация без o_proj, поэтому цвет тот же, а стиль
 # другой: цвет = эксперимент, как во всех фигурах README.
 RUNS = [
-    ("qwen06_orthrus", "Orthrus, reproduced (Q,K,V)", SLOT[0], "-"),
-    ("qwen06_orthrus_multistep", "masked + multi-step training (Q,K,V,O)", SLOT[1], "-"),
-    ("qwen06_flowdraft", "continuous state, no multi-step (Q,K,V,O)", SLOT[2], "-"),
-    ("qwen06_flowdraft_multistep", "continuous + multi-step (Q,K,V,O)", SLOT[3], "-"),
-    ("qwen06_flowdraft_multistep_qkv", "continuous + multi-step (Q,K,V)", SLOT[3], "--"),
+    ("qwen06_orthrus", "Orthrus (Q,K,V)", SLOT[0], "-"),
+    ("qwen06_orthrus_multistep", "Orthrus multistep (Q,K,V,O)", SLOT[1], "-"),
+    ("qwen06_flowdraft", "FlowDraft (Q,K,V,O)", SLOT[2], "-"),
+    ("qwen06_flowdraft_multistep", "FlowDraft multistep (Q,K,V,O)", SLOT[3], "-"),
+    ("qwen06_flowdraft_multistep_qkv", "FlowDraft multistep (Q,K,V)", SLOT[3], "--"),
 ]
 ARMS = [(k, l) for k, l, _, _ in RUNS]
 COLOR = {k: c for k, _, c, _ in RUNS}
 STYLE = {k: st for k, _, _, st in RUNS}
 LABEL = dict(ARMS)
+# The five runs form two matched sets, and a panel compares runs of one set only:
+# three on Q,K,V,O with the same position weights, which differ in nothing but
+# the state and the multistep term, and the Q,K,V pair of Orthrus against
+# FlowDraft multistep, the projections the Orthrus paper describes.
+SETS = [("Q,K,V,O, position weights in all three",
+         ["qwen06_orthrus_multistep", "qwen06_flowdraft", "qwen06_flowdraft_multistep"]),
+        ("Q,K,V, as in the Orthrus paper",
+         ["qwen06_orthrus", "qwen06_flowdraft_multistep_qkv"])]
 BLOCK = 32
 
 
@@ -83,55 +91,35 @@ def main():
     missing = [a for a, _ in ARMS if a not in E]
     if missing:
         print(f"нет логов: {missing}", file=sys.stderr)
-    runs = [a for a, _ in ARMS if a in E]
-    # Общий шаг — последний, на котором валидировались ВСЕ. Иначе панель
-    # сравнивала бы модель на 4428 шагах с моделью на 2806.
-    steps_each = [set(series(E[a], "val/teacher_agreement")) for a in runs]
-    common = sorted(set.intersection(*steps_each)) if steps_each else []
-    S = common[-1] if common else None
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.9), facecolor=SURFACE)
-    for ax in (ax1, ax2):
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.8), facecolor=SURFACE)
+    for ax in axes.flat:
         ax.set_facecolor(SURFACE)
         ax.grid(True, color=GRID, lw=0.8)
         ax.set_axisbelow(True)
         for s in ax.spines.values():
             s.set_color(GRID)
         ax.tick_params(colors=INK2, labelsize=9)
-
-    for a in runs:
-        d = series(E[a], "val/teacher_agreement")
-        xs = sorted(d)
-        draw(ax1, xs, [d[x] for x in xs], COLOR[a], STYLE[a], LABEL[a], note_below=True)
-    ax1.set_xlabel("optimizer step", color=INK2, fontsize=9)
-    ax1.set_ylabel("teacher-forced agreement", color=INK2, fontsize=9)
-    ax1.set_title("Teacher-forced agreement rises everywhere,\n"
-                  "and ranks them differently from held-out decoding",
-                  color=INK, fontsize=10, loc="left")
-
-    # Правая панель — валидационный лосс, а НЕ приёмка: приёмка на восьми
-    # последовательностях квантована по 1/8 и на графике превращается в шум.
-    # Лоссы между вариантами несравнимы (объективы разные), поэтому панель
-    # читается по НАКЛОНУ каждой кривой в отдельности: ни одна не вышла на
-    # плато, то есть 10k — это равный бюджет, а не сошедшееся состояние.
-    for a in runs:
-        d = series(E[a], "val/loss")
-        xs = sorted(d)
-        draw(ax2, xs, [d[x] for x in xs], COLOR[a], STYLE[a])
-    ax2.set_xlabel("optimizer step", color=INK2, fontsize=9)
-    ax2.set_ylabel("validation loss", color=INK2, fontsize=9)
-    ax2.set_title("Nothing has converged at 10k steps:\n"
-                  "a matched budget, not a converged state",
-                  color=INK, fontsize=10, loc="left")
-
-    handles, labels = ax1.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.055), ncol=3,
-               frameon=False, fontsize=8.5, labelcolor=INK2)
-    fig.text(0.5, 0.0, "Loss curves are not comparable BETWEEN configurations — the objectives "
-             "differ. "
-             "Read each slope on its own. Held-out acceptance is measured separately.",
+        ax.set_xlabel("optimizer step", color=INK2, fontsize=9)
+    for row, (set_name, keys) in enumerate(SETS):
+        ax1, ax2 = axes[row]
+        for a in [k for k in keys if k in E]:
+            d = series(E[a], "val/teacher_agreement")
+            xs = sorted(d)
+            draw(ax1, xs, [d[x] for x in xs], COLOR[a], STYLE[a], LABEL[a], note_below=False)
+            # Validation loss, not acceptance: acceptance on eight sequences is
+            # quantised to 1/8. The objectives differ, so read each slope alone.
+            d = series(E[a], "val/loss")
+            xs = sorted(d)
+            draw(ax2, xs, [d[x] for x in xs], COLOR[a], STYLE[a])
+        ax1.set_ylabel("teacher-forced agreement", color=INK2, fontsize=9)
+        ax1.set_title(f"({'ac'[row]}) {set_name}: teacher-forced agreement", color=INK, fontsize=10, loc="left")
+        ax2.set_ylabel("validation loss", color=INK2, fontsize=9)
+        ax2.set_title(f"({'bd'[row]}) {set_name}: validation loss", color=INK, fontsize=10, loc="left")
+        ax1.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc="lower right" if row == 0 else "upper left")
+    fig.text(0.5, 0.0, "Qwen3-0.6B at a matched 10k steps. Loss curves are not comparable BETWEEN configurations — "
+             "the objectives differ; read each slope on its own. Nothing has converged at 10k steps.",
              ha="center", va="bottom", color=INK2, fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.14, 1, 1))
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     out = "results/figures/qwen06_training.png"
     fig.savefig(out, dpi=160, bbox_inches="tight", facecolor=SURFACE)
     print(f"-> {out}")

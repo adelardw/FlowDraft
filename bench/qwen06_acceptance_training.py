@@ -29,11 +29,19 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e8e7e3"
 SLOT = ["#8b8a85", "#eb6834", "#eda100", "#2a78d6"]
-RUNS = [("qwen06_orthrus", "Orthrus, reproduced (Q,K,V)", SLOT[0], "-"),
-        ("qwen06_orthrus_multistep", "masked + multi-step training (Q,K,V,O)", SLOT[1], "-"),
-        ("qwen06_flowdraft", "continuous state, no multi-step (Q,K,V,O)", SLOT[2], "-"),
-        ("qwen06_flowdraft_multistep", "continuous + multi-step (Q,K,V,O)", SLOT[3], "-"),
-        ("qwen06_flowdraft_multistep_qkv", "continuous + multi-step (Q,K,V)", SLOT[3], "--")]
+RUNS = [("qwen06_orthrus", "Orthrus (Q,K,V)", SLOT[0], "-"),
+        ("qwen06_orthrus_multistep", "Orthrus multistep (Q,K,V,O)", SLOT[1], "-"),
+        ("qwen06_flowdraft", "FlowDraft (Q,K,V,O)", SLOT[2], "-"),
+        ("qwen06_flowdraft_multistep", "FlowDraft multistep (Q,K,V,O)", SLOT[3], "-"),
+        ("qwen06_flowdraft_multistep_qkv", "FlowDraft multistep (Q,K,V)", SLOT[3], "--")]
+# The five runs form two matched sets, and a panel compares runs of one set only:
+# three on Q,K,V,O with the same position weights, which differ in nothing but
+# the state and the multistep term, and the Q,K,V pair of Orthrus against
+# FlowDraft multistep, the projections the Orthrus paper describes.
+SETS = [("Q,K,V,O, position weights in all three",
+         ["qwen06_orthrus_multistep", "qwen06_flowdraft", "qwen06_flowdraft_multistep"]),
+        ("Q,K,V, as in the Orthrus paper",
+         ["qwen06_orthrus", "qwen06_flowdraft_multistep_qkv"])]
 BLOCK = 31
 
 
@@ -93,50 +101,42 @@ def draw(ax, xs, ys, color, style, label=None):
 
 def main():
     S, M = in_training(), measured()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.0, 5.0), facecolor=SURFACE)
-    for ax in (ax1, ax2):
+    by_key = {k: (label, color, style) for k, label, color, style in RUNS}
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 9.0), facecolor=SURFACE)
+    for ax in axes.flat:
         ax.set_facecolor(SURFACE)
         ax.grid(True, color=GRID, lw=0.8)
         ax.set_axisbelow(True)
         for s in ax.spines.values():
             s.set_color(GRID)
         ax.tick_params(colors=INK2, labelsize=9)
-
-    for key, label, color, style in RUNS:
-        d = S.get(key, {})
-        if d:
-            xs = sorted(d)
-            draw(ax1, xs, [d[x] for x in xs], color, style, label)
-    ax1.set_xlabel("training step", color=INK2, fontsize=9)
-    ax1.set_ylabel(f"accepted tokens out of {BLOCK}", color=INK2, fontsize=9)
-    ax1.set_title("As the training loop sees it — eight held-out sequences,\n"
-                  "quantised to 1/8 and noisy",
-                  color=INK, fontsize=10, loc="left")
-
     passes = (1, 2, 3, 4)
-    for key, label, color, style in RUNS:
-        v = M.get(key)
-        if not v or not all(v.get(n) for n in passes):
-            continue
-        ax2.plot(passes, [st.mean(v[n].values()) for n in passes], color=color, ls=style,
-                 lw=2.2, marker="o", ms=6)
-    ax2.set_xticks(passes)
-    ax2.set_xlabel("refinement passes at decode", color=INK2, fontsize=9)
-    ax2.set_ylabel(f"accepted tokens out of {BLOCK}", color=INK2, fontsize=9)
-    ax2.set_title("As decoding delivers it — 460 prompts, six benchmarks,\n"
-                  "and a different ordering",
-                  color=INK, fontsize=10, loc="left")
-
-    # Q,K,V is a diamond on the left and a dashed line on the right; its handle shows both.
-    handles = [Line2D([], [], color=c, ls=s, lw=2, marker="D" if s == "--" else "o",
-                      ms=7 if s == "--" else 5, markeredgecolor=SURFACE if s == "--" else c)
-               for _, _, c, s in RUNS]
-    fig.legend(handles, [l for _, l, _, _ in RUNS], loc="lower center", bbox_to_anchor=(0.5, 0.055),
-               ncol=3, frameon=False, fontsize=8.5, labelcolor=INK2, handlelength=3)
+    for row, (set_name, keys) in enumerate(SETS):
+        ax1, ax2 = axes[row]
+        for key in keys:
+            label, color, style = by_key[key]
+            d = S.get(key, {})
+            if d:
+                xs = sorted(d)
+                draw(ax1, xs, [d[x] for x in xs], color, style, label)
+            v = M.get(key)
+            if v and all(v.get(n) for n in passes):
+                ax2.plot(passes, [st.mean(v[n].values()) for n in passes], color=color, ls=style,
+                         lw=2.2, marker="o", ms=6, label=label)
+        ax1.set_xlabel("training step", color=INK2, fontsize=9)
+        ax1.set_ylabel(f"accepted tokens out of {BLOCK}", color=INK2, fontsize=9)
+        ax1.set_title(f"({'ac'[row]}) {set_name}: as the training loop sees it\n"
+                      "eight held-out sequences, quantised to 1/8", color=INK, fontsize=10, loc="left")
+        ax2.set_xticks(passes)
+        ax2.set_xlabel("refinement passes at decode", color=INK2, fontsize=9)
+        ax2.set_ylabel(f"accepted tokens out of {BLOCK}", color=INK2, fontsize=9)
+        ax2.set_title(f"({'bd'[row]}) {set_name}: as decoding delivers it\n"
+                      "460 prompts, six benchmarks", color=INK, fontsize=10, loc="left")
+        ax2.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc="upper left")
     fig.text(0.5, 0.0, "Qwen3-0.6B at a matched 10k steps, one training seed — no seed band, "
-             "unlike the 135M bench. Left panel is an indicator; the right one is the measurement.",
+             "unlike the 135M bench. The left panels are an indicator; the right ones are the measurement.",
              ha="center", va="bottom", color=INK2, fontsize=8.5)
-    fig.tight_layout(rect=(0, 0.14, 1, 1))
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     out = "results/figures/qwen06_acceptance.png"
     fig.savefig(out, dpi=160, bbox_inches="tight", facecolor=SURFACE)
     print(f"-> {out}")

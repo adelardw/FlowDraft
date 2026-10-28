@@ -49,10 +49,10 @@ SLOT = ["#8b8a85", "#eb6834", "#eda100", "#2a78d6"]
 
 # Fixed order — a run that is absent must not repaint the runs that remain.
 ARMS = [
-    ("smollm_orthrus", "Orthrus, reproduced (Q,K,V)"),
-    ("smollm_orthrus_multistep", "masked + multi-step training (Q,K,V,O)"),
-    ("smollm_flowdraft", "continuous state, no multi-step training (Q,K,V,O)"),
-    ("smollm_flowdraft_multistep", "continuous state + multi-step training (Q,K,V,O)"),
+    ("smollm_orthrus", "Orthrus (Q,K,V)"),
+    ("smollm_orthrus_multistep", "Orthrus multistep (Q,K,V,O)"),
+    ("smollm_flowdraft", "FlowDraft (Q,K,V,O)"),
+    ("smollm_flowdraft_multistep", "FlowDraft multistep (Q,K,V,O)"),
 ]
 COLOR = {a: SLOT[i] for i, (a, _) in enumerate(ARMS)}
 LABEL = dict(ARMS)
@@ -62,9 +62,9 @@ LABEL = dict(ARMS)
 # читается как «эти линии совпали», поэтому неполное покрытие называется прямо.
 SHORT = {
     "smollm_orthrus": "Orthrus",
-    "smollm_orthrus_multistep": "masked+MS",
-    "smollm_flowdraft": "continuous",
-    "smollm_flowdraft_multistep": "continuous+MS",
+    "smollm_orthrus_multistep": "Orthrus multistep",
+    "smollm_flowdraft": "FlowDraft",
+    "smollm_flowdraft_multistep": "FlowDraft multistep",
 }
 
 SEEDS = [(42, "-", ""), (43, "--", "s43"), (44, ":", "s44")]
@@ -73,8 +73,8 @@ STYLE = {sd: st for sd, st, _ in SEEDS}
 LOSS_PANELS = [
     ("train/loss", "Training loss (rolling median)"),
     ("val/loss", "Validation loss"),
-    ("val/loss/verify_kl", "verify KL — first decode refinement pass"),
-    ("val/loss/selfcorrect_kl", "multi-step KL — later refinement passes"),
+    ("val/loss/verify_kl", "single-pass term — the first decode pass"),
+    ("val/loss/selfcorrect_kl", "multistep term — later refinement passes"),
     ("val/loss/endpoint", "endpoint"),
     ("val/loss/ec", "endpoint consistency"),
     ("val/loss/td", "temporal difference"),

@@ -29,12 +29,19 @@ SLOT = ["#8b8a85", "#eb6834", "#eda100", "#2a78d6"]
 # Цвет = эксперимент, как во всех фигурах README: серый — воспроизведённый
 # Orthrus, синий — непрерывное состояние с многошаговостью. Пунктир у синего
 # означает набор проекций Q,K,V без O, а не другой эксперимент.
-ARMS = [("orthrus", "Orthrus, reproduced (Q,K,V)", SLOT[0], "-"),
-        ("qkv", "continuous state + multi-step (Q,K,V)", SLOT[3], "--")]
-FILES = {"orthrus": "kaggle_out/fd80k-eval-orthrus/result/fd80k-eval-orthrus.jsonl",
-         "qkv": "kaggle_out/fd80k-eval-qkv/result/fd80k-eval-qkv.jsonl"}
-PP = {"orthrus": "kaggle_out/fd80k-eval-orthrus/result/pp-fd80k-eval-orthrus.jsonl",
-      "qkv": "kaggle_out/fd80k-eval-qkv/result/pp-fd80k-eval-qkv.jsonl"}
+ARMS = [("orthrus", "Orthrus (Q,K,V)", SLOT[0], "-"),
+        ("qkv", "FlowDraft multistep (Q,K,V)", SLOT[3], "--")]
+FILES = {"orthrus": "results/qwen06-80k-orthrus.jsonl",
+         "qkv": "results/qwen06-80k-qkv.jsonl"}
+PP = {"orthrus": "results/pp-qwen06-80k-orthrus.jsonl",
+      "qkv": "results/pp-qwen06-80k-qkv.jsonl"}
+# Пара Q,K,V,O на 100 000 шагов: те же фигуры для другого набора проекций.
+ARMS_100K = [("orthrus", "Orthrus (Q,K,V,O)", SLOT[0], "-"),
+             ("qkv", "FlowDraft multistep (Q,K,V,O)", SLOT[3], "-")]
+FILES_100K = {"orthrus": "results/qwen06-100k-qkvo-orthrus.jsonl",
+              "qkv": "results/qwen06-100k-qkvo.jsonl"}
+PP_100K = {"orthrus": "results/pp-qwen06-100k-qkvo-orthrus.jsonl",
+           "qkv": "results/pp-qwen06-100k-qkvo.jsonl"}
 PASSES = (1, 2, 3, 4)
 SETS = ["gsm8k", "math500", "humaneval", "mbpp", "aime24", "aime25"]
 
@@ -69,14 +76,14 @@ def style(ax, xlabel="refinement passes"):
         ax.set_xlabel(xlabel, color=INK2, fontsize=9)
 
 
-def fig_passes():
-    g = {k: load(v) for k, v in FILES.items()}
+def fig_passes(files=FILES, arms=ARMS, steps="80,000", out="results/figures/qwen06_80k_passes.png"):
+    g = {k: load(v) for k, v in files.items()}
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.3), facecolor=SURFACE)
     for ax in axes:
         style(ax)
         ax.set_xticks(PASSES)
     keys = ["n1", "n2", "n3", "n4v"]
-    for arm, label, color, ls in ARMS:
+    for arm, label, color, ls in arms:
         acc = [mean(g[arm][k], "acceptance") for k in keys]
         tpf = [mean(g[arm][k], "tpf_steady") for k in keys]
         spd = [mean(g[arm][k], "speedup") for k in keys]
@@ -93,7 +100,7 @@ def fig_passes():
                      (4, mean(g["qkv"]["n4"], "acceptance")), color=INK2, fontsize=8,
                      xytext=(-8, -16), textcoords="offset points", ha="right")
     axes[0].set_ylabel("accepted tokens per cycle", color=INK2, fontsize=9)
-    axes[0].set_title("the flow map's acceptance grows with passes",
+    axes[0].set_title("FlowDraft multistep's acceptance grows with passes",
                       color=INK, fontsize=10, loc="left")
     axes[0].legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc="upper left")
     for ax, name, title in ((axes[1], "tokens per forward",
@@ -106,11 +113,10 @@ def fig_passes():
     axes[1].annotate("autoregressive decoding", (3.62, 1.0), color=INK2, fontsize=8,
                      ha="right", va="bottom", xytext=(0, 3), textcoords="offset points")
     fig.text(0.5, -0.10,
-             "Qwen3-0.6B, both drafters at a matched 80,000 optimizer steps · 460 prompts from six benchmarks · "
+             f"Qwen3-0.6B, both drafters at a matched {steps} optimizer steps · 460 prompts from six benchmarks · "
              "every measurement bitwise-identical to greedy AR\n"
              "hollow marker: the four-pass schedule whose entry s = 0.34 falls outside the trained range [0.5, 1)",
              ha="center", color=INK2, fontsize=8.5)
-    out = "results/figures/qwen06_80k_passes.png"
     fig.savefig(out, dpi=160, bbox_inches="tight", facecolor=SURFACE)
     print("написано", out)
 
@@ -140,7 +146,7 @@ def fig_schedule():
     ax.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc="upper left")
     fig.text(0.5, -0.14,
              "Training places the two refinement entries in [0.5, 0.75) and [0.75, 1); nothing left of 0.5 is ever seen.\n"
-             "Orthrus is the control: it has no self-correction and no s_min, and its two four-pass bars are\n"
+             "Orthrus is the control: it has no multistep term and no s_min, and its two four-pass bars are\n"
              "identical on every one of the 460 prompts.",
              ha="center", color=INK2, fontsize=8.5)
     out = "results/figures/qwen06_80k_schedule.png"
@@ -148,7 +154,7 @@ def fig_schedule():
     print("написано", out)
 
 
-def fig_benchmarks():
+def fig_benchmarks(pp=PP, arms=ARMS, steps="80,000", out="results/figures/qwen06_80k_per_benchmark.png"):
     """Уровни ОБЕИХ веток по наборам, а не только их разность.
 
     Первая версия этой фигуры рисовала лишь контраст, и по ней нельзя было
@@ -157,7 +163,7 @@ def fig_benchmarks():
     для раздела на 10 000 шагов, а разность подписана над парой.
     """
     vals = defaultdict(lambda: defaultdict(list))
-    for arm, path in PP.items():
+    for arm, path in pp.items():
         for line in open(path):
             r = json.loads(line)
             if sched(r) != "n3":
@@ -167,7 +173,7 @@ def fig_benchmarks():
     style(ax, xlabel=None)
     x = list(range(len(SETS)))
     w = 0.36
-    for i, (arm, label, color, _) in enumerate(ARMS):
+    for i, (arm, label, color, _) in enumerate(arms):
         ys = [sum(vals[arm][d]) / len(vals[arm][d]) for d in SETS]
         es = [1.96 * st.stdev(vals[arm][d]) / math.sqrt(len(vals[arm][d])) for d in SETS]
         pos = [p + (i - 0.5) * w for p in x]
@@ -192,11 +198,10 @@ def fig_benchmarks():
                  color=INK, fontsize=10, loc="left")
     ax.legend(frameon=False, fontsize=8.5, labelcolor=INK2, loc="upper left")
     fig.text(0.5, -0.12,
-             "Both drafters at a matched 80,000 steps. Bold numbers are the paired margin, computed\n"
+             f"Both drafters at a matched {steps} steps. Bold numbers are the paired margin, computed\n"
              "prompt by prompt. Whiskers are 95% intervals over prompts within a benchmark, so they\n"
              "show measurement spread, not the between-seed spread the 135M figures carry.",
              ha="center", color=INK2, fontsize=8.5)
-    out = "results/figures/qwen06_80k_per_benchmark.png"
     fig.savefig(out, dpi=160, bbox_inches="tight", facecolor=SURFACE)
     print("написано", out)
 
@@ -205,3 +210,5 @@ if __name__ == "__main__":
     fig_passes()
     fig_schedule()
     fig_benchmarks()
+    fig_passes(FILES_100K, ARMS_100K, "100,000", "results/figures/qwen06_100k_passes.png")
+    fig_benchmarks(PP_100K, ARMS_100K, "100,000", "results/figures/qwen06_100k_per_benchmark.png")
