@@ -184,6 +184,10 @@ def build_lit(
         from src.models.orthrus import Orthrus as Module
     elif canonical_variant == "flowdraft_block_wise":
         from src.models.flowdraft_block_wise import FlowDraftBlockWise as Module
+    elif canonical_variant == "flowdraft_fm":
+        from src.models.flowdraft_fm import FlowDraftFM as Module
+    elif canonical_variant == "flowdraft_fm_bank":
+        from src.models.flowdraft_fm_bank import FlowDraftFMBank as Module
     elif canonical_variant == "orthrus_linear":
         from src.models.linear_orthrus import LinearOrthrus as Module
     elif canonical_variant == "flowdraft_block_wise_linear":
@@ -195,7 +199,7 @@ def build_lit(
     else:
         raise ValueError(
             f"unknown variant='{requested_variant}' (flowdraft | flowdraft_block_wise | "
-            "orthrus | orthrus_linear | flowdraft_block_wise_linear | orthrus_onpolicy)"
+            "flowdraft_fm | orthrus | orthrus_linear | flowdraft_block_wise_linear | orthrus_onpolicy)"
         )
 
     model = Module(cfg)

@@ -244,6 +244,9 @@ def build_dataloaders(cfg: DictConfig, tokenizer, df_processor):
     ``attention_mask [B, T]``. The ``[B, T, V]`` simplex is built on-device
     inside the model — it never rides the DataLoader.
     """
+    if cfg.data.get("fm_tokens_path"):
+        from src.data.fm_bank import build_bank_loaders
+        return build_bank_loaders(cfg)
     from datasets import interleave_datasets, load_dataset
 
     d = cfg.data

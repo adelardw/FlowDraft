@@ -1,0 +1,46 @@
+# @package _global_
+# A separate conditional flow-matching experiment. No training horizon chosen.
+defaults:
+  - /experiment/qwen06_base
+  - _self_
+
+output_dir: checkpoints/qwen06_flowdraft_fm
+
+model:
+  backbone:
+    dtype: float16
+    compile_ar: false
+  adapter:
+    w_names: [q_proj, k_proj, v_proj]
+    time_parameterisation: pair
+    conditioning_gate: false
+
+train:
+  variant: flowdraft_fm
+  prior_type: gaussian
+  fm_loss: weighted_velocity_mse
+  fm_weight: 1.0
+  fm_noise_std: 1.0
+  fm_train_steps: [1, 2, 3, 4]  # Total Euler passes, drawn uniformly each batch.
+  teacher_source: corpus       # Prototype FM data; not yet an AR-generated endpoint dataset.
+  teacher_target: soft         # Original KL(sg(P_AR(previous draft)) || q_current).
+  teacher_chain_tail_weight: 1.0  # Unused: no separate first-pass teacher loss.
+  verify_kl_weight: 0.0
+  selfcorrect_kl_weight: 1.0
+  selfcorrect_rounds: null      # Restart-loop setting; FM uses N-1 refinements.
+  selfcorrect_tail_weight: 0.5
+  acceptance_profile: [0.8]
+  position_weights: null
+  monitor: val/loss
+  monitor_mode: min
+  best_checkpoint_name: best-fm-{step:07d}
+  early_stop_patience: 0
+  val_decode_prompts: 4
+  val_decode_datasets: []
+  val_decode_jumps: 4
+  val_decode_max_new: 64
+
+trainer:
+  devices: 1
+  precision: 16-mixed
+  max_steps: null  # FlowDraftFM rejects training until a positive horizon is supplied.

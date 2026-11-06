@@ -820,6 +820,39 @@ Flow-matching VLAs (π0, SmolVLA) with 1–2 steps instead of 10 are left out:
 in 2026 that direction is crowded (SnapFlow, One-Step Flow Policy, MP1,
 AdaVLA) and it needs simulator success rates.
 
+### 7.15 Flow matching with the existing weighted drafting objective (6 Nov 2026)
+
+Requested as an additional experiment: `qwen06_flowdraft_fm`, a separate QKV
+drafter combining corpus-based, time-weighted velocity regression with
+the original multistep KL on `q = X + (1-t)*v`, preserving its acceptance
+weights, previous-draft targets and stop-gradients. No separate first-pass
+loss is added. FM still uses corpus endpoints; AR-generated endpoint data
+for joint-distribution distillation remains to be prepared. Training uses 1–4
+consecutive Euler steps, with detached states and one packed AR verification
+of all drafts after the context pass. The implementation and precise protocol are in
+[docs/flowdraft-fm-experiment.md](docs/flowdraft-fm-experiment.md).
+This is not a restart of the archived CFM presets or a change to the current
+FlowDraft campaign. Local correctness checks are available; GPU training has
+not started, and the training horizon remains unset.
+
+Follow-up target alignment is derived in the protocol: replace the ms target
+with the full-block AR endpoint posterior conditioned on the current noisy
+state, while preserving acceptance weights and detached refinement. Particle
+estimates also remain inaccurate on a trained toy drafter's own Euler states.
+A CPU implementation now uses one fixed empirical bank of joint AR endpoints
+for both FM and exact bank-posterior ms. In three training seeds, four-step
+first-four-token joint TV decreased from 0.10982 to 0.05569 on average; compute
+was not matched. The finite bank differs substantially from the full AR law.
+The subsequent authorized Qwen stage uses 80k raw examples, four anchors and a
+fixed 60k optimizer horizon on `wolfram74`. `FlowDraftFMBank` implements lazy,
+persistent prefix banks, sparse posterior KL and a resumable fixed token pool;
+33 CPU checks pass, including four-anchor backward and unchanged-60k resume.
+Its bank size is 16, versus 256 in the toy; preparation cost and CUDA behavior
+still require measurement. Sampling traces distinguish raw Euler/argmax flow
+from verified generation. Neither exact raw AR generation nor a one-pass
+generator follows from the toy result. Live run state is kept in
+`kaggle_out/fm-bank60k/state.json`, separately from this experimental plan.
+
 ## 8. Rejected ideas
 
 Measured and dropped. Their full sections moved to

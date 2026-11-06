@@ -1,0 +1,35 @@
+# @package _global_
+# Authorized 2026-11-06: 80k examples, four anchors, fixed 60k optimizer steps.
+defaults:
+  - /experiment/qwen06_flowdraft_fm
+  - _self_
+
+output_dir: checkpoints/qwen06_flowdraft_fm_bank
+model:
+  backbone:
+    revision: c1899de289a04d12100db370d81485cdf75e47ca
+  tokenizer:
+    revision: c1899de289a04d12100db370d81485cdf75e47ca
+train:
+  variant: flowdraft_fm_bank
+  teacher_source: fixed_ar_bank
+  anchors_per_sequence: 4
+  fm_bank_size: 16
+  fm_bank_path: ${output_dir}/endpoints.sqlite
+  val_decode_prompts: 0
+  checkpoint_every_n_steps: 1000
+  checkpoint_save_top_k: 1
+data:
+  fm_tokens_path: null
+  train_size: 80000
+  batch_size: 1
+  num_workers: 0
+  pack_sequences: false
+  max_length: 256
+  val_size: 32
+trainer:
+  max_steps: 60000
+  max_epochs: -1
+  accumulate_grad_batches: 16
+  val_check_interval: 16000
+  log_every_n_steps: 10
