@@ -5,7 +5,7 @@ FlowDraft uses a full-depth adapter of a frozen autoregressive (AR) model to pro
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13%2B-blue)
 
-The [3 July 2026 project description](https://github.com/adelardw/FlowDraft/blob/40e741b0d09caaad6820d3b8643713d4f090d833/README.md) introduced categorical flow-map drafting in the SMILES project. The [9 August experiment record](https://github.com/adelardw/FlowDraft/commit/ef5054bbe9d1bcd79ffe30e259a51ec6359f44ac) documents the subsequent verifier-supervised refinement experiments. The original [SMILES report](https://openreview.net/forum?id=OwQPRxYdZj) and the present study describe different stages of the project.
+The [3 July 2026 project description](https://github.com/adelardw/FlowDraft/blob/40e741b0d09caaad6820d3b8643713d4f090d833/README.md) described categorical flow-map drafting. The [9 August experiment record](https://github.com/adelardw/FlowDraft/commit/ef5054bbe9d1bcd79ffe30e259a51ec6359f44ac) documents the subsequent verifier-supervised refinement experiments.
 
 | Manuscript name | Historical configuration suffix | Training |
 | --- | --- | --- |
@@ -46,9 +46,7 @@ The [3 July 2026 project description](https://github.com/adelardw/FlowDraft/blob
 - [Inference parameters, in plain words](#inference-parameters-in-plain-words)
 - [Evaluation](#evaluation)
 - [Results](#results)
-- [References](#references)
 - [Team](#team)
-- [Acknowledgments](#acknowledgments)
 - [License](#license)
 
 ## Results, first scale point: SmolLM2-135M (August 2026)
@@ -1209,49 +1207,13 @@ section above, the schedule sweep is
 [step 4 of the Quickstart](#4-validate-on-every-dataset), and the block-size ×
 jump-count grid is under [Evaluation](#evaluation).
 
-## References
-
-**Method and decoding**
-
-- Daan Roos, Oscar Davis, Floor Eijkelboom, Michael M. Bronstein, Max Welling, İsmail İlkan Ceylan, Luca Ambrogioni, Jan-Willem van de Meent. *Categorical Flow Maps.* ICML 2026. [arXiv:2602.12233](https://arxiv.org/abs/2602.12233) · code: [olsdavis/semicat](https://github.com/olsdavis/semicat)
-- Chien Van Nguyen, Chaitra Hegde, Van Cuong Pham, Ryan A. Rossi, Franck Dernoncourt, Thien Huu Nguyen. *Orthrus: Memory-Efficient Parallel Token Generation via Dual-View Diffusion.* 2026. [arXiv:2605.12825](https://arxiv.org/abs/2605.12825) · code and weights: [chiennv2000/orthrus](https://github.com/chiennv2000/orthrus)
-- Yaroslav Sergaev, Viacheslav Tekaev, Nikita Nikonov. *FlowDraft.* Report of the team project. Summer School of Machine Learning at Skoltech (SMILES 2026), accepted. [OpenReview](https://openreview.net/forum?id=OwQPRxYdZj) — the earlier version of this project, on Qwen3-1.7B
-- Yaniv Leviathan, Matan Kalman, Yossi Matias. *Fast Inference from Transformers via Speculative Decoding.* ICML 2023. [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)
-- Andrea Santilli, Silvio Severino, Emilian Postolache, Valentino Maiorca, Michele Mancusi, Riccardo Marin, Emanuele Rodolà. *Accelerating Transformer Inference for Translation via Parallel Decoding.* ACL 2023. [doi:10.18653/v1/2023.acl-long.689](https://doi.org/10.18653/v1/2023.acl-long.689)
-
-**Models, data and benchmarks**
-
-- An Yang, Anfeng Li, Baosong Yang, et al. *Qwen3 Technical Report.* 2025. [arXiv:2505.09388](https://arxiv.org/abs/2505.09388)
-- Loubna Ben Allal, Anton Lozhkov, Elie Bakouch, et al. *SmolLM2: When Smol Goes Big — Data-Centric Training of a Small Language Model.* COLM 2025. [arXiv:2502.02737](https://arxiv.org/abs/2502.02737)
-- NVIDIA. *Nemotron-Post-Training-Dataset-v2.* 2025. [Hugging Face](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2)
-- GSM8K — Karl Cobbe et al. *Training Verifiers to Solve Math Word Problems.* 2021. [arXiv:2110.14168](https://arxiv.org/abs/2110.14168)
-- MATH-500 — the 500-problem subset of MATH (Dan Hendrycks et al., NeurIPS Datasets and Benchmarks 2021, [arXiv:2103.03874](https://arxiv.org/abs/2103.03874)) selected in Hunter Lightman et al., *Let's Verify Step by Step*, ICLR 2024, [arXiv:2305.20050](https://arxiv.org/abs/2305.20050)
-- HumanEval — Mark Chen et al. *Evaluating Large Language Models Trained on Code.* 2021. [arXiv:2107.03374](https://arxiv.org/abs/2107.03374)
-- MBPP — Jacob Austin et al. *Program Synthesis with Large Language Models.* 2021. [arXiv:2108.07732](https://arxiv.org/abs/2108.07732)
-- AIME 2024 and 2025 — Mathematical Association of America; 30 problems a year, taken from [HuggingFaceH4/aime_2024](https://huggingface.co/datasets/HuggingFaceH4/aime_2024) and [yentinglin/aime_2025](https://huggingface.co/datasets/yentinglin/aime_2025)
-
-Citing this repository:
-
-```bibtex
-@misc{sergaev2026flowdraft,
-  title        = {FlowDraft: Multistep Training of a Lossless Block Drafter on Its Own Drafts},
-  author       = {Sergaev, Yaroslav},
-  year         = {2026},
-  howpublished = {\url{https://github.com/adelardw/FlowDraft}}
-}
-```
-
 ## Team
 
-FlowDraft began at SMILES 2026 as a team project of Yaroslav Sergaev, Viacheslav
+FlowDraft began as a team project of Yaroslav Sergaev, Viacheslav
 Tekaev and Nikita Nikonov; every commit after 8 August 2026 is Yaroslav
 Sergaev's.
 
 **Mentors:** Maria Ivanova (YSDA, Applied AI Institute) · Dmitrii Babaev
-
-## Acknowledgments
-
-Begun as a team project at the **Summer School of Machine Learning at Skoltech (SMILES 2026)**, Skoltech Applied AI Center.
 
 ## License
 

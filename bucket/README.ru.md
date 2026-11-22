@@ -29,9 +29,7 @@
 - [Параметры инференса простыми словами](#параметры-инференса-простыми-словами)
 - [Оценка](#оценка) 🚧
 - [Результаты](#результаты) 🚧
-- [Ссылки](#ссылки)
 - [Команда](#команда)
-- [Благодарности](#благодарности)
 - [Лицензия](#лицензия) 🚧
 
 ## Обзор
@@ -653,29 +651,10 @@ HumanEval/MBPP считается их официальными sandboxed execut
 
 **Абляции (TODO):** размер блока, число скачков.
 
-## Ссылки
-
-- **Categorical Flow Maps** — Roos et al., ICML 2026. arXiv:2602.12233. Референсная имплементация: `olsdavis/semicat`. <!-- TODO: сверить финальную ссылку и линки -->
-- **Orthrus** — lossless-параллельное декодирование через замороженный AR-бэкбон + обучаемый диффузионный драфтер. arXiv:2605.12825. Референсная имплементация: `chiennv2000/orthrus`. <!-- TODO: сверить финальную ссылку и линки -->
-
-<!-- TODO: дополнить, когда появятся метаданные -->
-```bibtex
-@misc{flowdraft2026,
-  title  = {FlowDraft: Flow-Map Drafting for Lossless Parallel Decoding},
-  author = {TODO},
-  year   = {2026},
-  note   = {Summer of Machine Learning at Skoltech (SMILES), Applied AI Center}
-}
-```
-
 ## Команда
 
 - **Участники:** <!-- TODO: члены команды -->
 - **Кураторы / менторы:** Maria Ivanova (YSDA, Applied AI Institute) · Dmitrii Babaev
-
-## Благодарности
-
-Работа выполнена в рамках **Summer of Machine Learning at Skoltech (SMILES)**, Skoltech Applied AI Center.
 
 ## Лицензия
 

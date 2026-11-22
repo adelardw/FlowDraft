@@ -318,8 +318,7 @@ the term exists to prevent.
 
 It is not lifted from a paper. It was derived in this project, and the order
 matters: the **negative** result came first — it was first written up in the
-project's SMILES 2026 report with V. Tekaev and N. Nikonov
-(<https://openreview.net/forum?id=OwQPRxYdZj>).
+project's 2026 report with V. Tekaev and N. Nikonov.
 
 **1 — Multi-step cannot come from the noise.** With a deterministic verifier, a
 mean-field endpoint parameterisation and $x_0 \perp x_1 \mid \mathrm{ctx}$, the
