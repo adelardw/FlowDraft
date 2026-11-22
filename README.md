@@ -1,29 +1,25 @@
 # FlowDraft: Multistep Training of a Lossless Block Drafter on Its Own Drafts
 
-> A controlled study of the drafter's training objective inside Orthrus. Each refinement pass is supervised by the frozen verifier's response to the drafter's own draft; that term — not the drafting state — is what raises acceptance at the operating point of one drafter pass per cycle. Every output stays bitwise identical to greedy decoding.
+FlowDraft uses a full-depth adapter of a frozen autoregressive (AR) model to propose a block of tokens. During training, the verifier scores the prefixes of a draft and its next-token distributions supervise the next refinement pass. At inference the verifier checks the final proposal in one forward pass.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.13%2B-blue)
 
-> **About the name.** FlowDraft is the name the project has carried since SMILES 2026, where it began as a drafter built on categorical flow maps, and it is kept for continuity with the reports and posters that use it. The flow-map consistency losses were measured, cost −0.114 accepted tokens and were removed (`bucket/cfm_terms`); what remains of that idea is a continuous drafting state on the vocabulary simplex. The contribution is the training term, the multistep term.
+The [3 July 2026 project description](https://github.com/adelardw/FlowDraft/blob/40e741b0d09caaad6820d3b8643713d4f090d833/README.md) introduced categorical flow-map drafting in the SMILES project. The [9 August experiment record](https://github.com/adelardw/FlowDraft/commit/ef5054bbe9d1bcd79ffe30e259a51ec6359f44ac) documents the subsequent verifier-supervised refinement experiments. The original [SMILES report](https://openreview.net/forum?id=OwQPRxYdZj) and the present study describe different stages of the project.
 
-> **Names.** Configurations carry the names of their runs in `results/`: **Orthrus** (`*_orthrus`, the paper's objective), **Orthrus multistep** (`*_orthrus_multistep`, the same masked drafter trained with the multistep term), **FlowDraft** (`*_flowdraft`, the continuous state without the term) and **FlowDraft multistep** (`*_flowdraft_multistep`; `_qkv` trains Q,K,V alone). The 80k and 100k pairs are Orthrus against FlowDraft multistep.
-
-> **Status: two scale points measured, one of them to its full 80k-step schedule.** SmolLM2-135M — ten training runs at 20k steps, four replicated across three seeds, with the training seed as the unit of observation. Qwen3-0.6B — five configurations at a matched 10k steps on CUDA, one seed, a scale check rather than a second set of claims; the two configurations that carry the comparison were then taken to a matched **80k steps** each. Both measured on 460 tasks from six benchmarks; every greedy generation is bitwise identical to plain decoding, and sampling was measured with standard speculative sampling, lossless in distribution. Results: [EXPERIMENTS.md](EXPERIMENTS.md). **Qwen3-1.7B, the paper's own scale, has not been trained here**; the authors' released Orthrus-Qwen3-1.7B, measured in this harness, reproduces the paper's Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit the token budget. The Q,K,V,O pair at 100k steps is measured — the margin is the same, +0.381 ± 0.033 accepted tokens at one pass; the hybrid diffusion view is training to 100k, and a 2×2 grid on what the training term teaches (`qwen06_orthrus_onpolicy`) is queued on Kaggle.
-
-**Summer School of Machine Learning at Skoltech (SMILES) · Applied AI Center**
-
----
+| Manuscript name | Historical configuration suffix | Training |
+| --- | --- | --- |
+| FlowDraft | `*_flowdraft_multistep` (also `*_flowdraft_multistep_qkv`) | Continuous state, weighted single-pass KL and multistep (MS) loss |
+| FlowDraft w/o MS | `*_flowdraft` | Continuous state, weighted single-pass KL |
+| Orthrus + MS | `*_orthrus_multistep` | Masked drafter trained with MS |
+| Orthrus | `*_orthrus` | Masked single-pass control |
 
 ## Main findings
 
-Measured on 460 prompts from six math and code benchmarks; intervals are 95%, paired by prompt at 0.6B and by seed at 135M.
-
-- **At one pass, the gain comes from the training term, not from the drafting state.** On Qwen3-0.6B at 10k steps the multistep term adds **+0.241 ± 0.027** accepted tokens per cycle with everything else fixed. Given the term, the masked drafter (Orthrus multistep) is at least as good at one pass as the continuous one (FlowDraft multistep): −0.059 ± 0.025 for the continuous state at 0.6B, −0.148 ± 0.047 over three seeds at 135M.
-- **The continuous state is what makes refinement work, and refinement does not pay.** With the term, the continuous state gains +0.78 accepted tokens over the masked one at three passes. No extra pass meets the break-even condition `A(n+1) − A(n) > TPF(n)`: each costs a forward of the model. A refinement pass costing a fraction `c` of a forward would pay at our 80k acceptances only for `c < 0.386`.
-- **Matched pairs, FlowDraft multistep against our Orthrus reproduction.** On Q,K,V at 80k steps: **2.576 vs 2.201** accepted tokens at one pass, +0.360 ± 0.035, ahead on 81% of prompts; tokens per forward 1.788 vs 1.601; wall clock 1.44× vs 1.35× on a T4. On Q,K,V,O at 100k steps: **2.467 vs 2.070**, +0.381 ± 0.033 (87%). The lead holds under speculative sampling, on 512-token generations, on every benchmark and at equal training GPU-hours (interpolated between checkpoints, one seed).
-- **The harness is checked against the released Orthrus-Qwen3-1.7B:** its Table 1 within −6.4% to +2.6% on the four benchmarks whose answers fit a 512-token budget.
-- **Closest work** — Draft-OPD, DEdit, DistillSpec and others — is laid out under [The idea](#the-idea). What is specific here: the label is the verifier's verdict on the draft the refinement pass *reads* (one Jacobi step), and the study separates the objective from the state.
+- **Qwen3-1.7B.** FlowDraft and the in-house Orthrus comparator each completed 25,000 updates on the same 360k-example pool with Q,K,V copies and eight anchors per sequence. With a 64-token cap, one-pass FlowDraft reached 30.22 tokens/s and the trained Orthrus reached 27.47 on one FP32 T4. The final FlowDraft checkpoint has SHA256 `e30b8843e6ecb1956ae342dfaf2d9b24f4093b73a37b49c245f0718d86f336c7`.
+- **Long generation.** At caps of 256, 512 and 1024, one-pass FlowDraft exceeded EAGLE-3 depth 3 by 15.8%, 16.3% and 15.5% in mean per-prompt throughput on 460, 459 and 459 common greedy-AR matches. Released native Orthrus and DFlash2 were faster at all three caps. Every one of the 5,520 FlowDraft outputs matched its greedy AR reference. Each prompt and setting was timed once per cap.
+- **Training with MS.** With the same continuous drafter and optimizer-update count, adding two supervised refinement passes increased three-pass acceptance by **1.138 ± 0.109** tokens per block on SmolLM2-135M and **1.080 ± 0.049** on Qwen3-0.6B. The 95% intervals use three training seeds at 135M and 460 paired prompts from one seed at 0.6B. This comparison measures the combined effect of training on intermediate drafts with verdict-weighted verifier targets.
+- **Cost of refinement.** At the 1024-token cap, increasing FlowDraft from one to four passes raised acceptance from 3.336 to 4.934 tokens per cycle and reduced throughput from 32.307 to 16.460 tokens/s. Final 1.7B measurements use adjacent intervals with one initial noise draw per block. The 135M and 0.6B measurements below use the historical restart schedules.
 
 ## Table of contents
 
@@ -32,7 +28,7 @@ Measured on 460 prompts from six math and code benchmarks; intervals are 95%, pa
 - [Results, second scale point: Qwen3-0.6B](#results-second-scale-point-qwen3-06b-august-2026) — five configurations at a matched budget
 - [Results at the full budget: Qwen3-0.6B to 80,000 steps](#results-at-the-full-budget-qwen3-06b-to-80000-steps-september-2026) — both drafters to the end of their schedule, and the schedule that was costing a pass
 - [Results with the output projection: Q,K,V,O to 100,000 steps](#results-with-the-output-projection-qwen3-06b-qkvo-to-100000-steps-october-2026) — the same pair with W_O in both drafters
-- [Porting to Qwen3-1.7B](#porting-to-qwen3-17b-the-papers-own-scale) — hyperparameters, hardware, memory
+- [Qwen3-1.7B training presets](#qwen3-17b-training-presets) — hyperparameters, hardware, memory
 - [Defects found and fixed](#defects-found-and-fixed)
 - [Overview](#overview)
 - [Quickstart](#quickstart) — setup, sparse attention, training, validation, statistics, curves
@@ -69,9 +65,9 @@ measures it in tokens per forward: its Table 3 puts a two-pass variant at 3.53
 against 6.35 for one pass. **On that metric our measurements agree with the
 paper, for every configuration including our own** — extra decode passes always
 cost more than they return. What a continuous state changes is *acceptance*:
-FlowDraft multistep keeps gaining as passes are added (1.57 → 2.46
-from one pass to four) where Orthrus multistep is flat (1.71 → 1.78) and
-FlowDraft, the continuous state without the term, collapses (1.54 → 0.98).
+FlowDraft keeps gaining as passes are added (1.57 → 2.46
+from one pass to four) where Orthrus + MS is flat (1.71 → 1.78) and
+FlowDraft w/o MS falls from 1.54 to 0.98.
 Separately, the multistep *training* term raises throughput at a single pass — by +0.9% on the continuous
 state and by +1.6% on the masked one, each against a control matched in
 projections, position weights and gate.
@@ -87,11 +83,10 @@ point than at ours. Multi-pass decoding still fails to pay here.
 
 | matched contrast (three refinement passes, 20k steps, Q,K,V,O) | Δ accepted tokens | 95% CI | p |
 |---|---|---|---|
-| multistep term: FlowDraft multistep − FlowDraft | **+1.138** | ± 0.109 | 0.0005 |
-| continuous state: FlowDraft multistep − Orthrus multistep | +0.612 | ± 0.065 | 0.0006 |
+| multistep term: FlowDraft − FlowDraft w/o MS | **+1.138** | ± 0.109 | 0.0005 |
+| continuous state: FlowDraft − Orthrus + MS | +0.612 | ± 0.065 | 0.0006 |
 
-Both contrasts change one factor and nothing else: the three runs train Q,K,V,O
-with the same position weights and gate. Orthrus as the paper describes it trains
+The three runs share Q,K,V,O, positional weights and gate. Adding MS changes the supervision and the work per update. The masked and continuous drafters also use different refinement rules. Orthrus as the paper describes it trains
 Q,K,V without the weights, so it is matched to none of them and no contrast here
 involves it. The masked drafter's own term has a matched control too —
 `smollm_masked_baseline`, Orthrus on Q,K,V,O with the weights and without the
@@ -100,8 +95,8 @@ passes (the six benchmarks weighted equally); [EXPERIMENTS.md](EXPERIMENTS.md) �
 records it.
 
 Going from one refinement pass to four, acceptance grows by **+0.893** for
-FlowDraft multistep and by +0.070 for Orthrus multistep, and **falls by 0.563**
-for FlowDraft, the same continuous drafter trained without the term — on all
+FlowDraft and by +0.070 for Orthrus + MS, and **falls by 0.563**
+for FlowDraft w/o MS, the same continuous drafter trained without the term — on all
 three seeds.
 
 **Training for several passes and decoding with them pull opposite ways.**
@@ -109,33 +104,30 @@ Multistep *training* — the loss term — **raises** throughput. Multi-pass
 *decoding* — spending extra passes at inference — lowers it.
 
 At one pass, which is where every method is fastest, the multistep term is worth
-+0.011 ± 0.007 tokens per forward on the continuous state (+0.9%, FlowDraft
-multistep against FlowDraft) and about **+1.6%** on the masked one (Orthrus
-multistep against its matched control, one seed, so a size and not an interval).
-The best single-pass throughput measured at this scale is Orthrus multistep's
++0.011 ± 0.007 tokens per forward on the continuous state (+0.9%, FlowDraft against FlowDraft w/o MS) and about **+1.6%** on the masked one (Orthrus + MS against its matched control, one seed, so a size and not an interval).
+The best single-pass throughput measured at this scale is Orthrus + MS's
 **1.326 tokens per forward**.
 
 Extra decode passes are what costs: a cycle of `n` passes spends `n+1` forwards
 while acceptance grows slower than `n`, so by three passes every configuration
-is below plain decoding (at two passes, measured on seed 42 only, FlowDraft
-multistep is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
+is below plain decoding (at two passes, measured on seed 42 only, FlowDraft is level with it at 1.008). The prefix-fixing lemma of Jacobi decoding (Santilli
 et al., 2023) says why refinement alone is no speedup mechanism: a pass that
-realised the Jacobi sweep exactly would guarantee only `TPF = 1`, the speed of
-plain decoding. FlowDraft multistep loses the least
-(1.257 → 0.675, against 1.326 → 0.550 for Orthrus multistep), and even so its large
+realised the Jacobi sweep exactly gives a steady-state lower bound of one token per forward for up to K−1 passes. Wall-clock speed also depends on the cost of each call. FlowDraft loses the least
+(1.257 → 0.675, against 1.326 → 0.550 for Orthrus + MS), and even so its large
 acceptance advantage does not convert into speed.
 
 **Wall-clock is a separate question and is not settled here.** On this bench —
-MPS, a 135M backbone — a single pass runs at 1.088× plain decoding for FlowDraft
-multistep against 1.049× for FlowDraft, averaged over three seeds, but the gap is
+MPS, a 135M backbone — a single pass runs at 1.088× plain decoding for FlowDraft against 1.049× for FlowDraft w/o MS, averaged over three seeds, but the gap is
 +0.005 on one seed and +0.070 on another (+0.039 ± 0.081): the throughput gain
 cannot be resolved in seconds, because at 135M a forward is dominated by fixed
 overhead rather than by arithmetic. Tokens per forward is the hardware-independent number; the T4
 measurements at 0.6B below turn it into seconds.
 
-**A reversal worth noting.** At a single pass masking *wins* (−0.148 ± 0.047, FlowDraft multistep − Orthrus multistep).
+**A reversal worth noting.** At a single pass masking *wins* (−0.148 ± 0.047, FlowDraft − Orthrus + MS).
 The advantage of a continuous state appears only with refinement and grows with
 it: −0.148 → +0.612 → +0.675 at one, three and four passes.
+
+Archived figures below retain the original run labels. In their legends, “FlowDraft multistep” is FlowDraft and “FlowDraft” alone is the ablation without MS.
 
 ![acceptance and throughput vs refinement passes](results/figures/multistep.png)
 ![paired contrasts with the seed as the unit](results/figures/contrasts.png)
@@ -148,7 +140,7 @@ three seeds, are in [step 6 of the Quickstart](#6-training-curves-and-figures):
 colour is the experiment, line style is the seed, so how tightly the three
 styles of one colour overlap *is* the between-seed spread.
 
-Refinement by FlowDraft, which is not trained for it, is not merely worse but *unpredictably* worse:
+The four-pass outcome for FlowDraft w/o MS varies across training seeds:
 at four passes the three seeds give 1.227 / 0.933 / 0.778 (σ = 0.228), while
 every other run's between-seed σ stays within 0.05.
 
@@ -175,21 +167,21 @@ state and the multistep term** (`qwen06_orthrus_multistep`, `qwen06_flowdraft`,
 | Q,K,V,O | 1 pass | 2 | 3 | 4 passes | growth 1 → 4 |
 |---|---|---|---|---|---|
 | *accepted tokens per cycle* | | | | | |
-| Orthrus multistep | 2.007 | 2.023 | 2.045 | 2.081 | +0.071 ± 0.013 |
-| FlowDraft | 1.705 | 1.724 | 1.749 | 1.749 | +0.035 ± 0.015 |
-| FlowDraft multistep | 1.952 | 2.501 | 2.882 | 2.997 | +0.995 ± 0.048 |
+| Orthrus + MS | 2.007 | 2.023 | 2.045 | 2.081 | +0.071 ± 0.013 |
+| FlowDraft w/o MS | 1.705 | 1.724 | 1.749 | 1.749 | +0.035 ± 0.015 |
+| FlowDraft | 1.952 | 2.501 | 2.882 | 2.997 | +0.995 ± 0.048 |
 | *tokens per forward* | | | | | |
-| Orthrus multistep | 1.504 | 1.008 | 0.761 | 0.616 | |
-| FlowDraft | 1.353 | 0.908 | 0.687 | 0.550 | |
-| FlowDraft multistep | 1.476 | 1.167 | 0.971 | 0.799 | |
+| Orthrus + MS | 1.504 | 1.008 | 0.761 | 0.616 | |
+| FlowDraft w/o MS | 1.353 | 0.908 | 0.687 | 0.550 | |
+| FlowDraft | 1.476 | 1.167 | 0.971 | 0.799 | |
 
 | matched contrast, Q,K,V,O, paired by prompt | 1 pass | 4 passes |
 |---|---|---|
-| multistep term: FlowDraft multistep − FlowDraft | **+0.241** ± 0.027 | **+1.200** ± 0.054 |
-| continuous state: FlowDraft multistep − Orthrus multistep | −0.059 ± 0.025 | +0.865 ± 0.050 |
+| multistep term: FlowDraft − FlowDraft w/o MS | **+0.241** ± 0.027 | **+1.200** ± 0.054 |
+| continuous state: FlowDraft − Orthrus + MS | −0.059 ± 0.025 | +0.865 ± 0.050 |
 
 **The signature reproduces at 0.6B.** Extra refinement passes keep paying only
-for FlowDraft multistep. With the term the masked state still barely grows with
+for FlowDraft. With the term the masked state still barely grows with
 passes (+0.071), so for growth with passes the term is not what pays — the state
 that carries it is. At one pass it is the other way round: the term adds +0.241
 on the continuous state, and given the term the continuous state adds nothing.
@@ -201,18 +193,18 @@ published baseline** (`qwen06_orthrus`, `qwen06_flowdraft_multistep_qkv`).
 |---|---|---|---|---|---|
 | *accepted tokens per cycle* | | | | | |
 | Orthrus | 1.837 | 1.850 | 1.883 | 1.900 | +0.062 ± 0.010 |
-| **FlowDraft multistep** | **2.088** | **2.772** | **3.288** | **3.557** | **+1.414 ± 0.053** |
+| **FlowDraft** | **2.088** | **2.772** | **3.288** | **3.557** | **+1.414 ± 0.053** |
 | paired margin | +0.243 ± 0.025 | +0.897 ± 0.039 | +1.356 ± 0.051 | +1.595 ± 0.059 | |
 | *tokens per forward* | | | | | |
 | Orthrus | 1.419 | 0.950 | 0.721 | 0.580 | |
-| **FlowDraft multistep** | **1.544** | **1.257** | **1.072** | **0.911** | |
+| **FlowDraft** | **1.544** | **1.257** | **1.072** | **0.911** | |
 
 This is the pair the next section carries to 80,000 steps. One pass is the
 operating point for both; beyond it the extra forwards cost more than the
 acceptance they buy, and by four passes both are below plain autoregressive
 decoding.
 
-**The output projection was costing us.** Training FlowDraft multistep on Q,K,V
+**The output projection was costing us.** Training FlowDraft on Q,K,V
 alone instead of Q,K,V,O, with nothing else changed, makes it **better**, not
 worse: +0.140 ± 0.027 accepted tokens at one pass and +0.559 ± 0.047 at four.
 
@@ -222,28 +214,26 @@ continuous state is +1.080 ± 0.049 here, against +1.138 ± 0.109 over three see
 at 135M — the same within its intervals: it does not shrink, and it does not
 grow either.
 
-The earlier reversal on this backbone — an untrained-looking continuous branch
-on a laptop run — was undertraining, not a property of the method: that run saw
-0.058 tokens per trainable parameter, 6.5× less than the 135M bench.
+An earlier run on this backbone had a smaller training budget of 0.058 tokens per trainable parameter, 6.5× below the 135M study.
 
 **Extra passes still do not pay in throughput, for any configuration.** Tokens
-per forward falls from 1.544 to 0.911 for FlowDraft multistep (Q,K,V), below
+per forward falls from 1.544 to 0.911 for FlowDraft (Q,K,V), below
 plain decoding by four passes.
 The break-even condition `A(n+1) − A(n) > TPF(n)` fails at every transition. One
-pass remains the operating point, and there FlowDraft multistep (Q,K,V) is
+pass remains the operating point, and there FlowDraft (Q,K,V) is
 **1.544 against Orthrus's 1.419**, +8.8%.
 
 **Limits, stated up front.** One seed, so the between-run intervals use the
 prompt as the unit of observation and do not carry between-seed spread; the
 growth contrasts are within-model and paired, which is what they are for. The
-Q,K,V run of FlowDraft multistep still differs from Orthrus in the position
+Q,K,V run of FlowDraft still differs from Orthrus in the position
 weights and the gate (`teacher_chain_tail_weight`) even though the projections
 now match. And nothing has converged —
 validation loss is still falling for all of them at 10k, so this is a matched
 budget rather than a settled state. Whether O would catch up given more steps is
 answered for this backbone by the Q,K,V,O pair at 100,000 steps
 [below](#results-with-the-output-projection-qwen3-06b-qkvo-to-100000-steps-october-2026): it does
-not — with O, FlowDraft multistep stays 0.119 ± 0.033 below its Q,K,V run at
+not — with O, FlowDraft stays 0.119 ± 0.033 below its Q,K,V run at
 80,000 steps at one pass.
 
 ![Qwen3-0.6B at 10k: acceptance and throughput vs refinement passes, one row per matched set](results/figures/qwen06_passes.png)
@@ -259,8 +249,8 @@ carry.
 
 The last two figures are the caution. In-training teacher-forced agreement
 ranks the runs of each set differently from held-out decoding: in the Q,K,V
-pair it puts Orthrus ahead at every step while decoding puts FlowDraft multistep
-far ahead, and in the Q,K,V,O set it puts Orthrus multistep last at 10k while
+pair it puts Orthrus ahead at every step while decoding puts FlowDraft
+far ahead, and in the Q,K,V,O set it puts Orthrus + MS last at 10k while
 decoding puts it first at one pass. This is the same proxy failure the 135M study
 documents, now visible on a second backbone. In-training
 acceptance is read from eight held-out sequences and is quantised to 1/8, so it
@@ -268,7 +258,7 @@ shows a trajectory and nothing finer; the decode measurement beside it rests on
 460 prompts.
 
 The budget caveat this section ends on is lifted in the next one: Orthrus and
-FlowDraft multistep on Q,K,V were both carried to 80,000 steps and measured
+FlowDraft on Q,K,V were both carried to 80,000 steps and measured
 again, with a decode schedule that stays inside the range the refinement term was
 trained on.
 
@@ -276,10 +266,10 @@ trained on.
 
 **What this section adds.** The 10k section above is a matched-budget snapshot of
 five configurations; it ends by saying nothing has converged. This one takes the
-two configurations that matter — Orthrus and FlowDraft multistep, on the same
+two configurations that matter — Orthrus and FlowDraft, on the same
 three projections — to **80,000 optimizer steps each**, and measures
 them the same way. Orthrus spent 74.9 hours of training across nine sessions,
-FlowDraft multistep 110.5 across twelve; the step counts are identical, which is what the
+FlowDraft 110.5 across twelve; the step counts are identical, which is what the
 comparison rests on. Two things are new besides the budget: a **decode schedule
 that stays inside the range the refinement term was trained on**, and the first
 wall-clock numbers from a real GPU rather than a laptop.
@@ -290,7 +280,7 @@ bitwise-identical to greedy AR.
 | accepted tokens per cycle | 1 pass | 2 | 3 | 4 passes | growth |
 |---|---|---|---|---|---|
 | Orthrus (Q,K,V) | 2.201 | 2.215 | 2.258 | 2.312 | +0.096 ± 0.017 |
-| **FlowDraft multistep (Q,K,V)** | **2.576** | **3.265** | **3.740** | **4.189** | **+1.559 ± 0.066** |
+| **FlowDraft (Q,K,V)** | **2.576** | **3.265** | **3.740** | **4.189** | **+1.559 ± 0.066** |
 
 Paired by prompt, the margin is **+0.360 ± 0.035** at one pass (ahead on 81% of
 prompts), **+0.998 ± 0.047** at two (99%), **+1.423 ± 0.059** at three (459 of
@@ -324,12 +314,12 @@ than a repeated projection under another name.
 | tokens per forward | 1 pass | 2 | 3 | 4 passes |
 |---|---|---|---|---|
 | Orthrus (Q,K,V) | 1.601 | 1.072 | 0.814 | 0.662 |
-| **FlowDraft multistep (Q,K,V)** | **1.788** | **1.422** | **1.185** | **1.038** |
+| **FlowDraft (Q,K,V)** | **1.788** | **1.422** | **1.185** | **1.038** |
 
 The break-even condition `A(n+1) − A(n) > TPF(n)` still fails at every transition
 for both drafters, so **one pass remains the operating point** and the paper's
 conclusion about single-step projection stands. What changes is the penalty:
-FlowDraft multistep stays above plain decoding in tokens per forward at every
+FlowDraft stays above plain decoding in tokens per forward at every
 schedule, where Orthrus drops below it from three passes on.
 
 **Wall-clock, measured on a T4 rather than a laptop.** The 135M section reports
@@ -339,10 +329,9 @@ forward is dominated by fixed overhead. On a real GPU it does:
 | wall-clock speedup over plain decoding | 1 pass | 2 | 3 | 4 passes |
 |---|---|---|---|---|
 | Orthrus (Q,K,V) | 1.347 | 0.906 | 0.693 | 0.564 |
-| **FlowDraft multistep (Q,K,V)** | **1.440** | **1.130** | **0.929** | **0.805** |
+| **FlowDraft (Q,K,V)** | **1.440** | **1.130** | **0.929** | **0.805** |
 
-Both drafters are faster than autoregressive decoding at one pass; only FlowDraft
-multistep is still faster at two. These numbers are a T4 at `float32` with the dense
+Both drafters are faster than autoregressive decoding at one pass; only FlowDraft is still faster at two. These numbers are a T4 at `float32` with the dense
 attention path, batch one — the regime in which decoding is bound by reading the
 weights, not by arithmetic.
 
@@ -364,7 +353,7 @@ understate the method is not known.
 
 The released Orthrus weights also train the output projection O, which the
 paper's text does not mention. So the pair of the section above — Orthrus against
-FlowDraft multistep — was trained again with **Q,K,V,O in both drafters**, for
+FlowDraft — was trained again with **Q,K,V,O in both drafters**, for
 100,000 steps on the same data and schedule (`qwen06_orthrus_qkvo` and
 `qwen06_flowdraft_multistep`, 97.4 and 140.0 T4 GPU-hours; measurements in
 `results/qwen06-100k-qkvo{,-orthrus}.jsonl`). Every one of the 4,600
@@ -374,14 +363,14 @@ generations is bitwise identical to greedy AR.
 |---|---|---|---|---|---|
 | *accepted tokens per cycle* | | | | | |
 | Orthrus | 2.070 | 2.079 | 2.108 | 2.115 | +0.044 ± 0.011 |
-| **FlowDraft multistep** | **2.467** | **3.000** | **3.400** | **3.667** | **+1.145 ± 0.060** |
+| **FlowDraft** | **2.467** | **3.000** | **3.400** | **3.667** | **+1.145 ± 0.060** |
 | paired margin | +0.381 ± 0.033 | +0.890 ± 0.045 | +1.215 ± 0.056 | +1.483 ± 0.067 | |
 | *tokens per forward* | | | | | |
 | Orthrus | 1.535 | 1.026 | 0.777 | 0.623 | |
-| **FlowDraft multistep** | **1.734** | **1.333** | **1.100** | **0.933** | |
+| **FlowDraft** | **1.734** | **1.333** | **1.100** | **0.933** | |
 | *wall-clock speedup, T4* | | | | | |
 | Orthrus | 1.297× | 0.868× | 0.656× | 0.526× | |
-| **FlowDraft multistep** | **1.385×** | **1.043×** | **0.856×** | **0.719×** | |
+| **FlowDraft** | **1.385×** | **1.043×** | **0.856×** | **0.719×** | |
 
 The margin is the same as on Q,K,V: **+0.381 ± 0.033** accepted tokens at one
 pass, ahead on 87% of prompts and on every benchmark (+0.33 to +0.51). Four
@@ -389,17 +378,16 @@ passes use the schedule `0 · 0.5 · 0.7 · 0.85`, inside the trained range.
 
 O helps neither drafter at this scale and budget. Paired by prompt against the
 same configuration on Q,K,V at 80,000 steps, it costs Orthrus 0.140 ± 0.031 and
-FlowDraft multistep 0.119 ± 0.033 accepted tokens at one pass, although the
+FlowDraft 0.119 ± 0.033 accepted tokens at one pass, although the
 Q,K,V,O runs trained 20,000 steps longer. The comparison of the two drafters
 does not depend on which set of projections is trained.
 
 ![Qwen3-0.6B, Q,K,V,O at 100k: acceptance, throughput and wall-clock against refinement passes](results/figures/qwen06_100k_passes.png)
 ![Qwen3-0.6B, Q,K,V,O at 100k: both drafters per benchmark, and the paired margin, at three refinement passes](results/figures/qwen06_100k_per_benchmark.png)
 
-## Porting to Qwen3-1.7B, the paper's own scale
+## Qwen3-1.7B training presets
 
-The baseline and the method have Qwen presets reproducing the
-paper's Table 4 hyperparameters exactly (2048 tokens, 256 anchor blocks, block
+The final 25k runs used 256-token sequences, eight anchors, effective batch 16, peak learning rate 3e-4, 5% warmup and cosine decay. The following examples illustrate the separate full-size Orthrus reference preset from its Table 4 (2048 tokens, 256 anchor blocks, block
 size 32, two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup,
 gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 
@@ -408,21 +396,19 @@ gradient clipping 1.0, global batch 128, 1:1:1 chat/math/code).
 # (the released weights also train W_O; on Qwen3-0.6B that is qwen06_orthrus_qkvo)
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_orthrus
 
-# FlowDraft multistep: the continuous state trained with the multistep term — the main result
+# FlowDraft: the continuous state trained with the multistep term — the main result
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep
 ```
 
 Measure a checkpoint. `model.backbone.dtype=float32` is required for the
 losslessness assertion — under bf16 the verifier's arithmetic breaks bitwise
-agreement on near-ties. `decode.jumps` takes restart pairs; an integer expands
-to passes at `t<1` that nothing in the objective trains when the consistency
-terms are off.
+agreement on near-ties. The example below selects the three-pass adjacent grid of the measured 1.7B protocol. An explicit list of levels carries one state between calls. A list of terminal pairs selects the historical restart protocol.
 
 ```bash
 ./hf-auth.sh uv run python src/eval.py \
     checkpoint=checkpoints/qwen_flowdraft_multistep/last.ckpt \
     data=math500 decode.block_size=32 decode.n_prompts=100 \
-    "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+    "decode.jumps=[0,0.5,0.75,1]" \
     model.backbone.dtype=float32 \
     per_prompt_file=results/qwen-per-prompt.jsonl
 
@@ -453,8 +439,7 @@ is enough, and it should be measured rather than argued: run 20 steps with
 `trainer.accumulate_grad_batches=1` and read the peak.
 
 **One knob does not transfer.** `acceptance_profile` states the acceptance
-regime the position weights aim at. It is 0.8 on both bench scales and 0.93 in
-the Qwen3-1.7B presets, interpolated from the paper's own numbers (TPF 6.35 at acceptance
+regime the position weights aim at. The final 1.7B FlowDraft and the smaller-model studies use 0.8. The full-size reference preset uses 0.93, interpolated from the paper's own numbers (TPF 6.35 at acceptance
 length 11.7 solves to a = 0.929). Getting it wrong is not free: at 0.93
 positions 8–31 carry ~48% of the gradient mass, at 0.6 about 3%. Every run logs
 per-position acceptance, so derive it from the data and retrain if it moved.
@@ -600,7 +585,7 @@ alone stream the whole dataset with batch 2 for 20,000 steps.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus \
     output_dir=checkpoints/qwen06_orthrus
 
-# FlowDraft multistep: the continuous state trained with the multistep term, adapting Q, K, V and O.
+# FlowDraft: the continuous state trained with the multistep term, adapting Q, K, V and O.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_flowdraft_multistep \
     output_dir=checkpoints/qwen06_flowdraft_multistep
 
@@ -611,8 +596,8 @@ alone stream the whole dataset with batch 2 for 20,000 steps.
     output_dir=checkpoints/qwen06_flowdraft_multistep_qkv
 
 # Orthrus as RELEASED: the authors' weights train W_O too, so this adds it.
-# Paired with qwen06_flowdraft_multistep above (also Q, K, V, O); the running
-# pair uses the settings above with trainer.max_steps=100000.
+# Paired with qwen06_flowdraft_multistep above (also Q, K, V, O); the historical 100k
+# pair used the settings above with trainer.max_steps=100000.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen06_orthrus_qkvo \
     output_dir=checkpoints/qwen06_orthrus_qkvo
 
@@ -626,7 +611,7 @@ alone stream the whole dataset with batch 2 for 20,000 steps.
 
 #### Qwen3-1.7B — the baseline and the method
 
-At the paper's hyperparameters: 2048 tokens, 256 anchor blocks, block size 32,
+The following are the published Orthrus reference settings. The measured 25k adapters use the overrides in [Main findings](#main-findings) and [Qwen3-1.7B training presets](#qwen3-17b-training-presets). Reference settings: 2048 tokens, 256 anchor blocks, block size 32,
 two epochs over 600k examples, peak LR 2e-4 cosine with 5% warmup, gradient
 clipping 1.0, global batch 128.
 
@@ -637,7 +622,7 @@ clipping 1.0, global batch 128.
     output_dir=checkpoints/qwen_orthrus \
     model.adapter.flex_attention_backend=flash
 
-# THE MAIN RESULT. FlowDraft multistep, the continuous state trained with the multistep term:
+# FlowDraft reference-preset example, the continuous state trained with the multistep term:
 # the drafter proposes, one frozen forward over that proposal supplies both
 # the target and the greedy verdict.
 ./hf-auth.sh uv run python src/train.py +experiment=qwen_flowdraft_multistep \
@@ -705,7 +690,7 @@ for ds in gsm8k:100 math500:100 humaneval:100 mbpp:100 aime24:30 aime25:30; do
   ./hf-auth.sh uv run python src/eval.py \
       checkpoint=$CKPT data=${ds%%:*} decode.n_prompts=${ds##*:} \
       decode.block_size=32 decode.max_new_tokens=64 \
-      "decode.jumps=[[0,1],[0.5,1],[0.75,1]]" \
+      "decode.jumps=[0,0.5,0.75,1]" \
       model.backbone.dtype=float32 \
       results_file=results/aggregate.jsonl \
       per_prompt_file=results/pp-qwen.jsonl
@@ -713,10 +698,7 @@ done
 ```
 
 AIME 24 and 25 hold 30 tasks each — that is the whole set, not a subsample.
-`decode.jumps` takes restart pairs; an integer expands to passes at `t < 1`, which
-nothing in the objective trains once the consistency terms are off. Sweep the
-schedule by repeating the loop with `decode.jumps=1`, `[[0,1],[0.5,1]]` and the
-four-pass form.
+The four final 1.7B grids were `[0,1]`, `[0,0.5,1]`, `[0,0.5,0.75,1]` and `[0,0.5,0.7,0.85,1]`. A grid carries the current state across adjacent intervals. Historical smaller-model comparisons used explicit terminal pairs such as `[[0,1],[0.5,1],[0.75,1]]`, with a fresh noise mixture between calls. The training loss supervises endpoints at destination time 1.
 
 ### 5. Metrics and statistics
 
@@ -780,7 +762,7 @@ commands that launch them are in
 | experiment | SmolLM2-135M | Qwen3-0.6B | Qwen3-1.7B |
 |---|---|---|---|
 | Orthrus | `smollm_orthrus` | `qwen06_orthrus` | `qwen_orthrus` |
-| FlowDraft multistep | `smollm_flowdraft_multistep` | `qwen06_flowdraft_multistep` | `qwen_flowdraft_multistep` |
+| FlowDraft | `smollm_flowdraft_multistep` | `qwen06_flowdraft_multistep` | `qwen_flowdraft_multistep` |
 | the same on Q,K,V alone | — | `qwen06_flowdraft_multistep_qkv` | — |
 | Orthrus as released, Q,K,V,O | — | `qwen06_orthrus_qkvo` | — |
 | hybrid diffusion view (Orthrus / the method) | — | `qwen06_orthrus_qkvo_linear` / `qwen06_flowdraft_multistep_linear` | — |
@@ -788,11 +770,11 @@ commands that launch them are in
 
 `smollm_base`, `qwen06_base`, `qwen_base` and `qwen06_linear_base` are the shared
 bases these inherit, not experiments. Presets that were measured and rejected —
-Orthrus multistep, FlowDraft (the continuous state without
+Orthrus + MS, FlowDraft w/o MS (the continuous state without
 the term), the trajectory-structure objective, the input gate, the Q/K/O projection
 set, the weight-profile controls and the idempotence term — are kept in
 `bucket/`, outside the source tree; their numbers are in
-[EXPERIMENTS.md](EXPERIMENTS.md) §8. Orthrus multistep is back as one cell of the 2×2 grid, in its own module
+[EXPERIMENTS.md](EXPERIMENTS.md) §8. Orthrus + MS is back as one cell of the 2×2 grid, in its own module
 (`src/models/orthrus_onpolicy.py`).
 
 ## Background: the decoding bottleneck
@@ -806,7 +788,7 @@ set, the weight-profile controls and the idempotence term — are kept in
 FlowDraft is built inside **Orthrus**, a lossless parallel-decoding scaffold:
 
 - One transformer, two attention paths: a **frozen AR path** and a **lightweight, trainable diffusion path** (~16% of parameters), sharing the same norm / MLP / embeddings and a single KV cache.
-- The diffusion path proposes *K* tokens in parallel; the frozen AR head verifies them in one pass → output **provably identical** to the base model. Accepted tokens are committed to the shared KV cache, and the loop continues with the next block.
+- The diffusion path proposes up to *K−1* fresh tokens after a clean anchor in parallel; the frozen AR head verifies them in one pass → output **provably identical** to the base model. Accepted tokens are committed to the shared KV cache, and the loop continues with the next block.
 - Reported by Orthrus: up to **7.8×** faster, training only **~16%** of parameters on **<1B** tokens.
 
 > *These figures describe the Orthrus host framework (prior work), not FlowDraft's own results.*
@@ -825,15 +807,16 @@ categorical flow-map drafter with consistency losses — is kept in
 `bucket/README_superseded_sections.md`.*
 
 - **What the drafter is trained on.** Orthrus distils its drafter on the training text: at every position the target is the frozen model's next-token distribution given the *true* preceding tokens. The drafter never sees a block it drafted, and nothing tells it how the verifier would judge one.
-- **The multistep term.** Run the drafter's own refinement passes and supervise each pass with the verifier's response to the draft it reads, `p_AR(· | ctx, a, d_<j)` — one parallel Jacobi sweep of the greedy chain, computed on the drafts the decoder actually produces. The verification forward computes this target anyway.
+- **The multistep term.** Run the drafter's own refinement passes and supervise each pass with the verifier's response to the draft it reads, `p_AR(· | ctx, a, d_<j)` — one parallel Jacobi sweep of the greedy chain, computed on the drafts the decoder actually produces. Each supervised refinement round adds one frozen verification forward per nonempty microbatch.
 - **Two drafting states.** *Masked:* the most confident positions are committed and the rest re-masked, as in Orthrus's multi-pass decoding. *Continuous:* a point on the vocabulary simplex that mixes fresh noise with the previous draft at a level `s ≥ 0.5`, so every position can still change.
-- **Why noise cannot help a single pass.** With a deterministic verifier the Bayes-optimal one-pass drafter ignores its noise input, so a refinement pass can gain only from the drafter's own previous draft. Flow-map consistency losses train on interpolants toward the training text, which contain the answer and never the draft — that is why they were dropped.
+- **Single-pass objective.** With an independent prior and separable forward KL, a population-optimal first-pass prediction is the conditional mean teacher distribution (a weighted mean with the training weights). The next refinement pass receives a previous proposal, and its verifier targets depend on that proposal.
 - **When a pass pays.** Only if it adds more accepted tokens than the current tokens per forward; if a refinement pass costs a fraction `c` of a forward, the second pass pays at our 80k acceptances for `c < 0.386`. Inside Orthrus `c = 1`.
 
 ### Closest work
 
 | work | what it shares with the multistep term | what differs |
 |---|---|---|
+| [FlashMap](https://arxiv.org/abs/2610.24365) (October 2026) | continuous block proposals with AR verification | distils a continuous flow into a map that can make a long jump in one pass |
 | DistillSpec (ICLR 2024), Online Speculative Decoding (ICML 2024) | the target model's distributions on the drafter's own tokens as labels | autoregressive drafters, no refinement |
 | Draft-OPD (EMNLP 2026, arXiv 2605.29343) | the same label for a block drafter's own block | a single pass: it labels the pass's own output, not the draft the next pass reads |
 | DEdit (arXiv 2609.38510, Sept 2026; concurrent) | a second pass that reads the drafter's own detached proposal | labels are fixed target-generated text, with ground truth mixed into the proposal; passes run through a small separate drafter, so they are cheap |
@@ -851,7 +834,7 @@ One frozen backbone, two attention paths (the Orthrus host), and a drafter train
   - **self-correction KL** — the drafter walks its own refinement chain, and each pass is trained on the frozen verifier's answer to the draft of the pass before it. This is the multistep term.
   - The three consistency terms of *Categorical Flow Maps* — endpoint on the diagonal, EC and TD — carried zero weight in every shipped preset — the one ablation that switched them on cost −0.114 accepted tokens — and were removed; they and the reasons are in `bucket/cfm_terms`.
 - **Training geometries** (`train.variant`): `flowdraft_block_wise` trains FlowDraft in the exact inference geometry, and `orthrus` uses Orthrus' single-step, dual-pass block-causal masked-diffusion geometry with no time conditioning. Both blockwise implementations can flatten several isolated width-K blocks into one drafter pass via `anchors_per_sequence`, sharing one full AR teacher/cache pass. `orthrus_linear` and `flowdraft_block_wise_linear` (`src/models/linear_orthrus.py`) add a hybrid diffusion view: planned components replaced by linear maps distilled from the frozen ones ([EXPERIMENTS.md](EXPERIMENTS.md) §7.2).
-- **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled (`coupled=false`): Leviathan speculative sampling, lossless **in distribution**.
+- **Decoding** (`FlowDraft.generate`): a width-K block contains one clean pending anchor plus K-1 fresh drafts produced in 1–few jumps, then ONE AR forward verifies the block. The previous cycle's correction/bonus token is never committed by its own pass: it rides as the clean in-block anchor and the next verify forward commits its K/V while scoring the drafts — **cycle cost = `jumps + 1` forwards** (TPF parity with the Orthrus convention). `temperature=0`: greedy verification, output **bit-identical** to `ar_generate`. `temperature>0` with Gumbel-coupled sampling (default): position-keyed Gumbel noise turns sampling into a deterministic argmax — the output is **bit-identical** to sampled `ar_generate` with the same seed. Uncoupled sampling (`coupled=false`) uses acceptance ratios and residual resampling. The ideal rule preserves the target distribution. The temperature-1 measurements report acceptance.
 
 ## Repository structure
 
@@ -1022,7 +1005,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `wandb.offline` | false | record locally for a later `wandb sync` instead of uploading live |
 | `train.variant` | `flowdraft` | which drafter to train: `flowdraft_block_wise` \| `orthrus` \| `flowdraft_block_wise_linear` \| `orthrus_linear`; the default `flowdraft` (full-sequence) has no loss and refuses to train |
 | `train.block_size` | 64 | total block width K: one clean anchor + K-1 drafted positions; every preset sets 32 |
-| `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; the Qwen3-1.7B presets use 256 |
+| `train.anchors_per_sequence` | 1 | number of isolated anchor+K blocks trained per packed sequence; the full-size reference preset uses 256, the final 1.7B runs used 8 |
 | `train.min_prefix` | 1 | shortest clean prefix before the training block |
 | `train.respect_document_boundaries` | true | full-sequence FlowDraft isolates DF attention/losses by document; block-wise variants prevent drafted windows from crossing document boundaries |
 | `train.lr` / `weight_decay` / `betas` | 1e-4 / 0.01 / [0.9, 0.95] | AdamW over the DF head only; `lr` is the PEAK of the schedule |
@@ -1032,7 +1015,7 @@ command line (`train.lr=3e-4`), config groups are swapped whole
 | `train.selfcorrect_rounds` / `selfcorrect_s_min` | 2 / 0.0 | refinement rounds of the multistep term and the lowest entry level; every multistep preset sets 0.5, and decoding must enter inside [s_min, 1) |
 | `train.selfcorrect_tail_weight` | 0.5 | chain weight on positions other than the first one the verifier rejects (that one gets 1) |
 | `train.teacher_chain_tail_weight` | 1.0 | single-pass weight after the training text leaves the frozen model's greedy chain; the bench presets set 0.3, Orthrus keeps 1.0 |
-| `train.acceptance_profile` | null | per-position acceptance the position weights `∂E[A]/∂a_j` are evaluated at; 0.8 on both bench scales, 0.93 in the Qwen3-1.7B presets, null (no weights) for Orthrus |
+| `train.acceptance_profile` | null | per-position acceptance the position weights `∂E[A]/∂a_j` are evaluated at; 0.8 on both bench scales, 0.8 in the final 1.7B FlowDraft run, 0.93 in the full-size reference preset, null (no weights) for Orthrus |
 | `train.verify_kl_weight` | 0.0 | direct block-wise `KL(p_AR ‖ π_{0,1})` on the exact one-jump inference pair |
 | `train.checkpoint_name` | `flowdraft-{step:07d}` | checkpoint filename pattern — set your own per experiment (quote on CLI: `'train.checkpoint_name="my-run-{step:07d}"'`) |
 | `train.checkpoint_every_n_steps` | 1000 | unconditional recovery snapshot interval in optimizer steps; all periodic snapshots are retained |
@@ -1108,15 +1091,12 @@ tokens that match what the base model would have said are kept, and the base
 model adds one token of its own (the fix for the first wrong guess — or a
 bonus token if everything matched). Then the next cycle starts. The knobs:
 
-- `--block-size` (K) — how many tokens the drafter guesses per cycle. Bigger
+- `--block-size` (K) — total positions per block, including the anchor. There are up to K−1 new proposals per cycle. Bigger
   blocks promise more speedup, but the tail of a long guess relies on the
   guessed (unverified) beginning, so it gets rejected more often. The presets
-  train and measure at 32.
-  Despite the similar name this has nothing to do with the `flowdraft_block_wise`
-  training variant — every drafter proposes blocks at inference.
+  train and measure at 32, giving up to 31 proposed tokens after each anchor.
 - `--jumps` — how many passes the drafter spends polishing its guess before
-  showing it to the base model. Each extra pass makes the guess better but
-  costs one forward: a cycle costs `jumps + 1` passes total. More jumps only
+  showing it to the base model. Each extra pass updates the proposal and costs one forward: a cycle costs `jumps + 1` passes total. More jumps only
   pay off if the extra accepted tokens outweigh the extra passes.
 - `--max-new-tokens` — response length cap.
 - `--temperature` — 0: always take the most likely token; the output is
@@ -1135,8 +1115,7 @@ bonus token if everything matched). Then the next cycle starts. The knobs:
   still exact, it just accepts almost nothing (slow).
 - `--model` — the backbone: a config name (`qwen2_0.5b`) or an HF id.
 
-None of these affect *what* is generated beyond the guarantees above — only
-how fast. The verifier has the final word on every token.
+With a fixed target decoding policy, the verifier decides which proposed tokens are committed. Temperature, top-k and top-p change the sampling policy itself.
 
 ## Evaluation
 
@@ -1158,12 +1137,12 @@ without metadata, together with explicit matching `model=... variant=...`.
 ```bash
 ./hf-auth.sh uv run python src/eval.py checkpoint=path.ckpt   # model and variant are restored from the checkpoint
 # block-size / jump-count grid (hydra multirun); integer jumps above 1 run passes
-# at t<1 that the multistep term does not train — use the pair form of step 4
+# on a uniform grid. For the reported 1.7B grids use the explicit levels in step 4.
 ./hf-auth.sh uv run python src/eval.py -m decode.block_size=4,8,16 decode.jumps=1,2,4
 ```
 
 Main metrics (mean ± std over `n_prompts`): **acceptance** per cycle and
-**TPF** (tokens per forward; cycle = `jumps+1`). Wall-clock tokens/s and
+**TPF** (returned tokens per total transformer call, including prefill). The steady-state proxy for the full-depth drafter is `(A+1)/(n+1)` for mean acceptance A and n draft passes per cycle. Wall-clock tokens/s and
 speedup vs AR are reported as diagnostics (hardware/kernel dependent). The
 attention kernel is a config switch (`model.backbone.attn_implementation`):
 `eager` (canonical evaluation default) | `sdpa` (fused throughput audit) |
@@ -1210,9 +1189,9 @@ Every row was asserted **bitwise identical** to greedy autoregressive decoding.
 
 | SmolLM2-135M, Q,K,V,O | Accepted tokens, three passes ↑ | TPF at 1 pass | Lossless |
 | --- | --- | --- | --- |
-| Orthrus multistep | 1.760 | **1.326** | ✅ |
-| FlowDraft | 1.234 | 1.245 | ✅ |
-| **FlowDraft multistep** | **2.373** | 1.257 | ✅ |
+| Orthrus + MS | 1.760 | **1.326** | ✅ |
+| FlowDraft w/o MS | 1.234 | 1.245 | ✅ |
+| **FlowDraft** | **2.373** | 1.257 | ✅ |
 
 Orthrus as the paper describes it (Q,K,V, no position weights) accepts 1.537 at
 three passes and runs at 1.219 tokens per forward at one pass; it is matched to
